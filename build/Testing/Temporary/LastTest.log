@@ -1,0 +1,47 @@
+Start testing: May 28 11:36 CST
+----------------------------------------------------------
+1/2 Testing: test_glin
+1/2 Test: test_glin
+Command: "/home/lh/Code/2026.5.28/GLIN/build/test_glin"
+Directory: /home/lh/Code/2026.5.28/GLIN/build
+"test_glin" start time: May 28 11:36 CST
+Output:
+----------------------------------------------------------
+[doctest] doctest version is "2.4.6"
+[doctest] run with "--help" for options
+result from index search is 0 and Ground truth is 0
+===============================================================================
+[doctest] test cases:    71 |    71 passed | 0 failed | 0 skipped
+[doctest] assertions: 42680 | 42680 passed | 0 failed |
+[doctest] Status: SUCCESS!
+<end of output>
+Test time =   0.21 sec
+----------------------------------------------------------
+Test Passed.
+"test_glin" end time: May 28 11:36 CST
+"test_glin" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/2 Testing: test_glin_piece
+2/2 Test: test_glin_piece
+Command: "/home/lh/Code/2026.5.28/GLIN/build/test_glin_piece"
+Directory: /home/lh/Code/2026.5.28/GLIN/build
+"test_glin_piece" start time: May 28 11:36 CST
+Output:
+----------------------------------------------------------
+[doctest] doctest version is "2.4.6"
+[doctest] run with "--help" for options
+result from index search is 3 and Ground truth is 3
+===============================================================================
+[doctest] test cases:    71 |    71 passed | 0 failed | 0 skipped
+[doctest] assertions: 42681 | 42681 passed | 0 failed |
+[doctest] Status: SUCCESS!
+<end of output>
+Test time =   0.19 sec
+----------------------------------------------------------
+Test Passed.
+"test_glin_piece" end time: May 28 11:36 CST
+"test_glin_piece" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: May 28 11:36 CST
