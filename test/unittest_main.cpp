@@ -4,6 +4,13 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+// These Boost.Geometry headers must be parsed before the test-only
+// private/public macro below, otherwise Boost internals fail to compile.
+#include <boost/geometry.hpp>
+#include <boost/geometry/geometries/box.hpp>
+#include <boost/geometry/geometries/point.hpp>
+#include <boost/geometry/index/rtree.hpp>
+
 #define private public
 #include "unittest_alex.h"
 #include "unittest_alex_map.h"

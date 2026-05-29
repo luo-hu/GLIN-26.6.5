@@ -34,4 +34,22 @@ target_link_libraries(test_glin_piece PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIB
 target_include_directories(test_glin_piece PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
 
 enable_testing()
-add_test(test_glin test_glin_piece) #running test while compile
+add_test(NAME test_glin COMMAND test_glin)
+add_test(NAME test_glin_piece COMMAND test_glin_piece)
+
+if(UNIX AND NOT APPLE)
+  set(GLIN_TEST_LIBRARY_PATHS /usr/lib/x86_64-linux-gnu)
+  foreach(prefix IN LISTS CMAKE_PREFIX_PATH)
+    if(EXISTS "${prefix}/lib")
+      list(APPEND GLIN_TEST_LIBRARY_PATHS "${prefix}/lib")
+    endif()
+  endforeach()
+  if(DEFINED ENV{LD_LIBRARY_PATH})
+    list(APPEND GLIN_TEST_LIBRARY_PATHS "$ENV{LD_LIBRARY_PATH}")
+  endif()
+  set_target_properties(test_glin test_glin_piece
+    PROPERTIES BUILD_RPATH "${GLIN_TEST_LIBRARY_PATHS}")
+  list(JOIN GLIN_TEST_LIBRARY_PATHS ":" GLIN_TEST_LIBRARY_PATH)
+  set_tests_properties(test_glin test_glin_piece
+    PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${GLIN_TEST_LIBRARY_PATH}")
+endif()
