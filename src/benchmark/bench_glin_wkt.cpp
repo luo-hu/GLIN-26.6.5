@@ -7,8 +7,13 @@
 
 #include "../../glin/glin.h"
 
+#include <geos/geom/Coordinate.h>
+#include <geos/geom/CoordinateArraySequence.h>
+#include <geos/geom/Envelope.h>
 #include <geos/geom/Geometry.h>
 #include <geos/geom/GeometryFactory.h>
+#include <geos/geom/LinearRing.h>
+#include <geos/geom/Polygon.h>
 #include <geos/io/WKTReader.h>
 #include <geos/util/GEOSException.h>
 
@@ -31,9 +36,10 @@ using GeometryPtr = std::unique_ptr<Geometry>;
 
 struct Options {
   std::string data_file;       // 输入数据文件，例如 /mnt/hgfs/AREAWATER.csv。
+  std::string query_file;      // 固定查询窗口文件；为空时使用随机抽样 smoke test。
   std::string output_csv;      // 每条查询的结果输出文件；为空时只在终端打印汇总。
   std::size_t limit = 10000;   // 最多读取多少条合法 WKT。用于先小规模试跑，避免一上来读 229 万行。
-  std::size_t query_count = 20;  // 随机抽多少个已加载 geometry 作为查询窗口。
+  std::size_t query_count = 20;  // 未指定 query_file 时，随机抽多少个已加载 geometry 作为查询窗口。
   std::uint64_t seed = 42;     // 随机种子。固定它可以让每次抽到同一批 query。
   double piece_limit = 10000.0;  // 每个 piece 汇总多少条记录；只在 PIECE 版本中真正起作用。
   double cell_xmin = -180.0;   // 经度转 Z-order 整数坐标时的起点，按论文公式设置。
@@ -42,7 +48,8 @@ struct Options {
 };
 
 struct QueryResult {
-  std::size_t query_id = 0;  // 被抽中的查询 geometry 在已加载数组中的下标。
+  std::size_t query_id = 0;  // 查询编号；随机模式下就是第几次查询，query_file 模式下来自文件。
+  std::size_t source_geometry_id = 0;  // 生成该 query 的原始 geometry 下标。
   long long probe_ns = 0;   // 索引探测耗时：用 GLIN 快速找到候选范围。
   long long refine_ns = 0;  // 精确过滤耗时：用 GEOS contains/intersects 检查候选结果。
   int candidates = 0;       // refine 前候选对象数量，越大通常 refine 越慢。
@@ -51,12 +58,19 @@ struct QueryResult {
   double loaded_leaf = 0.0;   // 查询实际加载/检查过的 GLIN 叶节点数。
 };
 
+struct QueryCase {
+  std::size_t query_id = 0;
+  std::size_t source_geometry_id = 0;
+  Geometry* geometry = nullptr;
+};
+
 void print_usage(const char* program) {
   std::cerr
       << "Usage: " << program << " --data_file /path/to/AREAWATER.csv [options]\n"
       << "Options:\n"
       << "  --limit N             Number of valid geometries to load (default: 10000)\n"
       << "  --query_count N       Number of sampled queries to run (default: 20)\n"
+      << "  --query_file PATH     Fixed query CSV: query_id,xmin,ymin,xmax,ymax,source_geometry_id\n"
       << "  --seed N              Random seed for query sampling (default: 42)\n"
       << "  --piece_limit N       Records per piece for PIECE build (default: 10000)\n"
       << "  --cell_xmin X         Z-order longitude origin (default: -180)\n"
@@ -78,6 +92,8 @@ Options parse_args(int argc, char* argv[]) {
 
     if (key == "--data_file") {
       options.data_file = require_value(key);
+    } else if (key == "--query_file") {
+      options.query_file = require_value(key);
     } else if (key == "--limit") {
       options.limit = static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--query_count") {
@@ -260,6 +276,95 @@ std::vector<std::size_t> sample_query_ids(std::size_t query_count,
   return ids;
 }
 
+// 用 xmin/ymin/xmax/ymax 构造一个矩形 polygon，作为 query window。
+// GEOS 的 contains/intersects 都需要一个 Geometry，这里不能只传 Envelope。
+GeometryPtr make_query_box(geos::geom::GeometryFactory& factory,
+                           double xmin, double ymin, double xmax, double ymax) {
+  if (xmin == xmax) {
+    xmax += 1e-12;
+  }
+  if (ymin == ymax) {
+    ymax += 1e-12;
+  }
+
+  auto* coordinates = new geos::geom::CoordinateArraySequence();
+  coordinates->add(geos::geom::Coordinate(xmin, ymin));
+  coordinates->add(geos::geom::Coordinate(xmin, ymax));
+  coordinates->add(geos::geom::Coordinate(xmax, ymax));
+  coordinates->add(geos::geom::Coordinate(xmax, ymin));
+  coordinates->add(geos::geom::Coordinate(xmin, ymin));
+
+  geos::geom::LinearRing* ring = factory.createLinearRing(coordinates);
+  return GeometryPtr(factory.createPolygon(ring, NULL));
+}
+
+std::vector<std::string> split_csv_line(const std::string& line) {
+  std::vector<std::string> fields;
+  std::stringstream ss(line);
+  std::string field;
+  while (std::getline(ss, field, ',')) {
+    fields.push_back(field);
+  }
+  return fields;
+}
+
+std::vector<QueryCase> load_query_file(
+    const std::string& query_file, geos::geom::GeometryFactory& factory,
+    std::vector<GeometryPtr>& owned_queries) {
+  std::ifstream input(query_file);
+  if (!input) {
+    throw std::runtime_error("Cannot open query file: " + query_file);
+  }
+
+  std::vector<QueryCase> queries;
+  std::string line;
+  while (std::getline(input, line)) {
+    strip_cr(line);
+    if (line.empty() || line.find("query_id") == 0) {
+      continue;
+    }
+
+    std::vector<std::string> fields = split_csv_line(line);
+    if (fields.size() < 6) {
+      throw std::runtime_error("Bad query row: " + line);
+    }
+
+    QueryCase query;
+    query.query_id = static_cast<std::size_t>(std::stoull(fields[0]));
+    double xmin = std::stod(fields[1]);
+    double ymin = std::stod(fields[2]);
+    double xmax = std::stod(fields[3]);
+    double ymax = std::stod(fields[4]);
+    query.source_geometry_id = static_cast<std::size_t>(std::stoull(fields[5]));
+
+    owned_queries.push_back(make_query_box(factory, xmin, ymin, xmax, ymax));
+    query.geometry = owned_queries.back().get();
+    queries.push_back(query);
+  }
+
+  if (queries.empty()) {
+    throw std::runtime_error("No query rows loaded from: " + query_file);
+  }
+  return queries;
+}
+
+std::vector<QueryCase> make_random_queries(const std::vector<Geometry*>& geometries,
+                                           std::size_t query_count,
+                                           std::uint64_t seed) {
+  std::vector<std::size_t> query_ids =
+      sample_query_ids(query_count, geometries.size(), seed);
+  std::vector<QueryCase> queries;
+  queries.reserve(query_ids.size());
+  for (std::size_t i = 0; i < query_ids.size(); ++i) {
+    QueryCase query;
+    query.query_id = i;
+    query.source_geometry_id = query_ids[i];
+    query.geometry = geometries[query_ids[i]];
+    queries.push_back(query);
+  }
+  return queries;
+}
+
 // 把每一次查询的详细结果写成 CSV。后续 Python 画图或聚合平均值就读这个文件。
 void write_csv(const std::string& path, const Options& options,
                std::size_t loaded_count, long long build_ns,
@@ -274,7 +379,7 @@ void write_csv(const std::string& path, const Options& options,
   }
 
   output << "dataset,index,relationship,loaded_count,piece_limit,cell_xmin,"
-            "cell_ymin,cell_size,seed,build_ns,query_id,probe_ns,refine_ns,"
+            "cell_ymin,cell_size,seed,build_ns,query_id,source_geometry_id,probe_ns,refine_ns,"
             "total_ns,candidates,answers,visited_leaf,loaded_leaf\n";
 
 #ifdef PIECE
@@ -294,7 +399,8 @@ void write_csv(const std::string& path, const Options& options,
            << loaded_count << "," << options.piece_limit << ","
            << options.cell_xmin << "," << options.cell_ymin << ","
            << options.cell_size << "," << options.seed << "," << build_ns
-           << "," << result.query_id << "," << result.probe_ns << ","
+           << "," << result.query_id << "," << result.source_geometry_id << ","
+           << result.probe_ns << ","
            << result.refine_ns << "," << (result.probe_ns + result.refine_ns)
            << "," << result.candidates << "," << result.answers << ","
            << result.visited_leaf << "," << result.loaded_leaf << "\n";
@@ -340,25 +446,31 @@ int main(int argc, char* argv[]) {
     auto build_end = std::chrono::high_resolution_clock::now();
     long long build_ns = ns_count(build_end - build_start);
 
-    // 3. 抽 query_count 个查询，并逐个运行 glin_find。
-    std::vector<std::size_t> query_ids =
-        sample_query_ids(options.query_count, geometries.size(), options.seed);
-    std::vector<QueryResult> results;
-    results.reserve(query_ids.size());
+    // 3. 准备查询窗口：
+    //    - 如果传了 --query_file，就读取固定 query 文件。
+    //    - 如果没传，就临时随机抽 query_count 个 geometry 做 smoke test。
+    std::vector<GeometryPtr> owned_queries;
+    std::vector<QueryCase> queries =
+        options.query_file.empty()
+            ? make_random_queries(geometries, options.query_count, options.seed)
+            : load_query_file(options.query_file, *factory, owned_queries);
 
-    for (std::size_t i = 0; i < query_ids.size(); ++i) {
+    std::vector<QueryResult> results;
+    results.reserve(queries.size());
+
+    for (const auto& query : queries) {
       int count_filter = 0;
       std::vector<Geometry*> find_result;
-      Geometry* query = geometries[query_ids[i]];
 
       // glin_find 内部会先 index_probe，再 refine。
       // 无 PIECE 版本 refine 用 contains；PIECE 版本 refine 用 intersects。
-      index.glin_find(query, "z", options.cell_xmin, options.cell_ymin,
+      index.glin_find(query.geometry, "z", options.cell_xmin, options.cell_ymin,
                       options.cell_size, options.cell_size, pieces, find_result,
                       count_filter);
 
       QueryResult result;
-      result.query_id = query_ids[i];
+      result.query_id = query.query_id;
+      result.source_geometry_id = query.source_geometry_id;
       result.probe_ns = index.index_probe_duration.count();
       result.refine_ns = index.index_refine_duration.count();
       result.candidates = count_filter;
@@ -398,6 +510,7 @@ int main(int argc, char* argv[]) {
               << " loaded=" << geometries.size()
               << " parse_errors=" << parse_errors
               << " pieces=" << pieces.size()
+              << " queries=" << results.size()
               << " load_ms=" << ns_count(load_end - load_start) / 1e6
               << " build_ms=" << build_ns / 1e6
               << " avg_probe_ns=" << total_probe_ns / results.size()
