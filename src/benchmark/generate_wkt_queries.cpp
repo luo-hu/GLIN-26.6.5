@@ -3,8 +3,17 @@
 // 这个程序是论文复现实验的第二步：先生成一份 query 文件，后续所有索引都读同一份
 // query 文件来测试。这样 GLIN、R-tree、QuadTree 的结果才有可比性。
 //
-// 注意：这里生成的是简化版 query workload，不是论文里的 JTS KNN selectivity workload。
-// 当前做法是随机抽一些 geometry，然后把它们的 MBR 作为查询窗口。
+// 默认生成近似论文的 KNN selectivity workload：
+// 1. 随机选一个 geometry 作为中心。
+// 2. 用 Boost R-tree 在 geometry MBR 中心点上找 K 个近邻。
+// 3. 把这 K 个近邻 geometry 的 MBR 合并成查询窗口。
+//
+// 注意：论文使用 JTS STR-Tree 做 KNN。这里为了保持 C++ 工具链简单，用 Boost R-tree
+// 的中心点 KNN 近似它；这比“单个 geometry 的 MBR”更接近论文 workload，但还不是完全一致。
+
+#include <boost/geometry.hpp>
+#include <boost/geometry/geometries/point.hpp>
+#include <boost/geometry/index/rtree.hpp>
 
 #include <geos/geom/Envelope.h>
 #include <geos/geom/Geometry.h>
@@ -13,25 +22,36 @@
 #include <geos/util/GEOSException.h>
 
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
 namespace {
 
+namespace bg = boost::geometry;
+namespace bgi = boost::geometry::index;
+
 using Geometry = geos::geom::Geometry;
 using GeometryPtr = std::unique_ptr<Geometry>;
+using Point = bg::model::point<double, 2, bg::cs::cartesian>;
+using RTreeValue = std::pair<Point, std::size_t>;
+using RTree = bgi::rtree<RTreeValue, bgi::linear<16>>;
 
 struct Options {
   std::string data_file;       // 输入 WKT CSV，例如 /mnt/hgfs/AREAWATER.csv。
   std::string output_file;     // 输出 query CSV。
+  std::string output_prefix;   // 多个 selectivity 时使用的输出前缀。
+  std::string mode = "knn";    // knn：近似论文；mbr：旧的单对象 MBR。
   std::size_t limit = 10000;   // 只从前 N 条合法 geometry 中抽 query。
   std::size_t query_count = 100;  // 生成多少个查询窗口。
   std::uint64_t seed = 42;     // 固定随机种子，保证可复现。
+  std::vector<double> selectivities = {0.01, 0.001, 0.0001, 0.00001};
 };
 
 void print_usage(const char* program) {
@@ -41,7 +61,51 @@ void print_usage(const char* program) {
       << "Options:\n"
       << "  --limit N             Number of valid geometries to load (default: 10000)\n"
       << "  --query_count N       Number of query windows to generate (default: 100)\n"
+      << "  --mode knn|mbr        knn approximates paper workload; mbr keeps old behavior (default: knn)\n"
+      << "  --selectivities LIST  Comma list, e.g. 1%,0.1%,0.01%,0.001% (default: paper list)\n"
+      << "  --output_prefix PATH  Prefix for multiple selectivity files, e.g. queries/aw1m_knn\n"
       << "  --seed N              Random seed (default: 42)\n";
+}
+
+std::string trim(std::string value) {
+  const std::size_t begin = value.find_first_not_of(" \t\r\n");
+  if (begin == std::string::npos) {
+    return "";
+  }
+  const std::size_t end = value.find_last_not_of(" \t\r\n");
+  return value.substr(begin, end - begin + 1);
+}
+
+std::vector<double> parse_selectivities(const std::string& text) {
+  std::vector<double> selectivities;
+  std::stringstream ss(text);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    item = trim(item);
+    if (item.empty()) {
+      continue;
+    }
+
+    bool percent = false;
+    if (!item.empty() && item.back() == '%') {
+      percent = true;
+      item.pop_back();
+    }
+
+    double value = std::stod(item);
+    if (percent) {
+      value /= 100.0;
+    }
+    if (value <= 0.0 || value > 1.0) {
+      throw std::runtime_error("Selectivity must be in (0, 1], got: " + item);
+    }
+    selectivities.push_back(value);
+  }
+
+  if (selectivities.empty()) {
+    throw std::runtime_error("--selectivities produced an empty list");
+  }
+  return selectivities;
 }
 
 Options parse_args(int argc, char* argv[]) {
@@ -59,10 +123,16 @@ Options parse_args(int argc, char* argv[]) {
       options.data_file = require_value(key);
     } else if (key == "--output_file") {
       options.output_file = require_value(key);
+    } else if (key == "--output_prefix") {
+      options.output_prefix = require_value(key);
+    } else if (key == "--mode") {
+      options.mode = require_value(key);
     } else if (key == "--limit") {
       options.limit = static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--query_count") {
       options.query_count = static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--selectivities") {
+      options.selectivities = parse_selectivities(require_value(key));
     } else if (key == "--seed") {
       options.seed = static_cast<std::uint64_t>(std::stoull(require_value(key)));
     } else if (key == "--help" || key == "-h") {
@@ -76,8 +146,20 @@ Options parse_args(int argc, char* argv[]) {
   if (options.data_file.empty()) {
     throw std::runtime_error("--data_file is required");
   }
-  if (options.output_file.empty()) {
-    throw std::runtime_error("--output_file is required");
+  if (options.output_file.empty() && options.output_prefix.empty()) {
+    throw std::runtime_error("--output_file or --output_prefix is required");
+  }
+  if (options.mode != "knn" && options.mode != "mbr") {
+    throw std::runtime_error("--mode must be knn or mbr");
+  }
+  if (options.mode == "mbr" && !options.output_prefix.empty() &&
+      options.output_file.empty()) {
+    throw std::runtime_error("--mode mbr needs --output_file");
+  }
+  if (options.mode == "knn" && options.selectivities.size() > 1 &&
+      !options.output_file.empty() && options.output_prefix.empty()) {
+    throw std::runtime_error(
+        "Multiple selectivities need --output_prefix, not only --output_file");
   }
   if (options.limit == 0) {
     throw std::runtime_error("--limit must be greater than 0");
@@ -182,7 +264,90 @@ std::vector<GeometryPtr> load_wkt_csv(const Options& options,
   return geometries;
 }
 
-void write_queries(const Options& options, const std::vector<GeometryPtr>& geometries) {
+std::string selectivity_tag(double selectivity) {
+  if (selectivity >= 0.01) {
+    return "1pct";
+  }
+  if (selectivity >= 0.001) {
+    return "0p1pct";
+  }
+  if (selectivity >= 0.0001) {
+    return "0p01pct";
+  }
+  if (selectivity >= 0.00001) {
+    return "0p001pct";
+  }
+
+  std::ostringstream out;
+  out << std::setprecision(8) << selectivity;
+  std::string tag = out.str();
+  for (char& ch : tag) {
+    if (ch == '.') {
+      ch = 'p';
+    } else if (ch == '-') {
+      ch = 'm';
+    }
+  }
+  return tag;
+}
+
+std::string output_path_for_selectivity(const Options& options,
+                                        double selectivity) {
+  if (!options.output_prefix.empty()) {
+    return options.output_prefix + "_" + selectivity_tag(selectivity) + ".csv";
+  }
+  return options.output_file;
+}
+
+double envelope_center_x(const geos::geom::Envelope* envelope) {
+  return (envelope->getMinX() + envelope->getMaxX()) / 2.0;
+}
+
+double envelope_center_y(const geos::geom::Envelope* envelope) {
+  return (envelope->getMinY() + envelope->getMaxY()) / 2.0;
+}
+
+RTree build_center_rtree(const std::vector<GeometryPtr>& geometries) {
+  std::vector<RTreeValue> values;
+  values.reserve(geometries.size());
+  for (std::size_t i = 0; i < geometries.size(); ++i) {
+    const geos::geom::Envelope* envelope = geometries[i]->getEnvelopeInternal();
+    values.emplace_back(
+        Point(envelope_center_x(envelope), envelope_center_y(envelope)), i);
+  }
+  return RTree(values.begin(), values.end());
+}
+
+std::size_t k_for_selectivity(double selectivity, std::size_t loaded_count) {
+  std::size_t k =
+      static_cast<std::size_t>(std::ceil(selectivity * loaded_count));
+  if (k < 1) {
+    k = 1;
+  }
+  if (k > loaded_count) {
+    k = loaded_count;
+  }
+  return k;
+}
+
+void expand_to_include(geos::geom::Envelope& query_envelope,
+                       const geos::geom::Envelope* item_envelope) {
+  query_envelope.expandToInclude(item_envelope->getMinX(), item_envelope->getMinY());
+  query_envelope.expandToInclude(item_envelope->getMaxX(), item_envelope->getMaxY());
+}
+
+void write_query_row(std::ofstream& output, std::size_t query_id,
+                     const geos::geom::Envelope& envelope,
+                     std::size_t source_id, double selectivity,
+                     std::size_t k) {
+  output << query_id << "," << envelope.getMinX() << "," << envelope.getMinY()
+         << "," << envelope.getMaxX() << "," << envelope.getMaxY() << ","
+         << source_id << "," << std::setprecision(17) << selectivity << "," << k
+         << "\n";
+}
+
+void write_mbr_queries(const Options& options,
+                       const std::vector<GeometryPtr>& geometries) {
   std::ofstream output(options.output_file);
   if (!output) {
     throw std::runtime_error("Cannot open output file: " + options.output_file);
@@ -191,14 +356,65 @@ void write_queries(const Options& options, const std::vector<GeometryPtr>& geome
   std::mt19937_64 rng(options.seed);
   std::uniform_int_distribution<std::size_t> distribution(0, geometries.size() - 1);
 
-  output << "query_id,xmin,ymin,xmax,ymax,source_geometry_id\n";
+  output << "query_id,xmin,ymin,xmax,ymax,source_geometry_id,selectivity,k\n";
   output << std::setprecision(17);
   for (std::size_t query_id = 0; query_id < options.query_count; ++query_id) {
     std::size_t source_id = distribution(rng);
     const geos::geom::Envelope* envelope = geometries[source_id]->getEnvelopeInternal();
-    output << query_id << "," << envelope->getMinX() << "," << envelope->getMinY()
-           << "," << envelope->getMaxX() << "," << envelope->getMaxY() << ","
-           << source_id << "\n";
+    geos::geom::Envelope query_envelope(*envelope);
+    write_query_row(output, query_id, query_envelope, source_id, 0.0, 1);
+  }
+}
+
+void write_knn_queries_for_selectivity(const Options& options,
+                                       const std::vector<GeometryPtr>& geometries,
+                                       const RTree& rtree,
+                                       double selectivity) {
+  const std::string output_file = output_path_for_selectivity(options, selectivity);
+  std::ofstream output(output_file);
+  if (!output) {
+    throw std::runtime_error("Cannot open output file: " + output_file);
+  }
+
+  const std::size_t k = k_for_selectivity(selectivity, geometries.size());
+  std::mt19937_64 rng(options.seed);
+  std::uniform_int_distribution<std::size_t> distribution(0, geometries.size() - 1);
+
+  output << "query_id,xmin,ymin,xmax,ymax,source_geometry_id,selectivity,k\n";
+  output << std::setprecision(17);
+  for (std::size_t query_id = 0; query_id < options.query_count; ++query_id) {
+    const std::size_t source_id = distribution(rng);
+    const geos::geom::Envelope* source_envelope =
+        geometries[source_id]->getEnvelopeInternal();
+    Point center(envelope_center_x(source_envelope),
+                 envelope_center_y(source_envelope));
+
+    std::vector<RTreeValue> neighbors;
+    neighbors.reserve(k);
+    rtree.query(bgi::nearest(center, static_cast<unsigned>(k)),
+                std::back_inserter(neighbors));
+
+    geos::geom::Envelope query_envelope(*source_envelope);
+    for (const auto& neighbor : neighbors) {
+      expand_to_include(query_envelope,
+                        geometries[neighbor.second]->getEnvelopeInternal());
+    }
+
+    write_query_row(output, query_id, query_envelope, source_id, selectivity, k);
+  }
+
+  std::cout << "query_file=" << output_file
+            << " selectivity=" << std::setprecision(17) << selectivity
+            << " k=" << k
+            << " query_count=" << options.query_count
+            << "\n";
+}
+
+void write_knn_queries(const Options& options,
+                       const std::vector<GeometryPtr>& geometries) {
+  RTree rtree = build_center_rtree(geometries);
+  for (double selectivity : options.selectivities) {
+    write_knn_queries_for_selectivity(options, geometries, rtree, selectivity);
   }
 }
 
@@ -227,15 +443,22 @@ int main(int argc, char* argv[]) {
       throw std::runtime_error("No valid geometries loaded");
     }
 
-    write_queries(options, geometries);
+    auto query_start = std::chrono::high_resolution_clock::now();
+    if (options.mode == "knn") {
+      write_knn_queries(options, geometries);
+    } else {
+      write_mbr_queries(options, geometries);
+    }
+    auto query_end = std::chrono::high_resolution_clock::now();
 
-    std::cout << "query_file=" << options.output_file
+    std::cout << "mode=" << options.mode
               << " lines_seen=" << lines_seen
               << " loaded=" << geometries.size()
               << " parse_errors=" << parse_errors
               << " query_count=" << options.query_count
               << " seed=" << options.seed
               << " load_ms=" << ns_count(load_end - load_start) / 1e6
+              << " generate_ms=" << ns_count(query_end - query_start) / 1e6
               << "\n";
   } catch (const std::exception& ex) {
     std::cerr << "Error: " << ex.what() << "\n";
