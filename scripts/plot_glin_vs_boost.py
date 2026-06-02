@@ -46,6 +46,7 @@ INDEX_LABELS = {
     "GLIN": "GLIN",
     "GLIN_PIECEWISE": "GLIN-piecewise",
     "Boost_Rtree": "Boost R-tree",
+    "GEOS_Quadtree": "GEOS Quadtree",
 }
 
 
@@ -53,6 +54,7 @@ INDEX_COLORS = {
     "GLIN": "#3B6EA8",
     "GLIN_PIECEWISE": "#70A37F",
     "Boost_Rtree": "#C46A4A",
+    "GEOS_Quadtree": "#8C6BB1",
 }
 
 
@@ -177,7 +179,7 @@ def relationship_order(summary):
 
 
 def index_order(summary):
-    preferred = ["GLIN", "GLIN_PIECEWISE", "Boost_Rtree"]
+    preferred = ["GLIN", "GLIN_PIECEWISE", "Boost_Rtree", "GEOS_Quadtree"]
     found = {row["index"] for row in summary}
     ordered = [idx for idx in preferred if idx in found]
     ordered.extend(sorted(found.difference(ordered)))

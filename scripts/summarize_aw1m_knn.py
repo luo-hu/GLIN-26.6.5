@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 SELECTIVITY_ORDER = ["0.001%", "0.01%", "0.1%", "1%"]
-INDEX_ORDER = ["GLIN", "GLIN_PIECEWISE", "Boost_Rtree"]
+INDEX_ORDER = ["GLIN", "GLIN_PIECEWISE", "Boost_Rtree", "GEOS_Quadtree"]
 REL_ORDER = ["contains", "intersects"]
 REQUIRED_COLUMNS = {
     "dataset",

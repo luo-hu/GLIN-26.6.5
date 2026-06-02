@@ -25,24 +25,27 @@ import matplotlib.pyplot as plt
 
 SELECTIVITY_ORDER = ["0.001%", "0.01%", "0.1%", "1%"]
 RELATIONSHIP_ORDER = ["contains", "intersects"]
-INDEX_ORDER = ["GLIN", "GLIN_PIECEWISE", "Boost_Rtree"]
+INDEX_ORDER = ["GLIN", "GLIN_PIECEWISE", "Boost_Rtree", "GEOS_Quadtree"]
 
 INDEX_LABELS = {
     "GLIN": "GLIN",
     "GLIN_PIECEWISE": "GLIN-piecewise",
     "Boost_Rtree": "Boost R-tree",
+    "GEOS_Quadtree": "GEOS Quadtree",
 }
 
 INDEX_COLORS = {
     "GLIN": "#3B6EA8",
     "GLIN_PIECEWISE": "#70A37F",
     "Boost_Rtree": "#C46A4A",
+    "GEOS_Quadtree": "#8C6BB1",
 }
 
 INDEX_MARKERS = {
     "GLIN": "o",
     "GLIN_PIECEWISE": "s",
     "Boost_Rtree": "^",
+    "GEOS_Quadtree": "D",
 }
 
 REQUIRED_COLUMNS = {

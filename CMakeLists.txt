@@ -50,6 +50,10 @@ add_executable(bench_boost_rtree_wkt src/benchmark/bench_boost_rtree_wkt.cpp)
 target_link_libraries(bench_boost_rtree_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
 target_include_directories(bench_boost_rtree_wkt PUBLIC "$<BUILD_INTERFACE:${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
 
+add_executable(bench_geos_quadtree_wkt src/benchmark/bench_geos_quadtree_wkt.cpp)
+target_link_libraries(bench_geos_quadtree_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
+target_include_directories(bench_geos_quadtree_wkt PUBLIC "$<BUILD_INTERFACE:${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+
 enable_testing()
 add_test(NAME test_glin COMMAND test_glin)
 add_test(NAME test_glin_piece COMMAND test_glin_piece)
@@ -64,7 +68,7 @@ if(UNIX AND NOT APPLE)
   if(DEFINED ENV{LD_LIBRARY_PATH})
     list(APPEND GLIN_TEST_LIBRARY_PATHS "$ENV{LD_LIBRARY_PATH}")
   endif()
-  set_target_properties(test_glin test_glin_piece bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries bench_boost_rtree_wkt
+  set_target_properties(test_glin test_glin_piece bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries bench_boost_rtree_wkt bench_geos_quadtree_wkt
     PROPERTIES BUILD_RPATH "${GLIN_TEST_LIBRARY_PATHS}")
   list(JOIN GLIN_TEST_LIBRARY_PATHS ":" GLIN_TEST_LIBRARY_PATH)
   set_tests_properties(test_glin test_glin_piece
