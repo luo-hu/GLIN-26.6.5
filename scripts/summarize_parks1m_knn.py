@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize AREAWATER 1M KNN-selectivity benchmark CSVs."""
+"""Summarize parks 1M KNN-selectivity benchmark CSVs."""
 
 import argparse
 import csv
@@ -38,17 +38,17 @@ def selectivity_from_name(path):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Summarize AREAWATER 1M KNN-selectivity benchmark CSVs."
+        description="Summarize parks 1M KNN-selectivity benchmark CSVs."
     )
     parser.add_argument(
         "--glob",
-        default="results/aw1m_knn_*.csv",
-        help="Input raw benchmark CSV glob. Default: results/aw1m_knn_*.csv",
+        default="results/parks_1m_geom_knn_*.csv",
+        help="Input raw benchmark CSV glob. Default: results/parks_1m_geom_knn_*.csv",
     )
     parser.add_argument(
         "--output",
-        default="results/aw1m_knn_summary.csv",
-        help="Output summary CSV. Default: results/aw1m_knn_summary.csv",
+        default="results/parks_1m_geom_knn_summary.csv",
+        help="Output summary CSV. Default: results/parks_1m_geom_knn_summary.csv",
     )
     return parser.parse_args()
 

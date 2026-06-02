@@ -36,6 +36,7 @@ using GeometryPtr = std::unique_ptr<Geometry>;
 
 struct Options {
   std::string data_file;       // 输入数据文件，例如 /mnt/hgfs/AREAWATER.csv。
+  std::string dataset_name = "WKT";  // 输出 CSV 里的数据集名称，例如 AREAWATER 或 PARKS。
   std::string query_file;      // 固定查询窗口文件；为空时使用随机抽样 smoke test。
   std::string output_csv;      // 每条查询的结果输出文件；为空时只在终端打印汇总。
   std::size_t limit = 10000;   // 最多读取多少条合法 WKT。用于先小规模试跑，避免一上来读 229 万行。
@@ -68,6 +69,7 @@ void print_usage(const char* program) {
   std::cerr
       << "Usage: " << program << " --data_file /path/to/AREAWATER.csv [options]\n"
       << "Options:\n"
+      << "  --dataset_name NAME   Dataset label written to CSV/stdout (default: WKT)\n"
       << "  --limit N             Number of valid geometries to load (default: 10000)\n"
       << "  --query_count N       Number of sampled queries to run (default: 20)\n"
       << "  --query_file PATH     Fixed query CSV: query_id,xmin,ymin,xmax,ymax,source_geometry_id\n"
@@ -92,6 +94,8 @@ Options parse_args(int argc, char* argv[]) {
 
     if (key == "--data_file") {
       options.data_file = require_value(key);
+    } else if (key == "--dataset_name") {
+      options.dataset_name = require_value(key);
     } else if (key == "--query_file") {
       options.query_file = require_value(key);
     } else if (key == "--limit") {
@@ -188,7 +192,8 @@ std::string extract_wkt(std::string line) {
   }
 
   static const std::vector<std::string> prefixes = {
-      "MULTIPOLYGON", "POLYGON", "MULTILINESTRING", "LINESTRING", "POINT"};
+      "GEOMETRYCOLLECTION", "MULTIPOLYGON", "POLYGON", "MULTILINESTRING",
+      "LINESTRING", "POINT"};
   for (const auto& prefix : prefixes) {
     std::size_t pos = line.find(prefix);
     if (pos != std::string::npos) {
@@ -395,7 +400,7 @@ void write_csv(const std::string& path, const Options& options,
 #endif
 
   for (const auto& result : results) {
-    output << "AREAWATER," << index_name << "," << relationship << ","
+    output << options.dataset_name << "," << index_name << "," << relationship << ","
            << loaded_count << "," << options.piece_limit << ","
            << options.cell_xmin << "," << options.cell_ymin << ","
            << options.cell_size << "," << options.seed << "," << build_ns
@@ -503,7 +508,7 @@ int main(int argc, char* argv[]) {
 #endif
 
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << "dataset=AREAWATER"
+    std::cout << "dataset=" << options.dataset_name
               << " index=" << index_name
               << " relationship=" << relationship
               << " lines_seen=" << lines_seen

@@ -46,6 +46,7 @@ using RTree = bgi::rtree<RTreeValue, bgi::linear<16>>;
 
 struct Options {
   std::string data_file;
+  std::string dataset_name = "WKT";
   std::string query_file;
   std::string output_csv;
   std::string relationship = "contains";
@@ -77,6 +78,7 @@ void print_usage(const char* program) {
       << "Usage: " << program
       << " --data_file /path/to/AREAWATER.csv --query_file queries.csv [options]\n"
       << "Options:\n"
+      << "  --dataset_name NAME        Dataset label written to CSV/stdout (default: WKT)\n"
       << "  --limit N                  Number of valid geometries to load (default: 10000)\n"
       << "  --relationship contains    contains or intersects (default: contains)\n"
       << "  --output_csv PATH          Write per-query CSV rows\n"
@@ -96,6 +98,8 @@ Options parse_args(int argc, char* argv[]) {
 
     if (key == "--data_file") {
       options.data_file = require_value(key);
+    } else if (key == "--dataset_name") {
+      options.dataset_name = require_value(key);
     } else if (key == "--query_file") {
       options.query_file = require_value(key);
     } else if (key == "--output_csv") {
@@ -179,7 +183,8 @@ std::string extract_wkt(std::string line) {
   }
 
   static const std::vector<std::string> prefixes = {
-      "MULTIPOLYGON", "POLYGON", "MULTILINESTRING", "LINESTRING", "POINT"};
+      "GEOMETRYCOLLECTION", "MULTIPOLYGON", "POLYGON", "MULTILINESTRING",
+      "LINESTRING", "POINT"};
   for (const auto& prefix : prefixes) {
     std::size_t pos = line.find(prefix);
     if (pos != std::string::npos) {
@@ -334,7 +339,7 @@ void write_csv(const std::string& path, const Options& options,
             "probe_ns,refine_ns,total_ns,candidates,answers,visited_leaf,loaded_leaf\n";
 
   for (const auto& result : results) {
-    output << "AREAWATER,Boost_Rtree," << options.relationship << ","
+    output << options.dataset_name << ",Boost_Rtree," << options.relationship << ","
            << loaded_count << ",0,0,0,0," << options.seed << "," << build_ns
            << "," << result.query_id << "," << result.source_geometry_id << ","
            << result.probe_ns << "," << result.refine_ns << ","
@@ -421,7 +426,7 @@ int main(int argc, char* argv[]) {
     write_csv(options.output_csv, options, geometries.size(), build_ns, results);
 
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << "dataset=AREAWATER"
+    std::cout << "dataset=" << options.dataset_name
               << " index=Boost_Rtree"
               << " relationship=" << options.relationship
               << " lines_seen=" << lines_seen

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Plot figures from results/aw1m_knn_summary.csv.
+"""Plot figures from results/parks_1m_geom_knn_summary.csv.
 
-这个脚本专门读取 summarize_aw1m_knn.py 生成的汇总表，不再读取逐 query CSV。
+这个脚本专门读取 summarize_parks1m_knn.py 生成的汇总表，不再读取逐 query CSV。
 
 用法：
-  python3 scripts/plot_aw1m_knn_summary.py
+  python3 scripts/plot_parks1m_knn_summary.py
 
 也可以手动指定输入和输出目录：
-  python3 scripts/plot_aw1m_knn_summary.py \
-    --input results/aw1m_knn_summary.csv \
+  python3 scripts/plot_parks1m_knn_summary.py \
+    --input results/parks_1m_geom_knn_summary.csv \
     --output_dir figures
 """
 
@@ -63,12 +63,12 @@ REQUIRED_COLUMNS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Plot AREAWATER 1M KNN-selectivity benchmark summary."
+        description="Plot parks 1M KNN-selectivity benchmark summary."
     )
     parser.add_argument(
         "--input",
-        default="results/aw1m_knn_summary.csv",
-        help="Input summary CSV. Default: results/aw1m_knn_summary.csv",
+        default="results/parks_1m_geom_knn_summary.csv",
+        help="Input summary CSV. Default: results/parks_1m_geom_knn_summary.csv",
     )
     parser.add_argument(
         "--output_dir",
