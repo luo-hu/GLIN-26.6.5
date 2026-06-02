@@ -105,6 +105,13 @@ mvn -q exec:java -Dexec.args="\
   --output_prefix ../../queries/areawater_1m_jts_strtree_knn \
   --seed 42"
 ```
+或者用第二种脚本的方式：
+scripts/generate_jts_strtree_knn_queries.sh \
+  /mnt/hgfs/AREAWATER.csv \
+  queries/aw_1m_jts_strtree_knn \
+  1000000 \
+  100 \
+  42
 
 ## 用生成的 Query 跑 C++ Benchmark
 
@@ -128,6 +135,17 @@ for sel in 0p001pct 0p01pct 0p1pct 1pct; do
 done
 ```
 
+for sel in 0p001pct 0p01pct 0p1pct 1pct; do
+  ./build/bench_boost_rtree_wkt \
+    --data_file /mnt/hgfs/AREAWATER.csv \
+    --dataset_name AREAWATER.csv \
+    --limit 1000000 \
+    --query_file queries/aw_1m_jts_strtree_knn_${sel}.csv \
+    --relationship contains \
+    --output_csv results/aw_1m_jts_strtree_knn_${sel}_boost_rtree_contains.csv
+done
+
+
 GLIN contains：
 
 ```bash
@@ -140,6 +158,14 @@ for sel in 0p001pct 0p01pct 0p1pct 1pct; do
     --output_csv results/parks_1m_jts_strtree_knn_${sel}_glin_contains.csv
 done
 ```
+for sel in 0p001pct 0p01pct 0p1pct 1pct; do
+  ./build/bench_glin_wkt \
+    --data_file /mnt/hgfs/AREAWATER.csv \
+    --dataset_name AREAWATER.csv \
+    --limit 1000000 \
+    --query_file queries/aw_1m_jts_strtree_knn_${sel}.csv \
+    --output_csv results/aw_1m_jts_strtree_knn_${sel}_glin_contains.csv
+done
 
 GLIN-piecewise intersects：
 
@@ -153,6 +179,14 @@ for sel in 0p001pct 0p01pct 0p1pct 1pct; do
     --output_csv results/parks_1m_jts_strtree_knn_${sel}_glin_piece_intersects.csv
 done
 ```
+for sel in 0p001pct 0p01pct 0p1pct 1pct; do
+  ./build/bench_glin_wkt_piece \
+    --data_file /mnt/hgfs/AREAWATER.csv \
+    --dataset_name AREAWATER.csv \
+    --limit 1000000 \
+    --query_file queries/aw_1m_jts_strtree_knn_${sel}.csv \
+    --output_csv results/aw_1m_jts_strtree_knn_${sel}_glin_piece_intersects.csv
+done
 
 Boost R-tree intersects：
 
@@ -167,6 +201,15 @@ for sel in 0p001pct 0p01pct 0p1pct 1pct; do
     --output_csv results/parks_1m_jts_strtree_knn_${sel}_boost_rtree_intersects.csv
 done
 ```
+for sel in 0p001pct 0p01pct 0p1pct 1pct; do
+  ./build/bench_boost_rtree_wkt \
+    --data_file /mnt/hgfs/AREAWATER.csv  \
+    --dataset_name AREAWATER.csv  \
+    --limit 1000000 \
+    --query_file queries/aw_1m_jts_strtree_knn_${sel}.csv \
+    --relationship intersects \
+    --output_csv results/aw_1m_jts_strtree_knn_${sel}_boost_rtree_intersects.csv
+done
 
 汇总：
 
@@ -184,3 +227,5 @@ python3 scripts/plot_aw1m_knn_summary.py \
   --output_dir figures \
   --figure_prefix parks_1m_jts_strtree_knn
 ```
+
+哦哦，这个summarize_aw1m_knn.py和plot_aw1m_knn_summary.py是可以重复使用的，只要修改输入输出就行了，不用每一次都写新的脚本
