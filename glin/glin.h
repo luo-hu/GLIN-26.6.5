@@ -561,10 +561,16 @@ namespace alex {
 #ifdef PIECE
             erase_position = std::upper_bound(pieces.begin(), pieces.end(), std::make_tuple(del_end, -1, -1, -1),
                                               sortbysec);
-            double update_count = std::get<2>(pieces[erase_position - pieces.begin()]) - 1;
-            double update_sum = (std::get<3>(pieces[erase_position - pieces.begin()])) -  del_start;
-            std::get<2>(pieces[erase_position - pieces.begin()]) = update_count;
-            std::get<3>(pieces[erase_position - pieces.begin()]) = update_sum;
+            if (!pieces.empty()) {
+                if (erase_position == pieces.end()) {
+                    erase_position = pieces.end() - 1;
+                }
+                auto piece_index = erase_position - pieces.begin();
+                double update_count = std::get<2>(pieces[piece_index]) - 1;
+                double update_sum = (std::get<3>(pieces[piece_index])) -  del_start;
+                std::get<2>(pieces[piece_index]) = update_count;
+                std::get<3>(pieces[piece_index]) = update_sum;
+            }
 #endif
             return num_erase;
         }
@@ -572,4 +578,3 @@ namespace alex {
 
 
 }
-

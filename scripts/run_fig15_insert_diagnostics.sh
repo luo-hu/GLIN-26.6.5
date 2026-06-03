@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LIMIT="${LIMIT:-1000000}"
+SEED="${SEED:-42}"
+PIECE_LIMIT="${PIECE_LIMIT:-10000}"
+DATASETS="${DATASETS:-AW LW ROADS PARKS}"
+RESULT_DIR="${RESULT_DIR:-results/fig15_insert_diagnostics}"
+FIGURE_DIR="${FIGURE_DIR:-figures/fig15_insert_diagnostics}"
+AUTO_BUILD="${AUTO_BUILD:-1}"
+
+BOOST_CSV="$RESULT_DIR/boost_strategy_sweep.csv"
+ORDER_CSV="$RESULT_DIR/insert_order_sweep.csv"
+CELL_CSV="$RESULT_DIR/cell_size_sweep.csv"
+SUMMARY_CSV="$RESULT_DIR/fig15_insert_diagnostics_summary.csv"
+
+if [[ "$AUTO_BUILD" == "1" ]]; then
+  cmake --build build --target bench_update_wkt bench_update_wkt_piece -j2
+fi
+
+mkdir -p "$RESULT_DIR" "$FIGURE_DIR"
+: > "$BOOST_CSV"
+: > "$ORDER_CSV"
+: > "$CELL_CSV"
+
+data_file_for_dataset() {
+  case "$1" in
+    AW) echo "/mnt/hgfs/AREAWATER.csv" ;;
+    LW) echo "/mnt/hgfs/LINEARWATER.csv" ;;
+    ROADS) echo "/mnt/hgfs/roads" ;;
+    PARKS) echo "/mnt/hgfs/parks" ;;
+    *)
+      echo "Unknown dataset: $1" >&2
+      return 1
+      ;;
+  esac
+}
+
+append_args_for_file() {
+  local file="$1"
+  if [[ -s "$file" ]]; then
+    echo "--append_csv"
+  fi
+}
+
+for dataset in $DATASETS; do
+  data_file="$(data_file_for_dataset "$dataset")"
+
+  # 1. Boost split strategy sweep: linear/quadratic/rstar in one process.
+  # GLIN and GEOS Quadtree are included once as reference rows.
+  ./build/bench_update_wkt \
+    --data_file "$data_file" \
+    --dataset_name "$dataset" \
+    --limit "$LIMIT" \
+    --mode insert \
+    --seed "$SEED" \
+    --piece_limit "$PIECE_LIMIT" \
+    --boost_strategy all \
+    --insert_order random \
+    --output_csv "$BOOST_CSV" \
+    $(append_args_for_file "$BOOST_CSV")
+
+  # 2. Insert order sweep: random, original file order, and Zmin order.
+  for insert_order in random file zmin; do
+    ./build/bench_update_wkt \
+      --data_file "$data_file" \
+      --dataset_name "$dataset" \
+      --limit "$LIMIT" \
+      --mode insert \
+      --seed "$SEED" \
+      --piece_limit "$PIECE_LIMIT" \
+      --boost_strategy linear \
+      --insert_order "$insert_order" \
+      --output_csv "$ORDER_CSV" \
+      $(append_args_for_file "$ORDER_CSV")
+
+    ./build/bench_update_wkt_piece \
+      --data_file "$data_file" \
+      --dataset_name "$dataset" \
+      --limit "$LIMIT" \
+      --mode insert \
+      --seed "$SEED" \
+      --piece_limit "$PIECE_LIMIT" \
+      --insert_order "$insert_order" \
+      --output_csv "$ORDER_CSV" \
+      --append_csv
+  done
+
+  # 3. GLIN cell size sweep. Baselines are skipped because Boost/Quadtree do
+  # not use GLIN's Z-order cell size.
+  for cell_size in 5e-5 5e-6 5e-7 5e-8; do
+    ./build/bench_update_wkt \
+      --data_file "$data_file" \
+      --dataset_name "$dataset" \
+      --limit "$LIMIT" \
+      --mode insert \
+      --seed "$SEED" \
+      --piece_limit "$PIECE_LIMIT" \
+      --cell_size "$cell_size" \
+      --insert_order random \
+      --include_baselines 0 \
+      --output_csv "$CELL_CSV" \
+      $(append_args_for_file "$CELL_CSV")
+
+    ./build/bench_update_wkt_piece \
+      --data_file "$data_file" \
+      --dataset_name "$dataset" \
+      --limit "$LIMIT" \
+      --mode insert \
+      --seed "$SEED" \
+      --piece_limit "$PIECE_LIMIT" \
+      --cell_size "$cell_size" \
+      --insert_order random \
+      --output_csv "$CELL_CSV" \
+      --append_csv
+  done
+done
+
+python3 scripts/plot_fig15_insert_diagnostics.py \
+  --boost_csv "$BOOST_CSV" \
+  --order_csv "$ORDER_CSV" \
+  --cell_csv "$CELL_CSV" \
+  --output_dir "$FIGURE_DIR" \
+  --summary_csv "$SUMMARY_CSV"
