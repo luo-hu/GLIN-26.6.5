@@ -193,7 +193,7 @@ std::string extract_wkt(std::string line) {
 
   static const std::vector<std::string> prefixes = {
       "GEOMETRYCOLLECTION", "MULTIPOLYGON", "POLYGON", "MULTILINESTRING",
-      "LINESTRING", "POINT"};
+      "LINESTRING", "MULTIPOINT", "POINT"};
   for (const auto& prefix : prefixes) {
     std::size_t pos = line.find(prefix);
     if (pos != std::string::npos) {

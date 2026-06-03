@@ -46,6 +46,12 @@ add_executable(generate_wkt_queries src/benchmark/generate_wkt_queries.cpp)
 target_link_libraries(generate_wkt_queries PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
 target_include_directories(generate_wkt_queries PUBLIC "$<BUILD_INTERFACE:${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
 
+add_executable(generate_synthetic_points scripts/generate_synthetic_points.cpp)
+
+add_executable(convert_binary_points_to_wkt scripts/convert_binary_points_to_wkt.cpp)
+
+add_executable(generate_synthetic_rectangles scripts/generate_synthetic_rectangles.cpp)
+
 add_executable(bench_boost_rtree_wkt src/benchmark/bench_boost_rtree_wkt.cpp)
 target_link_libraries(bench_boost_rtree_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
 target_include_directories(bench_boost_rtree_wkt PUBLIC "$<BUILD_INTERFACE:${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
@@ -68,7 +74,7 @@ if(UNIX AND NOT APPLE)
   if(DEFINED ENV{LD_LIBRARY_PATH})
     list(APPEND GLIN_TEST_LIBRARY_PATHS "$ENV{LD_LIBRARY_PATH}")
   endif()
-  set_target_properties(test_glin test_glin_piece bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries bench_boost_rtree_wkt bench_geos_quadtree_wkt
+  set_target_properties(test_glin test_glin_piece bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries generate_synthetic_points convert_binary_points_to_wkt generate_synthetic_rectangles bench_boost_rtree_wkt bench_geos_quadtree_wkt
     PROPERTIES BUILD_RPATH "${GLIN_TEST_LIBRARY_PATHS}")
   list(JOIN GLIN_TEST_LIBRARY_PATHS ":" GLIN_TEST_LIBRARY_PATH)
   set_tests_properties(test_glin test_glin_piece
