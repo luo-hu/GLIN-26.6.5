@@ -20,6 +20,7 @@ set -euo pipefail
 #   SUMMARIZE=1
 #   PLOT=1
 #   AUTO_BUILD=1
+#   SYNTHETIC_KIND=points    # points or rectangles
 
 LIMIT=${LIMIT:-1000000}
 QUERY_COUNT=${QUERY_COUNT:-100}
@@ -32,6 +33,7 @@ REAL_WORK_DIR=${REAL_WORK_DIR:-data/real}
 SYN_WORK_DIR=${SYN_WORK_DIR:-data/synthetic/glin_geo}
 SUMMARY_CSV=${SUMMARY_CSV:-results/all_1m_summary.csv}
 DATASETS=${DATASETS:-"AW LW ROADS PARKS OSM_AU_POINTS UNIF_S UNIF_L DIAG_S DIAG_L"}
+SYNTHETIC_KIND=${SYNTHETIC_KIND:-points}
 
 OVERWRITE=${OVERWRITE:-0}
 DRY_RUN=${DRY_RUN:-0}
@@ -124,9 +126,18 @@ prepare_data() {
       fi
     done
     if [[ "$missing" == "1" ]]; then
-      echo "[prepare] Generate synthetic geo point datasets -> $SYN_WORK_DIR"
-      run_cmd env SMALL_N="$LIMIT" LARGE_N="$LIMIT" OUT_DIR="$SYN_WORK_DIR" \
-        SEED="$SEED" FORMAT=wkt scripts/prepare_glin_synthetic_geo_points.sh
+      if [[ "$SYNTHETIC_KIND" == "points" ]]; then
+        echo "[prepare] Generate synthetic geo point datasets -> $SYN_WORK_DIR"
+        run_cmd env SMALL_N="$LIMIT" LARGE_N="$LIMIT" OUT_DIR="$SYN_WORK_DIR" \
+          SEED="$SEED" FORMAT=wkt scripts/prepare_glin_synthetic_geo_points.sh
+      elif [[ "$SYNTHETIC_KIND" == "rectangles" ]]; then
+        echo "[prepare] Generate synthetic rectangle datasets -> $SYN_WORK_DIR"
+        run_cmd env SMALL_N="$LIMIT" LARGE_N="$LIMIT" OUT_DIR="$SYN_WORK_DIR" \
+          SEED="$SEED" scripts/prepare_synthetic_rectangles.sh
+      else
+        echo "Error: SYNTHETIC_KIND must be points or rectangles" >&2
+        exit 1
+      fi
     fi
   fi
 }
@@ -282,6 +293,7 @@ main() {
   echo "=== GLIN all 1M runner ==="
   echo "LIMIT=$LIMIT QUERY_COUNT=$QUERY_COUNT SEED=$SEED"
   echo "DATASETS=$DATASETS"
+  echo "SYNTHETIC_KIND=$SYNTHETIC_KIND"
   echo "RESULT_DIR=$RESULT_DIR QUERY_DIR=$QUERY_DIR FIGURE_DIR=$FIGURE_DIR"
 
   if [[ "$AUTO_BUILD" == "1" ]]; then
@@ -294,6 +306,7 @@ main() {
       bench_geos_quadtree_wkt \
       convert_binary_points_to_wkt \
       generate_synthetic_points \
+      generate_synthetic_rectangles \
       -j2
   fi
 
@@ -303,6 +316,7 @@ main() {
   ensure_executable ./build/bench_geos_quadtree_wkt
   ensure_executable ./build/convert_binary_points_to_wkt
   ensure_executable ./build/generate_synthetic_points
+  ensure_executable ./build/generate_synthetic_rectangles
 
   mkdir -p "$RESULT_DIR" "$QUERY_DIR" "$FIGURE_DIR"
 
@@ -313,7 +327,7 @@ main() {
   for dataset in $DATASETS; do
     local data_file
     data_file=$(dataset_file "$dataset")
-    if [[ ! -s "$data_file" ]]; then
+    if [[ "$DRY_RUN" != "1" && ! -s "$data_file" ]]; then
       echo "Error: dataset file missing or empty for $dataset: $data_file" >&2
       exit 1
     fi
