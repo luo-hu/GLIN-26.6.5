@@ -60,6 +60,10 @@ add_executable(bench_geos_quadtree_wkt src/benchmark/bench_geos_quadtree_wkt.cpp
 target_link_libraries(bench_geos_quadtree_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
 target_include_directories(bench_geos_quadtree_wkt PUBLIC "$<BUILD_INTERFACE:${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
 
+add_executable(bench_index_size_wkt src/benchmark/bench_index_size_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
+target_link_libraries(bench_index_size_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
+target_include_directories(bench_index_size_wkt PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+
 add_executable(bench_update_wkt src/benchmark/bench_update_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_link_libraries(bench_update_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
 target_include_directories(bench_update_wkt PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
@@ -88,7 +92,7 @@ if(UNIX AND NOT APPLE)
   if(DEFINED ENV{LD_LIBRARY_PATH})
     list(APPEND GLIN_TEST_LIBRARY_PATHS "$ENV{LD_LIBRARY_PATH}")
   endif()
-  set_target_properties(test_glin test_glin_piece bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries generate_synthetic_points convert_binary_points_to_wkt generate_synthetic_rectangles bench_boost_rtree_wkt bench_geos_quadtree_wkt bench_update_wkt bench_update_wkt_piece bench_hybrid_wkt_piece
+  set_target_properties(test_glin test_glin_piece bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries generate_synthetic_points convert_binary_points_to_wkt generate_synthetic_rectangles bench_boost_rtree_wkt bench_geos_quadtree_wkt bench_index_size_wkt bench_update_wkt bench_update_wkt_piece bench_hybrid_wkt_piece
     PROPERTIES BUILD_RPATH "${GLIN_TEST_LIBRARY_PATHS}")
   list(JOIN GLIN_TEST_LIBRARY_PATHS ":" GLIN_TEST_LIBRARY_PATH)
   set_tests_properties(test_glin test_glin_piece
