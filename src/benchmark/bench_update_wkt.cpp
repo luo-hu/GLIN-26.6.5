@@ -1,9 +1,10 @@
 // Fig.15/Fig.16 style update benchmark for WKT datasets.
 //
 // Insert workload: bulk-load a random 50% of the records, then insert the
-// remaining records one by one.
+// remaining records one by one.  50%批量建索引，剩余50%逐条插入
 // Delete workload: bulk-load 100% of the records, then delete a random 50%
-// of the records one by one.
+// of the records one by one.   100%批量建索引，随机50%逐条删除
+
 
 #include "../../glin/glin.h"
 
@@ -45,6 +46,7 @@ using RTreeQuadratic = bgi::rtree<RTreeValue, bgi::quadratic<16>>;
 using RTreeRStar = bgi::rtree<RTreeValue, bgi::rstar<16>>;
 using Quadtree = geos::index::quadtree::Quadtree;
 
+//Options：所有命令行入参的仓库，shell 传的LIMIT/PROGRESS_STEP_PERCENT/PIECE_LIMIT/insert_order全部存在这里
 struct Options {
   std::string data_file;
   std::string dataset_name = "WKT";
@@ -65,13 +67,13 @@ struct Options {
   bool include_baselines = true;
   bool append_csv = false;
 };
-
+//LoadStats：文件加载统计：读取行数、解析报错数、文件加载耗时
 struct LoadStats {
   std::size_t lines_seen = 0;
   std::size_t parse_errors = 0;
   long long load_ns = 0;
 };
-
+//UpdateResult：终端一行日志 = 一个 UpdateResult（你运行打印的dataset=AW index=GLIN ...全来自这个结构体）
 struct UpdateResult {
   std::string index;
   std::string operation;
@@ -84,7 +86,7 @@ struct UpdateResult {
   std::size_t failed_count = 0;
   std::size_t pieces = 0;
 };
-
+//ProgressResult：进度打点数据，每 5%/10% 更新记录瞬时性能，写入 progress.csv 画折线图
 struct ProgressResult {
   std::string index;
   std::string operation;
@@ -122,7 +124,7 @@ void print_usage(const char* program) {
       << "  --progress_step_percent N  Checkpoint step percent (default: 10)\n"
       << "  --append_csv             Append to output CSV instead of overwriting\n";
 }
-
+// Options parse_args(int argc, char* argv[])：解析所有--xxx命令行参数，把参数填进 Options 结构体；例：--limit 5000000 → options.limit=5000000
 Options parse_args(int argc, char* argv[]) {
   Options options;
   for (int i = 1; i < argc; ++i) {
@@ -251,6 +253,7 @@ std::string extract_balanced_wkt(const std::string& text, std::size_t start) {
   return text.substr(start);
 }
 
+// extract_wkt()：从 CSV 每行字符串里抠出 WKT 文本（解决 csv 带引号、杂字符、科学计数法解析问
 std::string extract_wkt(std::string line) {
   strip_bom(line);
   strip_cr(line);
@@ -276,7 +279,7 @@ std::string extract_wkt(std::string line) {
   }
   return "";
 }
-
+//load_wkt_csv()：打开磁盘文件→逐行提取 WKT→GEOS 解析成 Geometry 几何数组，整个数据加载入口；
 std::vector<GeometryPtr> load_wkt_csv(const Options& options,
                                       geos::io::WKTReader& reader,
                                       LoadStats& stats) {
@@ -327,7 +330,10 @@ std::vector<GeometryPtr> load_wkt_csv(const Options& options,
   }
   return geometries;
 }
-
+//shuffled_ids/zmin_order_ids/file_order_ids：三种数据排序规则，对应--insert_order random/zmin/file；
+//random：随机打乱下标
+//zmin：按几何包围盒 Z 值升序排序（GLIN 最优插入顺序）
+//file：原始文件顺序
 std::vector<std::size_t> shuffled_ids(std::size_t n, std::uint64_t seed) {
   std::vector<std::size_t> ids(n);
   std::iota(ids.begin(), ids.end(), 0);
@@ -487,7 +493,15 @@ void capture_progress(const Options& options,
     ++next_checkpoint;
   }
 }
-
+// 四大索引运行函数（核心业务，性能测试逻辑）
+// 分四类函数，一一对应日志里四种 index 名称：
+// run_glin_insert / run_glin_delete → index=GLIN / GLIN_PIECEWISE（受#ifdef PIECE控制）
+// run_boost_insert / run_boost_delete → index=Boost_Rtree（linear/rstar/quadratic）
+// run_quadtree_insert / run_quadtree_delete → index=GEOS_Quadtree
+// 每个函数固定流程：
+// ① 拆分初始数据批量 bulk-load 建索引、计时（build_ns）
+// ② 剩余数据循环逐条插入 / 删除、计时（update_ns）
+// ③ 每隔 N% 进度写入 progress 打点数据
 UpdateResult run_glin_insert(const Options& options,
                              const std::vector<GeometryPtr>& geometries,
                              const std::vector<std::size_t>& ids,
@@ -1011,6 +1025,21 @@ void print_result(const Options& options, const LoadStats& stats,
             << " update_ms=" << result.update_ns / 1e6
             << " avg_update_ns=" << avg_update_ns
             << " throughput_ops_per_sec=" << throughput << "\n";
+  // dataset	数据集名称
+  // index	索引：GLIN/Boost_Rtree/GEOS_Quadtree/GLIN_PIECEWISE
+  // operation	insert = 增量插入、delete = 增量删除，--mode both两个都跑
+  // loaded	最终成功加载的有效几何体总数
+  // initial	前 50% 数据，用来初始构建索引
+  // updates	后 50% 数据，分批动态更新（插入 / 删除）的总条数
+  // success/failed	更新成功 / 失败条数
+  // pieces	仅 GLIN_PIECEWISE 有效：分片数量；原版 GLIN 固定 = 0
+  // lines_seen	原始文件读取总行数
+  // parse_errors	WKT 解析出错行数
+  // load_ms	原始文件解析 + 加载进内存总耗时 (ms)
+  // build_ms	初始数据集构建索引耗时 (ms)
+  // update_ms	全部增量更新（insert/delete）总耗时 (ms)
+  // avg_update_ns	单次更新平均纳秒耗时，越小性能越好
+  // throughput_ops_per_sec	每秒更新吞吐（操作数），越大性能越好
 }
 
 }  // namespace
