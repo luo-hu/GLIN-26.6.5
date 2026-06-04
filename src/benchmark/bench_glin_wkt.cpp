@@ -200,7 +200,7 @@ std::string extract_wkt(std::string line) {
       return extract_balanced_wkt(line, pos);
     }
   }
-  return line;
+  return "";
 }
 
 // GLIN 的接口要 vector<Geometry*>；这里把 unique_ptr 管理的对象转成裸指针视图。

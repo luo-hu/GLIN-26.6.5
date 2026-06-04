@@ -69,6 +69,11 @@ target_compile_definitions(bench_update_wkt_piece PRIVATE PIECE)
 target_link_libraries(bench_update_wkt_piece PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
 target_include_directories(bench_update_wkt_piece PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
 
+add_executable(bench_hybrid_wkt_piece src/benchmark/bench_hybrid_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
+target_compile_definitions(bench_hybrid_wkt_piece PRIVATE PIECE)
+target_link_libraries(bench_hybrid_wkt_piece PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
+target_include_directories(bench_hybrid_wkt_piece PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+
 enable_testing()
 add_test(NAME test_glin COMMAND test_glin)
 add_test(NAME test_glin_piece COMMAND test_glin_piece)
@@ -83,7 +88,7 @@ if(UNIX AND NOT APPLE)
   if(DEFINED ENV{LD_LIBRARY_PATH})
     list(APPEND GLIN_TEST_LIBRARY_PATHS "$ENV{LD_LIBRARY_PATH}")
   endif()
-  set_target_properties(test_glin test_glin_piece bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries generate_synthetic_points convert_binary_points_to_wkt generate_synthetic_rectangles bench_boost_rtree_wkt bench_geos_quadtree_wkt bench_update_wkt bench_update_wkt_piece
+  set_target_properties(test_glin test_glin_piece bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries generate_synthetic_points convert_binary_points_to_wkt generate_synthetic_rectangles bench_boost_rtree_wkt bench_geos_quadtree_wkt bench_update_wkt bench_update_wkt_piece bench_hybrid_wkt_piece
     PROPERTIES BUILD_RPATH "${GLIN_TEST_LIBRARY_PATHS}")
   list(JOIN GLIN_TEST_LIBRARY_PATHS ":" GLIN_TEST_LIBRARY_PATH)
   set_tests_properties(test_glin test_glin_piece

@@ -30,6 +30,8 @@ QUERY_COUNT=${4:-100}
 SEED=${5:-42}
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 GENERATOR_DIR="$REPO_ROOT/java/jts-query-generator"
+JTS_JAVA_HEAP="${JTS_JAVA_HEAP:-12g}"
+QUERY_SELECTIVITIES="${QUERY_SELECTIVITIES:-1%,0.1%,0.01%,0.001%}"
 
 if ! command -v java >/dev/null 2>&1; then
   echo "Error: java is not installed. Run: sudo apt install -y openjdk-17-jdk maven" >&2
@@ -41,8 +43,15 @@ if ! command -v mvn >/dev/null 2>&1; then
   exit 1
 fi
 
-mkdir -p "$(dirname "$REPO_ROOT/$OUTPUT_PREFIX")"
+if [[ "$OUTPUT_PREFIX" = /* ]]; then
+  OUTPUT_PREFIX_FOR_JAVA="$OUTPUT_PREFIX"
+  mkdir -p "$(dirname "$OUTPUT_PREFIX")"
+else
+  OUTPUT_PREFIX_FOR_JAVA="../../$OUTPUT_PREFIX"
+  mkdir -p "$(dirname "$REPO_ROOT/$OUTPUT_PREFIX")"
+fi
 
 cd "$GENERATOR_DIR"
 mvn -q -DskipTests package
-mvn -q exec:java -Dexec.args="--data_file $DATA_FILE --limit $LIMIT --query_count $QUERY_COUNT --selectivities 1%,0.1%,0.01%,0.001% --output_prefix ../../$OUTPUT_PREFIX --seed $SEED"
+MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx${JTS_JAVA_HEAP}" \
+  mvn -q exec:java -Dexec.args="--data_file $DATA_FILE --limit $LIMIT --query_count $QUERY_COUNT --selectivities $QUERY_SELECTIVITIES --output_prefix $OUTPUT_PREFIX_FOR_JAVA --seed $SEED"

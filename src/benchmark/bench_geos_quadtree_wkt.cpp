@@ -179,7 +179,7 @@ std::string extract_wkt(std::string line) {
       return extract_balanced_wkt(line, pos);
     }
   }
-  return line;
+  return "";
 }
 
 std::vector<GeometryPtr> load_wkt_csv(const Options& options,
