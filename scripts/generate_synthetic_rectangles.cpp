@@ -32,6 +32,7 @@ struct Options {
   double max_height = 0.001;
   double diagonal_noise = 0.01;
   std::uint64_t seed = 42;
+  bool avoid_clamp = false;
 };
 
 void print_usage(const char* program) {
@@ -50,6 +51,7 @@ void print_usage(const char* program) {
       << "  --min_height H            Minimum rectangle height (default: 0.0001)\n"
       << "  --max_height H            Maximum rectangle height (default: 0.001)\n"
       << "  --diagonal_noise F        Diagonal noise as fraction of y range (default: 0.01)\n"
+      << "  --avoid_clamp             Sample centers so rectangles do not touch world bounds\n"
       << "  --seed N                  Random seed (default: 42)\n";
 }
 
@@ -88,6 +90,8 @@ Options parse_args(int argc, char* argv[]) {
       options.max_height = std::stod(require_value(key));
     } else if (key == "--diagonal_noise") {
       options.diagonal_noise = std::stod(require_value(key));
+    } else if (key == "--avoid_clamp") {
+      options.avoid_clamp = true;
     } else if (key == "--seed") {
       options.seed = static_cast<std::uint64_t>(std::stoull(require_value(key)));
     } else if (key == "--help" || key == "-h") {
@@ -116,6 +120,11 @@ Options parse_args(int argc, char* argv[]) {
   }
   if (options.diagonal_noise < 0.0) {
     throw std::runtime_error("--diagonal_noise must be non-negative");
+  }
+  if (options.avoid_clamp &&
+      (options.max_width >= options.xmax - options.xmin ||
+       options.max_height >= options.ymax - options.ymin)) {
+    throw std::runtime_error("--avoid_clamp requires max width/height smaller than the coordinate range");
   }
   return options;
 }
@@ -157,19 +166,41 @@ int main(int argc, char* argv[]) {
 
     output << std::setprecision(17);
     for (std::size_t i = 0; i < options.num; ++i) {
+      const double width = wdist(generator);
+      const double height = hdist(generator);
+
+      const double center_xmin =
+          options.avoid_clamp ? options.xmin + width / 2.0 : options.xmin;
+      const double center_xmax =
+          options.avoid_clamp ? options.xmax - width / 2.0 : options.xmax;
+      const double center_ymin =
+          options.avoid_clamp ? options.ymin + height / 2.0 : options.ymin;
+      const double center_ymax =
+          options.avoid_clamp ? options.ymax - height / 2.0 : options.ymax;
+      const double center_xrange = center_xmax - center_xmin;
+      const double center_yrange = center_ymax - center_ymin;
+
       double cx = 0.0;
       double cy = 0.0;
       if (options.dist == "uniform") {
-        cx = xdist(generator);
-        cy = ydist(generator);
+        if (options.avoid_clamp) {
+          cx = center_xmin + unit(generator) * center_xrange;
+          cy = center_ymin + unit(generator) * center_yrange;
+        } else {
+          cx = xdist(generator);
+          cy = ydist(generator);
+        }
       } else {
         const double t = unit(generator);
-        cx = options.xmin + t * xrange;
-        cy = options.ymin + clamp(t + noise(generator), 0.0, 1.0) * yrange;
+        if (options.avoid_clamp) {
+          cx = center_xmin + t * center_xrange;
+          cy = center_ymin + clamp(t + noise(generator), 0.0, 1.0) * center_yrange;
+        } else {
+          cx = options.xmin + t * xrange;
+          cy = options.ymin + clamp(t + noise(generator), 0.0, 1.0) * yrange;
+        }
       }
 
-      const double width = wdist(generator);
-      const double height = hdist(generator);
       double rxmin = clamp(cx - width / 2.0, options.xmin, options.xmax);
       double rxmax = clamp(cx + width / 2.0, options.xmin, options.xmax);
       double rymin = clamp(cy - height / 2.0, options.ymin, options.ymax);
@@ -190,6 +221,7 @@ int main(int argc, char* argv[]) {
               << options.xmax << "," << options.ymax << "]"
               << " width=[" << options.min_width << "," << options.max_width << "]"
               << " height=[" << options.min_height << "," << options.max_height << "]"
+              << " avoid_clamp=" << (options.avoid_clamp ? "true" : "false")
               << " seed=" << options.seed << "\n";
   } catch (const std::exception& ex) {
     std::cerr << "Error: " << ex.what() << "\n";

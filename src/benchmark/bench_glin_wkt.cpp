@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -33,6 +34,11 @@ namespace {
 
 using Geometry = geos::geom::Geometry;
 using GeometryPtr = std::unique_ptr<Geometry>;
+
+bool debug_progress_enabled() {
+  const char* value = std::getenv("GLIN_DEBUG_PROGRESS");
+  return value != nullptr && std::string(value) != "0";
+}
 
 struct Options {
   std::string data_file;       // 输入数据文件，例如 /mnt/hgfs/AREAWATER.csv。
@@ -441,15 +447,23 @@ int main(int argc, char* argv[]) {
 
     std::vector<Geometry*> geometries = raw_ptrs(owned_geometries);
     std::vector<std::tuple<double, double, double, double>> pieces;
+    const bool debug_progress = debug_progress_enabled();
 
     // 2. 建 GLIN 索引。这里才是 index build time，不包含上面的文件读取时间。
     alex::Glin<double, Geometry*> index;
+    if (debug_progress) {
+      std::cerr << "[debug] build_start loaded=" << geometries.size() << "\n";
+    }
     auto build_start = std::chrono::high_resolution_clock::now();
     index.glin_bulk_load(geometries, options.piece_limit, "z",
                          options.cell_xmin, options.cell_ymin,
                          options.cell_size, options.cell_size, pieces);
     auto build_end = std::chrono::high_resolution_clock::now();
     long long build_ns = ns_count(build_end - build_start);
+    if (debug_progress) {
+      std::cerr << "[debug] build_done pieces=" << pieces.size()
+                << " nodes=" << index.num_nodes() << "\n";
+    }
 
     // 3. 准备查询窗口：
     //    - 如果传了 --query_file，就读取固定 query 文件。
@@ -466,6 +480,10 @@ int main(int argc, char* argv[]) {
     for (const auto& query : queries) {
       int count_filter = 0;
       std::vector<Geometry*> find_result;
+      if (debug_progress) {
+        std::cerr << "[debug] query_start id=" << query.query_id
+                  << " source=" << query.source_geometry_id << "\n";
+      }
 
       // glin_find 内部会先 index_probe，再 refine。
       // 无 PIECE 版本 refine 用 contains；PIECE 版本 refine 用 intersects。
@@ -483,6 +501,11 @@ int main(int argc, char* argv[]) {
       result.visited_leaf = index.avg_num_visited_leaf;
       result.loaded_leaf = index.avg_num_loaded_leaf;
       results.push_back(result);
+      if (debug_progress) {
+        std::cerr << "[debug] query_done id=" << query.query_id
+                  << " candidates=" << result.candidates
+                  << " answers=" << result.answers << "\n";
+      }
     }
 
     long long total_probe_ns = 0;

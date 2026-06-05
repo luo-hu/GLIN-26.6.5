@@ -31,6 +31,7 @@ QUERY_DIR=${QUERY_DIR:-queries/all_1m}
 FIGURE_DIR=${FIGURE_DIR:-figures/all_1m}
 REAL_WORK_DIR=${REAL_WORK_DIR:-data/real}
 SYN_WORK_DIR=${SYN_WORK_DIR:-data/synthetic/glin_geo}
+ZGAP_WORK_DIR=${ZGAP_WORK_DIR:-data/synthetic/zrange_gap}
 SUMMARY_CSV=${SUMMARY_CSV:-results/all_1m_summary.csv}
 DATASETS=${DATASETS:-"AW LW ROADS PARKS OSM_AU_POINTS UNIF_S UNIF_L DIAG_S DIAG_L"}
 SYNTHETIC_KIND=${SYNTHETIC_KIND:-points}
@@ -77,6 +78,7 @@ dataset_file() {
     UNIF_L) echo "${SYN_WORK_DIR}/UNIF_L.wkt" ;;
     DIAG_S) echo "${SYN_WORK_DIR}/DIAG_S.wkt" ;;
     DIAG_L) echo "${SYN_WORK_DIR}/DIAG_L.wkt" ;;
+    ZGAP_WIDE) echo "${ZGAP_WORK_DIR}/ZGAP_WIDE.wkt" ;;
     *)
       echo "Error: unknown dataset '$1'" >&2
       exit 1
@@ -138,6 +140,16 @@ prepare_data() {
         echo "Error: SYNTHETIC_KIND must be points or rectangles" >&2
         exit 1
       fi
+    fi
+  fi
+
+  if [[ " $DATASETS " == *" ZGAP_WIDE "* ]]; then
+    local zgap_wkt
+    zgap_wkt=$(dataset_file ZGAP_WIDE)
+    if should_run_file "$zgap_wkt"; then
+      echo "[prepare] Generate Zmin/Zmax gap stress dataset -> $zgap_wkt"
+      run_cmd env NUM="$LIMIT" OUT_DIR="$ZGAP_WORK_DIR" NAME=ZGAP_WIDE \
+        SEED="$SEED" AUTO_BUILD=0 scripts/prepare_zrange_gap_dataset.sh
     fi
   fi
 }

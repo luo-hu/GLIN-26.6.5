@@ -14,7 +14,7 @@ import pandas as pd
 
 
 REAL_DATASETS = ["AW", "LW", "ROADS", "PARKS", "OSM_AU_POINTS"]
-SYNTHETIC_DATASETS = ["DIAG_S", "DIAG_L", "UNIF_S", "UNIF_L"]
+SYNTHETIC_DATASETS = ["DIAG_S", "DIAG_L", "UNIF_S", "UNIF_L", "ZGAP_WIDE"]
 DATASET_ORDER = REAL_DATASETS + SYNTHETIC_DATASETS
 RANGE_ORDER = ["Zmin", "Zmax"]
 COLORS = {
@@ -27,6 +27,7 @@ COLORS = {
     "DIAG_L": "#1F4E79",
     "UNIF_S": "#C46A4A",
     "UNIF_L": "#8C3E2F",
+    "ZGAP_WIDE": "#2F855A",
 }
 MARKERS = {
     "AW": "o",
@@ -38,9 +39,11 @@ MARKERS = {
     "DIAG_L": "s",
     "UNIF_S": "^",
     "UNIF_L": "D",
+    "ZGAP_WIDE": "P",
 }
 LABELS = {
     "OSM_AU_POINTS": "OSM Points",
+    "ZGAP_WIDE": "Z-gap Wide",
 }
 
 
