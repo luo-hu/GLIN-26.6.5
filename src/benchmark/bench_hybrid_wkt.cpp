@@ -115,6 +115,7 @@ struct HybridResult {
   long long build_ns = 0;
   long long workload_ns = 0;
   long long maintenance_ns = 0;
+  long long drain_ns = 0;
   std::size_t pieces = 0;
   std::size_t flush_count = 0;
   std::size_t merge_count = 0;
@@ -773,7 +774,7 @@ struct BackgroundBuildResult {
 
 struct BackgroundJob {
   bool active = false;
-  std::size_t pending_delta_id = 0;
+  std::vector<std::size_t> pending_delta_ids;
   std::vector<std::size_t> obsolete_segment_ids;
   std::future<BackgroundBuildResult> future;
 };
@@ -816,11 +817,12 @@ void apply_background_job(BackgroundJob& job,
   result.maintenance_ns += built.maintenance_ns;
   result.merge_count += built.merge_count;
 
-  if (job.pending_delta_id != 0) {
+  if (!job.pending_delta_ids.empty()) {
     pending_deltas.erase(
         std::remove_if(pending_deltas.begin(), pending_deltas.end(),
                        [&](const PendingDelta& delta) {
-                         return delta.delta_id == job.pending_delta_id;
+                         return id_in_list(delta.delta_id,
+                                           job.pending_delta_ids);
                        }),
         pending_deltas.end());
   }
@@ -837,7 +839,7 @@ void apply_background_job(BackgroundJob& job,
 
   segments.push_back(std::move(built.segment));
   job.active = false;
-  job.pending_delta_id = 0;
+  job.pending_delta_ids.clear();
   job.obsolete_segment_ids.clear();
 }
 
@@ -871,23 +873,10 @@ bool schedule_background_job(const Options& options,
                              std::vector<GlinSegment>& segments,
                              std::size_t fanout,
                              std::size_t& next_segment_id,
-                             BackgroundJob& job) {
+                             BackgroundJob& job,
+                             bool flush_partial_delta_group) {
   if (job.active) {
     return false;
-  }
-
-  for (auto& delta : pending_deltas) {
-    if (delta.flushing) {
-      continue;
-    }
-    delta.flushing = true;
-    std::size_t segment_id = next_segment_id++;
-    job.active = true;
-    job.pending_delta_id = delta.delta_id;
-    job.obsolete_segment_ids.clear();
-    job.future = launch_background_build(options, geometries, delta.ids, 0,
-                                         segment_id, 0);
-    return true;
   }
 
   for (std::size_t i = 0; i < segments.size(); ++i) {
@@ -917,10 +906,40 @@ bool schedule_background_job(const Options& options,
 
     std::size_t segment_id = next_segment_id++;
     job.active = true;
-    job.pending_delta_id = 0;
+    job.pending_delta_ids.clear();
     job.obsolete_segment_ids = obsolete_segment_ids;
     job.future = launch_background_build(options, geometries, merged_ids,
                                          level + 1, segment_id, 1);
+    return true;
+  }
+
+  std::vector<std::size_t> delta_indices;
+  for (std::size_t i = 0; i < pending_deltas.size(); ++i) {
+    if (!pending_deltas[i].flushing) {
+      delta_indices.push_back(i);
+    }
+  }
+  if (delta_indices.size() >= fanout ||
+      (flush_partial_delta_group && !delta_indices.empty())) {
+    std::size_t group_size =
+        flush_partial_delta_group ? delta_indices.size() : fanout;
+    delta_indices.resize(group_size);
+
+    std::vector<std::size_t> merged_ids;
+    std::vector<std::size_t> pending_delta_ids;
+    for (std::size_t index : delta_indices) {
+      PendingDelta& delta = pending_deltas[index];
+      delta.flushing = true;
+      pending_delta_ids.push_back(delta.delta_id);
+      merged_ids.insert(merged_ids.end(), delta.ids.begin(), delta.ids.end());
+    }
+
+    std::size_t segment_id = next_segment_id++;
+    job.active = true;
+    job.pending_delta_ids = pending_delta_ids;
+    job.obsolete_segment_ids.clear();
+    job.future = launch_background_build(options, geometries, merged_ids, 0,
+                                         segment_id, 0);
     return true;
   }
 
@@ -1408,7 +1427,7 @@ HybridResult run_glin_lsm_background_hybrid(
     if (!background_job.active) {
       schedule_background_job(options, geometries, pending_deltas, segments,
                               compaction_fanout, next_segment_id,
-                              background_job);
+                              background_job, false);
     }
   };
 
@@ -1528,14 +1547,17 @@ HybridResult run_glin_lsm_background_hybrid(
   auto workload_end = std::chrono::high_resolution_clock::now();
   result.workload_ns = ns_count(workload_end - workload_start);
 
+  auto drain_start = std::chrono::high_resolution_clock::now();
   while (true) {
     wait_background_job(background_job, pending_deltas, segments, result);
     if (!schedule_background_job(options, geometries, pending_deltas, segments,
                                  compaction_fanout, next_segment_id,
-                                 background_job)) {
+                                 background_job, true)) {
       break;
     }
   }
+  auto drain_end = std::chrono::high_resolution_clock::now();
+  result.drain_ns = ns_count(drain_end - drain_start);
 
   update_lsm_state();
   return result;
@@ -1732,16 +1754,43 @@ void write_summary_csv(const std::string& path, const Options& options,
               "insert_batch_percent,loaded_count,initial_count,total_insert_count,"
               "insert_order,piece_limit,cell_xmin,cell_ymin,cell_size,seed,"
               "lines_seen,parse_errors,load_ns,build_ns,workload_ns,maintenance_ns,"
-              "throughput_transactions_per_sec,transaction_count,query_transactions,"
+              "drain_ns,total_elapsed_ns,throughput_transactions_per_sec,"
+              "total_throughput_transactions_per_sec,transaction_count,query_transactions,"
               "insert_transactions,insert_success_count,insert_failed_count,pieces,"
               "flush_count,merge_count,delta_pending,delta_size,segment_count,"
-              "max_segment_level,segments_pruned_total,candidates_total,answers_total\n";
+              "max_segment_level,segments_pruned_total,candidates_total,answers_total,"
+              "candidate_answer_ratio,answers_match_boost,answers_delta_vs_boost\n";
   }
   for (const auto& result : results) {
     double throughput = result.workload_ns == 0
                             ? 0.0
                             : static_cast<double>(result.transaction_count) * 1e9 /
                                   static_cast<double>(result.workload_ns);
+    long long total_elapsed_ns = result.workload_ns + result.drain_ns;
+    double total_throughput =
+        total_elapsed_ns == 0
+            ? 0.0
+            : static_cast<double>(result.transaction_count) * 1e9 /
+                  static_cast<double>(total_elapsed_ns);
+    double candidate_answer_ratio =
+        result.answers_total == 0
+            ? 0.0
+            : static_cast<double>(result.candidates_total) /
+                  static_cast<double>(result.answers_total);
+    bool has_boost = false;
+    long long boost_answers = 0;
+    for (const auto& baseline : results) {
+      if (baseline.workload == result.workload &&
+          baseline.index == "Boost_Rtree") {
+        has_boost = true;
+        boost_answers = baseline.answers_total;
+        break;
+      }
+    }
+    long long answers_delta_vs_boost =
+        has_boost ? result.answers_total - boost_answers : 0;
+    int answers_match_boost =
+        has_boost && answers_delta_vs_boost == 0 ? 1 : 0;
     output << options.dataset_name << "," << result.index << ",intersects,"
            << result.workload << "," << result.query_fraction << ","
            << options.insert_batch_percent << "," << result.loaded_count << ","
@@ -1752,7 +1801,8 @@ void write_summary_csv(const std::string& path, const Options& options,
            << stats.lines_seen << "," << stats.parse_errors << ","
            << stats.load_ns << "," << result.build_ns << ","
            << result.workload_ns << "," << result.maintenance_ns << ","
-           << throughput << ","
+           << result.drain_ns << "," << total_elapsed_ns << ","
+           << throughput << "," << total_throughput << ","
            << result.transaction_count << "," << result.query_transactions << ","
            << result.insert_transactions << "," << result.insert_success_count
            << "," << result.insert_failed_count << "," << result.pieces << ","
@@ -1761,7 +1811,9 @@ void write_summary_csv(const std::string& path, const Options& options,
            << options.delta_size << "," << result.segment_count << ","
            << result.max_segment_level << "," << result.segments_pruned_total
            << ","
-           << result.candidates_total << "," << result.answers_total << "\n";
+           << result.candidates_total << "," << result.answers_total << ","
+           << candidate_answer_ratio << "," << answers_match_boost << ","
+           << answers_delta_vs_boost << "\n";
   }
 }
 
@@ -1852,6 +1904,7 @@ void print_result(const HybridResult& result) {
             << " build_ms=" << result.build_ns / 1e6
             << " workload_ms=" << result.workload_ns / 1e6
             << " maintenance_ms=" << result.maintenance_ns / 1e6
+            << " drain_ms=" << result.drain_ns / 1e6
             << " throughput_tx_per_sec=" << throughput << "\n";
 }
 

@@ -76,6 +76,8 @@ def read_rows(path):
                 row["throughput_transactions_per_sec"] = float(
                     row["throughput_transactions_per_sec"]
                 )
+                for field in ["delta_pending", "segment_count", "maintenance_ns"]:
+                    row[field] = float(row.get(field) or 0)
             except (KeyError, ValueError) as exc:
                 raise ValueError(f"Bad row in {path}: {row}") from exc
             rows.append(row)
@@ -145,6 +147,53 @@ def plot_panel(rows, output_path):
     plt.close(fig)
 
 
+def plot_metric_panel(rows, output_path, field, ylabel):
+    grouped = group_rows(rows)
+    datasets = [d for d in ["ROADS", "PARKS"] if any(row["dataset"] == d for row in rows)]
+    if not datasets:
+        datasets = sorted({row["dataset"] for row in rows})
+    workloads = [
+        w
+        for w in ["read_intensive", "write_intensive"]
+        if any(row["workload"] == w for row in rows)
+    ]
+    if not workloads:
+        workloads = sorted({row["workload"] for row in rows})
+
+    fig, axes = plt.subplots(
+        len(workloads),
+        len(datasets),
+        figsize=(5.2 * len(datasets), 3.8 * len(workloads)),
+        squeeze=False,
+    )
+
+    for r, workload in enumerate(workloads):
+        for c, dataset in enumerate(datasets):
+            ax = axes[r][c]
+            for index in INDEX_ORDER:
+                series = grouped.get((workload, dataset, index), [])
+                if not series:
+                    continue
+                ax.plot(
+                    ordered_values(series, "inserted_percent"),
+                    ordered_values(series, field),
+                    label=INDEX_LABELS.get(index, index),
+                    linewidth=1.8,
+                    markersize=4.5,
+                    **STYLE.get(index, {}),
+                )
+            ax.set_title(f"{WORKLOAD_LABELS.get(workload, workload)} on {dataset}")
+            ax.set_xlabel("Number of Inserted Records (%)")
+            ax.set_ylabel(ylabel)
+            ax.grid(True, axis="y", linestyle=":", linewidth=0.8, alpha=0.7)
+            ax.set_xlim(left=0)
+            ax.legend(frameon=False, fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220)
+    plt.close(fig)
+
+
 def plot_each_workload(rows, output_dir, prefix):
     grouped = group_rows(rows)
     for workload in sorted({row["workload"] for row in rows}):
@@ -173,6 +222,77 @@ def plot_each_workload(rows, output_dir, prefix):
             plt.close(fig)
 
 
+def maybe_float(row, field):
+    try:
+        return float(row.get(field) or 0)
+    except ValueError:
+        return 0.0
+
+
+def maybe_int(row, field):
+    try:
+        return int(float(row.get(field) or 0))
+    except ValueError:
+        return 0
+
+
+def write_summary_diagnostics(summary_csv, output_path):
+    if not summary_csv.exists():
+        return False
+
+    rows = []
+    with open(summary_csv, newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            rows.append(row)
+    if not rows:
+        return False
+
+    rows.sort(
+        key=lambda row: (
+            row.get("dataset", ""),
+            row.get("workload", ""),
+            INDEX_ORDER.index(row["index"])
+            if row.get("index") in INDEX_ORDER
+            else len(INDEX_ORDER),
+        )
+    )
+
+    with open(output_path, "w", encoding="utf-8") as handle:
+        handle.write("Fig.17 hybrid metric notes\n")
+        handle.write("==========================\n\n")
+        handle.write("名词速查：\n")
+        handle.write("- foreground throughput: 只看前台事务时间，也就是用户感受到的在线查询/写入吞吐。\n")
+        handle.write("- total throughput: workload_ns + drain_ns 后的吞吐，把最后收尾维护也算进去。\n")
+        handle.write("- maintenance_ns: 后台 flush/compaction 真正花掉的建索引时间，越大说明维护成本越重。\n")
+        handle.write("- drain_ns: workload 结束后等待后台任务收尾的时间；越大说明后台追不上前台。\n")
+        handle.write("- delta_pending: 还停留在 delta R-tree 里的记录数；太大会增加查询双读成本。\n")
+        handle.write("- segment_count: 已经刷成 GLIN segment 的段数；太多会让一次查询查很多段。\n")
+        handle.write("- candidate/answer ratio: 候选数 / 真答案数；越接近 1，过滤越准。\n")
+        handle.write("- answers_match_boost: 1 表示答案总数和 Boost R-tree 一致，0 表示需要查正确性。\n\n")
+
+        handle.write(
+            "dataset,workload,index,fg_tps,total_tps,maintenance_s,drain_s,"
+            "flush,merge,delta_pending,segments,cand_answer_ratio,answers_ok\n"
+        )
+        for row in rows:
+            handle.write(
+                f"{row.get('dataset','')},{row.get('workload','')},"
+                f"{INDEX_LABELS.get(row.get('index',''), row.get('index',''))},"
+                f"{maybe_float(row, 'throughput_transactions_per_sec'):.3f},"
+                f"{maybe_float(row, 'total_throughput_transactions_per_sec'):.3f},"
+                f"{maybe_float(row, 'maintenance_ns') / 1e9:.6f},"
+                f"{maybe_float(row, 'drain_ns') / 1e9:.6f},"
+                f"{maybe_int(row, 'flush_count')},"
+                f"{maybe_int(row, 'merge_count')},"
+                f"{maybe_int(row, 'delta_pending')},"
+                f"{maybe_int(row, 'segment_count')},"
+                f"{maybe_float(row, 'candidate_answer_ratio'):.6f},"
+                f"{maybe_int(row, 'answers_match_boost')}\n"
+            )
+    return True
+
+
 def main():
     args = parse_args()
     input_csv = Path(args.input_csv)
@@ -181,11 +301,25 @@ def main():
 
     rows = read_rows(input_csv)
     panel_path = output_dir / f"{args.prefix}_curves_panel.png"
+    delta_pending_path = output_dir / f"{args.prefix}_delta_pending_panel.png"
+    segment_count_path = output_dir / f"{args.prefix}_segment_count_panel.png"
+    maintenance_path = output_dir / f"{args.prefix}_maintenance_ns_panel.png"
+    diagnostics_path = output_dir / f"{args.prefix}_summary_diagnostics.txt"
     plot_panel(rows, panel_path)
+    plot_metric_panel(rows, delta_pending_path, "delta_pending", "Pending Delta Records")
+    plot_metric_panel(rows, segment_count_path, "segment_count", "Segment Count")
+    plot_metric_panel(rows, maintenance_path, "maintenance_ns", "Maintenance Time (ns)")
     plot_each_workload(rows, output_dir, args.prefix)
+    summary_csv = input_csv.with_name("fig17_hybrid_summary.csv")
+    wrote_diagnostics = write_summary_diagnostics(summary_csv, diagnostics_path)
 
     print(f"Rows: {len(rows)}")
     print(f"Panel: {panel_path}")
+    print(f"Delta pending: {delta_pending_path}")
+    print(f"Segment count: {segment_count_path}")
+    print(f"Maintenance: {maintenance_path}")
+    if wrote_diagnostics:
+        print(f"Diagnostics: {diagnostics_path}")
 
 
 if __name__ == "__main__":
