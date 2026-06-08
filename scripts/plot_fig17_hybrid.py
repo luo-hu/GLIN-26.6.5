@@ -17,6 +17,7 @@ INDEX_LABELS = {
     "GLIN_LSM_ASYNC": "GLIN-LSM-async",
     "GLIN_LSM_SEGMENTED": "GLIN-LSM-segmented",
     "GLIN_LSM_SEGMENTED4": "GLIN-LSM-seg4",
+    "GLIN_LSM_BG": "GLIN-LSM-bg",
     "Boost_Rtree": "Boost R-tree",
     "GEOS_Quadtree": "Quadtree",
 }
@@ -26,6 +27,7 @@ INDEX_ORDER = [
     "GLIN_LSM_ASYNC",
     "GLIN_LSM_SEGMENTED",
     "GLIN_LSM_SEGMENTED4",
+    "GLIN_LSM_BG",
     "GEOS_Quadtree",
     "Boost_Rtree",
 ]
@@ -35,6 +37,7 @@ STYLE = {
     "GLIN_LSM_ASYNC": {"marker": "D", "linestyle": "-.", "color": "#9467bd"},
     "GLIN_LSM_SEGMENTED": {"marker": "P", "linestyle": "-", "color": "#8c564b"},
     "GLIN_LSM_SEGMENTED4": {"marker": "X", "linestyle": "--", "color": "#ff7f0e"},
+    "GLIN_LSM_BG": {"marker": "v", "linestyle": "-", "color": "#17becf"},
     "GEOS_Quadtree": {"marker": "s", "linestyle": "--", "color": "#d62728"},
     "Boost_Rtree": {"marker": "^", "linestyle": ":", "color": "#2ca02c"},
 }

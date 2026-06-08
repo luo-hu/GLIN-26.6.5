@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -78,6 +79,7 @@ struct Options {
   bool include_lsm_async_glin = false;
   bool include_lsm_segmented_glin = false;
   bool include_lsm_segmented4_glin = false;
+  bool include_lsm_bg_glin = false;
   bool append_csv = false;
 };
 
@@ -177,6 +179,7 @@ void print_usage(const char* program) {
       << "  --include_lsm_async_glin 0|1 Also run GLIN-LSM-async (default: 0)\n"
       << "  --include_lsm_segmented_glin 0|1 Also run segmented GLIN-LSM (default: 0)\n"
       << "  --include_lsm_segmented4_glin 0|1 Also run fanout-4 pruned GLIN-LSM (default: 0)\n"
+      << "  --include_lsm_bg_glin 0|1 Also run background GLIN-LSM (default: 0)\n"
       << "  --delta_size N               Delta size before merge/rebuild (default: 100000)\n"
       << "  --seed N                     Random seed (default: 42)\n"
       << "  --output_csv PATH            Write summary CSV\n"
@@ -230,6 +233,8 @@ Options parse_args(int argc, char* argv[]) {
       options.include_lsm_segmented_glin = std::stoi(require_value(key)) != 0;
     } else if (key == "--include_lsm_segmented4_glin") {
       options.include_lsm_segmented4_glin = std::stoi(require_value(key)) != 0;
+    } else if (key == "--include_lsm_bg_glin") {
+      options.include_lsm_bg_glin = std::stoi(require_value(key)) != 0;
     } else if (key == "--delta_size") {
       options.delta_size =
           static_cast<std::size_t>(std::stoull(require_value(key)));
@@ -574,7 +579,9 @@ std::unique_ptr<alex::Glin<double, Geometry*>> build_glin_index_by_ids(
 }
 
 struct GlinSegment {
+  std::size_t segment_id = 0;
   std::size_t level = 0;
+  bool compacting = false;
   std::vector<std::size_t> ids;
   std::vector<std::tuple<double, double, double, double>> pieces;
   std::unique_ptr<alex::Glin<double, Geometry*>> index;
@@ -586,8 +593,10 @@ struct GlinSegment {
 GlinSegment build_glin_segment(const Options& options,
                                const std::vector<GeometryPtr>& geometries,
                                const std::vector<std::size_t>& ids,
-                               std::size_t level) {
+                               std::size_t level,
+                               std::size_t segment_id = 0) {
   GlinSegment segment;
+  segment.segment_id = segment_id;
   segment.level = level;
   segment.ids = zmin_sorted_batch_ids(options, geometries, ids, 0, ids.size());
   bool first = true;
@@ -747,6 +756,175 @@ bool segment_may_intersect_query(const GlinSegment& segment,
     return false;
   }
   return !(query_zmax < segment.zmin || segment.zmax < query_zmin);
+}
+
+struct PendingDelta {
+  std::size_t delta_id = 0;
+  bool flushing = false;
+  std::vector<std::size_t> ids;
+  RTree index;
+};
+
+struct BackgroundBuildResult {
+  GlinSegment segment;
+  long long maintenance_ns = 0;
+  std::size_t merge_count = 0;
+};
+
+struct BackgroundJob {
+  bool active = false;
+  std::size_t pending_delta_id = 0;
+  std::vector<std::size_t> obsolete_segment_ids;
+  std::future<BackgroundBuildResult> future;
+};
+
+long long pending_delta_record_count(const std::vector<PendingDelta>& deltas) {
+  long long total = 0;
+  for (const auto& delta : deltas) {
+    total += static_cast<long long>(delta.ids.size());
+  }
+  return total;
+}
+
+bool id_in_list(std::size_t id, const std::vector<std::size_t>& ids) {
+  return std::find(ids.begin(), ids.end(), id) != ids.end();
+}
+
+std::future<BackgroundBuildResult> launch_background_build(
+    const Options& options, const std::vector<GeometryPtr>& geometries,
+    std::vector<std::size_t> ids, std::size_t level,
+    std::size_t segment_id, std::size_t merge_count) {
+  return std::async(
+      std::launch::async,
+      [&options, &geometries, ids, level, segment_id, merge_count]() mutable {
+        auto start = std::chrono::high_resolution_clock::now();
+        BackgroundBuildResult result;
+        result.segment =
+            build_glin_segment(options, geometries, ids, level, segment_id);
+        auto end = std::chrono::high_resolution_clock::now();
+        result.maintenance_ns = ns_count(end - start);
+        result.merge_count = merge_count;
+        return result;
+      });
+}
+
+void apply_background_job(BackgroundJob& job,
+                          std::vector<PendingDelta>& pending_deltas,
+                          std::vector<GlinSegment>& segments,
+                          HybridResult& result) {
+  BackgroundBuildResult built = job.future.get();
+  result.maintenance_ns += built.maintenance_ns;
+  result.merge_count += built.merge_count;
+
+  if (job.pending_delta_id != 0) {
+    pending_deltas.erase(
+        std::remove_if(pending_deltas.begin(), pending_deltas.end(),
+                       [&](const PendingDelta& delta) {
+                         return delta.delta_id == job.pending_delta_id;
+                       }),
+        pending_deltas.end());
+  }
+
+  if (!job.obsolete_segment_ids.empty()) {
+    segments.erase(
+        std::remove_if(segments.begin(), segments.end(),
+                       [&](const GlinSegment& segment) {
+                         return id_in_list(segment.segment_id,
+                                           job.obsolete_segment_ids);
+                       }),
+        segments.end());
+  }
+
+  segments.push_back(std::move(built.segment));
+  job.active = false;
+  job.pending_delta_id = 0;
+  job.obsolete_segment_ids.clear();
+}
+
+void poll_background_job(BackgroundJob& job,
+                         std::vector<PendingDelta>& pending_deltas,
+                         std::vector<GlinSegment>& segments,
+                         HybridResult& result) {
+  if (!job.active) {
+    return;
+  }
+  if (job.future.wait_for(std::chrono::seconds(0)) ==
+      std::future_status::ready) {
+    apply_background_job(job, pending_deltas, segments, result);
+  }
+}
+
+void wait_background_job(BackgroundJob& job,
+                         std::vector<PendingDelta>& pending_deltas,
+                         std::vector<GlinSegment>& segments,
+                         HybridResult& result) {
+  if (!job.active) {
+    return;
+  }
+  job.future.wait();
+  apply_background_job(job, pending_deltas, segments, result);
+}
+
+bool schedule_background_job(const Options& options,
+                             const std::vector<GeometryPtr>& geometries,
+                             std::vector<PendingDelta>& pending_deltas,
+                             std::vector<GlinSegment>& segments,
+                             std::size_t fanout,
+                             std::size_t& next_segment_id,
+                             BackgroundJob& job) {
+  if (job.active) {
+    return false;
+  }
+
+  for (auto& delta : pending_deltas) {
+    if (delta.flushing) {
+      continue;
+    }
+    delta.flushing = true;
+    std::size_t segment_id = next_segment_id++;
+    job.active = true;
+    job.pending_delta_id = delta.delta_id;
+    job.obsolete_segment_ids.clear();
+    job.future = launch_background_build(options, geometries, delta.ids, 0,
+                                         segment_id, 0);
+    return true;
+  }
+
+  for (std::size_t i = 0; i < segments.size(); ++i) {
+    if (segments[i].compacting) {
+      continue;
+    }
+    std::size_t level = segments[i].level;
+    std::vector<std::size_t> compact_indices;
+    for (std::size_t j = 0; j < segments.size(); ++j) {
+      if (!segments[j].compacting && segments[j].level == level) {
+        compact_indices.push_back(j);
+      }
+    }
+    if (compact_indices.size() < fanout) {
+      continue;
+    }
+
+    compact_indices.resize(fanout);
+    std::vector<std::size_t> merged_ids;
+    std::vector<std::size_t> obsolete_segment_ids;
+    for (std::size_t index : compact_indices) {
+      segments[index].compacting = true;
+      obsolete_segment_ids.push_back(segments[index].segment_id);
+      merged_ids.insert(merged_ids.end(), segments[index].ids.begin(),
+                        segments[index].ids.end());
+    }
+
+    std::size_t segment_id = next_segment_id++;
+    job.active = true;
+    job.pending_delta_id = 0;
+    job.obsolete_segment_ids = obsolete_segment_ids;
+    job.future = launch_background_build(options, geometries, merged_ids,
+                                         level + 1, segment_id, 1);
+    return true;
+  }
+
+  return false;
 }
 
 Box box_from_envelope(const geos::geom::Envelope* envelope) {
@@ -1181,6 +1359,188 @@ HybridResult run_glin_lsm_segmented_hybrid(
   return result;
 }
 
+HybridResult run_glin_lsm_background_hybrid(
+    const Options& options, const std::vector<GeometryPtr>& geometries,
+    const std::vector<std::size_t>& ids, const std::vector<QueryCase>& queries,
+    const std::string& workload, double query_fraction,
+    std::size_t initial_count, std::size_t total_insert_count,
+    std::size_t batch_size, std::vector<ProgressResult>& progress) {
+  std::vector<std::size_t> base_ids(ids.begin(), ids.begin() + initial_count);
+  base_ids = zmin_sorted_batch_ids(options, geometries, base_ids, 0,
+                                   base_ids.size());
+
+  std::vector<std::tuple<double, double, double, double>> base_pieces;
+  auto build_start = std::chrono::high_resolution_clock::now();
+  std::unique_ptr<alex::Glin<double, Geometry*>> base_index =
+      build_glin_index_by_ids(options, geometries, base_ids, base_pieces);
+  auto build_end = std::chrono::high_resolution_clock::now();
+
+  RTree delta_index;
+  std::vector<std::size_t> delta_ids;
+  delta_ids.reserve(options.delta_size);
+  std::vector<PendingDelta> pending_deltas;
+  std::vector<GlinSegment> segments;
+  BackgroundJob background_job;
+  std::size_t next_delta_id = 1;
+  std::size_t next_segment_id = 1;
+  const std::size_t compaction_fanout = 4;
+
+  HybridResult result;
+  result.index = "GLIN_LSM_BG";
+  result.workload = workload;
+  result.query_fraction = query_fraction;
+  result.loaded_count = geometries.size();
+  result.initial_count = initial_count;
+  result.total_insert_count = total_insert_count;
+  result.build_ns = ns_count(build_end - build_start);
+  result.pieces = base_pieces.size();
+
+  std::vector<std::size_t> checkpoints = make_progress_checkpoints(
+      geometries.size(), total_insert_count, options.progress_step_percent);
+  std::size_t next_checkpoint = 0;
+  std::size_t next_query = 0;
+  std::size_t next_insert_offset = 0;
+  std::size_t queries_per_insert =
+      query_transactions_before_insert(query_fraction);
+
+  auto service_background = [&]() {
+    poll_background_job(background_job, pending_deltas, segments, result);
+    if (!background_job.active) {
+      schedule_background_job(options, geometries, pending_deltas, segments,
+                              compaction_fanout, next_segment_id,
+                              background_job);
+    }
+  };
+
+  auto update_lsm_state = [&]() {
+    result.delta_pending = static_cast<std::size_t>(
+        static_cast<long long>(delta_ids.size()) +
+        pending_delta_record_count(pending_deltas));
+    result.segment_count = segments.size();
+    result.max_segment_level = max_segment_level(segments);
+    result.pieces = total_segment_pieces(base_pieces, segments);
+  };
+
+  auto workload_start = std::chrono::high_resolution_clock::now();
+  while (next_insert_offset < total_insert_count) {
+    for (std::size_t q = 0; q < queries_per_insert; ++q) {
+      service_background();
+      const QueryCase& query = queries[next_query % queries.size()];
+      ++next_query;
+
+      int base_candidates = 0;
+      std::vector<Geometry*> base_result;
+      base_index->glin_find(query.geometry, "z", options.cell_xmin,
+                            options.cell_ymin, options.cell_size,
+                            options.cell_size, base_pieces, base_result,
+                            base_candidates);
+
+      double query_zmin = 0.0;
+      double query_zmax = 0.0;
+      curve_shape_projection(query.geometry, "z", options.cell_xmin,
+                             options.cell_ymin, options.cell_size,
+                             options.cell_size, query_zmin, query_zmax);
+
+      std::size_t segment_candidates = 0;
+      std::size_t segment_answers = 0;
+      for (auto& segment : segments) {
+        if (!segment_may_intersect_query(segment, query, query_zmin,
+                                         query_zmax)) {
+          ++result.segments_pruned_total;
+          continue;
+        }
+        int current_candidates = 0;
+        std::vector<Geometry*> segment_result;
+        segment.index->glin_find(query.geometry, "z", options.cell_xmin,
+                                 options.cell_ymin, options.cell_size,
+                                 options.cell_size, segment.pieces,
+                                 segment_result, current_candidates);
+        segment_candidates += static_cast<std::size_t>(current_candidates);
+        segment_answers += segment_result.size();
+      }
+
+      std::size_t pending_candidates = 0;
+      std::size_t pending_answers = 0;
+      for (const auto& pending : pending_deltas) {
+        std::vector<RTreeValue> pending_result;
+        pending.index.query(bgi::intersects(box_from_query(query)),
+                            std::back_inserter(pending_result));
+        pending_candidates += pending_result.size();
+        for (const auto& candidate : pending_result) {
+          Geometry* payload = geometries[candidate.second].get();
+          if (query.geometry->intersects(payload)) {
+            ++pending_answers;
+          }
+        }
+      }
+
+      std::vector<RTreeValue> delta_result;
+      delta_index.query(bgi::intersects(box_from_query(query)),
+                        std::back_inserter(delta_result));
+      std::size_t delta_answers = 0;
+      for (const auto& candidate : delta_result) {
+        Geometry* payload = geometries[candidate.second].get();
+        if (query.geometry->intersects(payload)) {
+          ++delta_answers;
+        }
+      }
+
+      ++result.query_transactions;
+      ++result.transaction_count;
+      result.candidates_total += static_cast<long long>(
+          base_candidates + segment_candidates + pending_candidates +
+          delta_result.size());
+      result.answers_total += static_cast<long long>(
+          base_result.size() + segment_answers + pending_answers +
+          delta_answers);
+    }
+
+    std::size_t remaining = total_insert_count - next_insert_offset;
+    std::size_t current_batch = std::min(batch_size, remaining);
+    for (std::size_t i = 0; i < current_batch; ++i) {
+      service_background();
+      std::size_t id = ids[initial_count + next_insert_offset + i];
+      delta_index.insert(std::make_pair(
+          box_from_envelope(geometries[id]->getEnvelopeInternal()), id));
+      delta_ids.push_back(id);
+      ++result.insert_success_count;
+
+      if (delta_ids.size() >= options.delta_size) {
+        PendingDelta sealed;
+        sealed.delta_id = next_delta_id++;
+        sealed.ids.swap(delta_ids);
+        sealed.index = std::move(delta_index);
+        pending_deltas.push_back(std::move(sealed));
+        delta_index = RTree();
+        ++result.flush_count;
+        service_background();
+      }
+    }
+    next_insert_offset += current_batch;
+    ++result.insert_transactions;
+    ++result.transaction_count;
+    update_lsm_state();
+    maybe_capture_progress(progress, result.index, workload, query_fraction,
+                           geometries.size(), initial_count, total_insert_count,
+                           checkpoints, next_checkpoint, workload_start,
+                           result);
+  }
+  auto workload_end = std::chrono::high_resolution_clock::now();
+  result.workload_ns = ns_count(workload_end - workload_start);
+
+  while (true) {
+    wait_background_job(background_job, pending_deltas, segments, result);
+    if (!schedule_background_job(options, geometries, pending_deltas, segments,
+                                 compaction_fanout, next_segment_id,
+                                 background_job)) {
+      break;
+    }
+  }
+
+  update_lsm_state();
+  return result;
+}
+
 template <typename QueryFn, typename InsertFn>
 HybridResult run_tree_hybrid(const Options& options,
                              const std::string& index_name,
@@ -1550,6 +1910,11 @@ int main(int argc, char* argv[]) {
             options, geometries, ids, queries, workload.first, workload.second,
             initial_count, total_insert_count, batch_size,
             "GLIN_LSM_SEGMENTED4", 4, true, progress_results));
+      }
+      if (options.include_lsm_bg_glin) {
+        summary_results.push_back(run_glin_lsm_background_hybrid(
+            options, geometries, ids, queries, workload.first, workload.second,
+            initial_count, total_insert_count, batch_size, progress_results));
       }
       summary_results.push_back(run_boost_hybrid(
           options, geometries, ids, queries, workload.first, workload.second,

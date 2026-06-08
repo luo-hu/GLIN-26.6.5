@@ -41,6 +41,7 @@ PROGRESS_STEP_PERCENT="${PROGRESS_STEP_PERCENT:-10}"
 INCLUDE_LSM_ASYNC_GLIN="${INCLUDE_LSM_ASYNC_GLIN:-0}"
 INCLUDE_LSM_SEGMENTED_GLIN="${INCLUDE_LSM_SEGMENTED_GLIN:-0}"
 INCLUDE_LSM_SEGMENTED4_GLIN="${INCLUDE_LSM_SEGMENTED4_GLIN:-0}"
+INCLUDE_LSM_BG_GLIN="${INCLUDE_LSM_BG_GLIN:-0}"
 DELTA_SIZE="${DELTA_SIZE:-100000}"
 DATA_ROOT="${DATA_ROOT:-/mnt/hgfs}"    # 原始数据集路径
 QUERY_ROOT="${QUERY_ROOT:-queries/fig17_hybrid_${QUERY_LIMIT}}" # 查询 csv 文件存储根目录
@@ -157,6 +158,7 @@ for dataset in $DATASETS; do
     --include_lsm_async_glin "$INCLUDE_LSM_ASYNC_GLIN" \
     --include_lsm_segmented_glin "$INCLUDE_LSM_SEGMENTED_GLIN" \
     --include_lsm_segmented4_glin "$INCLUDE_LSM_SEGMENTED4_GLIN" \
+    --include_lsm_bg_glin "$INCLUDE_LSM_BG_GLIN" \
     --delta_size "$DELTA_SIZE" \
     --output_csv "$SUMMARY_CSV" \
     --progress_csv "$PROGRESS_CSV" \
