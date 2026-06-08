@@ -1,236 +1,367 @@
-# GLIN Dynamic Update Improvement Summary
+# GLIN 动态更新改进进展总结
 
-Last updated: 2026-06-08
+最后更新日期：2026-06-08
 
-This document records what has been added around GLIN dynamic updates, how to
-run the experiments, what the current results mean, and which variants are
-usable for the paper.
+本文档记录目前围绕 GLIN 动态更新做过哪些改进、如何测试、增加了哪些实验指标、当前效果如何，以及哪些内容可以作为论文创新点。
 
-## 1. Research Question
+固定英文术语说明：
 
-Original GLIN is weak under random dynamic insertion because its underlying
-ALEX-like learned index stores ordered arrays with gaps. Random arrivals cause
-data movement, node resizing, split/retrain, and leaf MBR updates. However,
-when data are inserted in Zmin order, the update path becomes close to append or
-near-append, and GLIN can outperform Boost R-tree.
+- `GLIN`: 当前项目中的 learned spatial index，基于空间对象的 Z-order/Zmin 编码进行索引。
+- `ALEX`: Adaptive Learned Index，是 GLIN 底层使用或借鉴的动态 learned index 结构。
+- `Zmin`: 空间对象映射到 Z-order 曲线后的最小 key。按 `Zmin` 插入通常更接近顺序插入。
+- `LSM`: Log-Structured Merge-tree，日志结构合并树。这里借用它的思想：先写 delta，再批量合并。
+- `delta`: 临时增量区，专门接收新插入的数据。
+- `segment`: 一个已经从 delta 批量构建出来的小 GLIN 索引段。
+- `compaction`: 合并多个 segment，减少查询时需要访问的索引数量。
+- `foreground`: 前台路径，指用户查询/插入正在执行时直接等待的部分。
+- `background`: 后台路径，指异步维护任务，比如建 segment 或 compaction。
+- `drain`: workload 结束后等待后台任务收尾。
 
-The current research question is:
+## 1. 研究问题
 
-> Can we preserve GLIN's advantage on ordered Z-order keys while making random
-> dynamic updates practical through buffering, delta indexes, segmentation, and
-> background maintenance?
+原始 GLIN 在随机动态插入下表现不好，主要原因是底层 ALEX/GLIN 的数据节点接近“有序数组 + gap”的结构。
 
-## 2. Files Changed or Added
+随机插入容易触发：
 
-Main benchmark code:
+```text
+1. 叶子数组内部搬移元素。
+2. 扩容 resize。
+3. 节点 split/retrain。
+4. leaf MBR 更新。
+```
 
-- `src/benchmark/bench_update_wkt.cpp`
-  - Added insert-only variants:
-    - `GLIN_BUFFERED`
-    - `GLIN_LSM`
-    - `GLIN_LSM_ASYNC`
-  - Added update metrics:
-    - `maintenance_ns`
-    - `merge_count`
-    - `delta_pending`
-    - `buffer_size`
-    - `delta_size`
+但是，如果按 `Zmin` 顺序插入，插入过程更像 append 或 near-append，也就是追加或接近追加。此时 GLIN 的有序数组结构反而有优势。
 
-- `src/benchmark/bench_hybrid_wkt.cpp`
-  - Added hybrid workload variants:
-    - `GLIN_LSM_ASYNC`
-    - `GLIN_LSM_SEGMENTED`
-    - `GLIN_LSM_SEGMENTED4`
-    - `GLIN_LSM_BG`
-  - Added hybrid metrics:
-    - `maintenance_ns`
-    - `drain_ns`
-    - `total_elapsed_ns`
-    - `throughput_transactions_per_sec`
-    - `total_throughput_transactions_per_sec`
-    - `candidate_answer_ratio`
-    - `answers_match_boost`
-    - `answers_delta_vs_boost`
-    - `delta_pending`
-    - `segment_count`
-    - `segments_pruned_total`
+因此当前研究问题是：
 
-Scripts:
+> 能不能保留 GLIN 在 Z-order 有序数据上的优势，同时通过 buffer、delta index、segment 和 background compaction，让它也能处理随机动态更新？
 
-- `scripts/run_fig15_insert_diagnostics.sh`
-  - Supports:
-    - `INCLUDE_BUFFERED_GLIN`
-    - `BUFFER_SIZE`
-    - `INCLUDE_LSM_GLIN`
-    - `INCLUDE_LSM_ASYNC_GLIN`
-    - `DELTA_SIZE`
+## 2. 当前改了哪些文件
 
-- `scripts/run_fig17_hybrid_1m.sh`
-  - Supports:
-    - `INCLUDE_LSM_ASYNC_GLIN`
-    - `INCLUDE_LSM_SEGMENTED_GLIN`
-    - `INCLUDE_LSM_SEGMENTED4_GLIN`
-    - `INCLUDE_LSM_BG_GLIN`
-    - `DELTA_SIZE`
+### 2.1 插入诊断 benchmark
 
-- `scripts/plot_fig17_hybrid.py`
-  - Added progress panels:
-    - `fig17_hybrid_delta_pending_panel.png`
-    - `fig17_hybrid_segment_count_panel.png`
-    - `fig17_hybrid_maintenance_ns_panel.png`
-  - Added a beginner-friendly diagnostic text file:
-    - `fig17_hybrid_summary_diagnostics.txt`
+文件：
 
-## 3. Variants Implemented
+```text
+src/benchmark/bench_update_wkt.cpp
+```
+
+新增变体：
+
+```text
+GLIN_BUFFERED
+GLIN_LSM
+GLIN_LSM_ASYNC
+```
+
+新增指标：
+
+```text
+maintenance_ns
+merge_count
+delta_pending
+buffer_size
+delta_size
+```
+
+指标解释：
+
+- `maintenance_ns`: 维护时间，例如 rebuild、merge、compaction 花了多久。
+- `merge_count`: 发生了多少次 merge 或 rebuild。
+- `delta_pending`: 还有多少数据留在 delta 里。
+- `buffer_size`: micro-batch buffer 的大小。
+- `delta_size`: delta 满多少条后触发 flush/merge。
+
+### 2.2 Hybrid 查询 + 更新 benchmark
+
+文件：
+
+```text
+src/benchmark/bench_hybrid_wkt.cpp
+```
+
+新增变体：
+
+```text
+GLIN_LSM_ASYNC
+GLIN_LSM_SEGMENTED
+GLIN_LSM_SEGMENTED4
+GLIN_LSM_BG
+```
+
+新增指标：
+
+```text
+maintenance_ns
+drain_ns
+total_elapsed_ns
+throughput_transactions_per_sec
+total_throughput_transactions_per_sec
+candidate_answer_ratio
+answers_match_boost
+answers_delta_vs_boost
+delta_pending
+segment_count
+segments_pruned_total
+```
+
+指标解释：
+
+- `throughput_transactions_per_sec`: 前台事务吞吐，只看 workload 正在执行期间的速度。
+- `total_throughput_transactions_per_sec`: 总吞吐，把最后 `drain_ns` 也算进去。
+- `drain_ns`: workload 结束后，为了等后台任务完成又花了多久。
+- `candidate_answer_ratio`: 候选数量 / 真答案数量，越接近 1，说明过滤越准。
+- `answers_match_boost`: 是否和 Boost R-tree 的答案数量一致。`1` 表示一致。
+- `answers_delta_vs_boost`: 和 Boost R-tree 的答案数量差值。
+- `segment_count`: 当前有多少个 GLIN segment。
+- `segments_pruned_total`: 查询时被剪枝跳过的 segment 总数。
+
+### 2.3 实验脚本
+
+文件：
+
+```text
+scripts/run_fig15_insert_diagnostics.sh
+```
+
+新增环境变量：
+
+```text
+INCLUDE_BUFFERED_GLIN
+BUFFER_SIZE
+INCLUDE_LSM_GLIN
+INCLUDE_LSM_ASYNC_GLIN
+DELTA_SIZE
+```
+
+文件：
+
+```text
+scripts/run_fig17_hybrid_1m.sh
+```
+
+新增环境变量：
+
+```text
+INCLUDE_LSM_ASYNC_GLIN
+INCLUDE_LSM_SEGMENTED_GLIN
+INCLUDE_LSM_SEGMENTED4_GLIN
+INCLUDE_LSM_BG_GLIN
+DELTA_SIZE
+```
+
+文件：
+
+```text
+scripts/plot_fig17_hybrid.py
+```
+
+新增输出图：
+
+```text
+fig17_hybrid_delta_pending_panel.png
+fig17_hybrid_segment_count_panel.png
+fig17_hybrid_maintenance_ns_panel.png
+```
+
+新增诊断报告：
+
+```text
+fig17_hybrid_summary_diagnostics.txt
+```
+
+这个诊断报告会用中文解释 `foreground throughput`、`maintenance_ns`、`drain_ns` 等指标，方便以后直接查看。
+
+## 3. 各个 GLIN 改进版本说明
 
 ### 3.1 GLIN_BUFFERED
 
-Location:
+实现位置：
 
-- `src/benchmark/bench_update_wkt.cpp`
+```text
+src/benchmark/bench_update_wkt.cpp
+```
 
-Idea:
+核心思想：
 
-Random inserts are buffered in micro-batches. Each batch is sorted by Zmin
-before insertion into GLIN.
+随机插入不是一条来一条立刻插入，而是先缓存一小批。每批先按 `Zmin` 排序，再插入 GLIN。
 
-Path:
+流程：
 
 ```text
 random arrival -> buffer -> sort by Zmin -> GLIN insert
 ```
 
-Parameters:
+参数：
 
-- `--include_buffered_glin 1`
-- `--buffer_size N`
+```text
+--include_buffered_glin 1
+--buffer_size N
+```
 
-Strength:
+优点：
 
-- Simple and easy to explain.
-- Does not rebuild the whole index.
-- Directly tests the hypothesis that GLIN benefits from sorted update order.
+```text
+1. 实现简单。
+2. 很容易解释。
+3. 能直接验证“按 Zmin 插入有利于 GLIN”这个假设。
+4. 不需要 full rebuild。
+```
 
-Weakness:
+缺点：
 
-- Only implemented for insert diagnostics, not as a full hybrid query/update
-  system.
-- Sacrifices real-time insertion latency.
-- In current results it is not clearly strong enough to be the final method.
+```text
+1. 目前只用于 insert diagnostics，没有做成完整的 query/update 系统。
+2. 会牺牲实时性，因为数据要先等在 buffer 里。
+3. 当前结果没有强到足够作为最终方法。
+```
 
-Current paper status:
+论文定位：
 
-- Useful as a diagnostic or ablation.
-- Not recommended as the main contribution.
+```text
+可以作为动机实验或 ablation。
+不建议作为最终创新方法。
+```
 
 ### 3.2 GLIN_LSM
 
-Location:
+实现位置：
 
-- `src/benchmark/bench_update_wkt.cpp`
+```text
+src/benchmark/bench_update_wkt.cpp
+```
 
-Idea:
+核心思想：
 
-Keep a main GLIN and a delta R-tree. Inserts go to the delta. When the delta is
-full, merge all records and rebuild the main GLIN.
+维护一个 main GLIN 和一个 delta R-tree。新插入数据先进 delta。delta 满了以后，把 main + delta 的所有数据重新按 `Zmin` 排序，然后重建 main GLIN。
 
-Path:
+流程：
 
 ```text
 main GLIN + delta R-tree
 delta full -> sort all main+delta by Zmin -> rebuild main GLIN
 ```
 
-Strength:
+优点：
 
-- Conceptually clean.
-- Correctly exposes the full rebuild cost through `maintenance_ns`.
+```text
+1. 思路清楚。
+2. 能验证 delta buffer + rebuild 的基本想法。
+3. maintenance_ns 可以清楚暴露 full rebuild 成本。
+```
 
-Weakness:
+缺点：
 
-- Full rebuild is too expensive.
-- If the rebuild is counted in foreground time, write throughput becomes poor.
-- If `delta_size` is small, rebuild happens too often.
-- If `delta_size` is large, queries must check a large delta index.
+```text
+1. full rebuild 太重。
+2. DELTA_SIZE 小时 rebuild 太频繁。
+3. DELTA_SIZE 大时查询要查很大的 delta，query 变慢。
+4. 作为系统方案不稳定。
+```
 
-Current paper status:
+论文定位：
 
-- Do not use as final method.
-- Useful only to show why naive LSM/full rebuild is insufficient.
+```text
+不能作为最终方法。
+可以用来说明 naive LSM/full rebuild 不够好。
+```
 
 ### 3.3 GLIN_LSM_ASYNC
 
-Locations:
+实现位置：
 
-- `src/benchmark/bench_update_wkt.cpp`
-- `src/benchmark/bench_hybrid_wkt.cpp`
+```text
+src/benchmark/bench_update_wkt.cpp
+src/benchmark/bench_hybrid_wkt.cpp
+```
 
-Idea:
+核心思想：
 
-Separate foreground delta writes from maintenance time. In the update-only
-benchmark, `update_ns` counts only delta writes and `maintenance_ns` records
-merge/rebuild time separately.
+把前台写入时间和维护时间拆开统计。也就是 `update_ns` 只统计写入 delta 的时间，rebuild/merge 的时间单独记到 `maintenance_ns`。
 
-Strength:
+优点：
 
-- Shows the best-case write path if rebuild/merge can be moved away from the
-  foreground.
-- Helpful for understanding why async maintenance matters.
+```text
+1. 能看到“如果只看前台写 delta，写入可以很快”。
+2. 能说明 async maintenance 有必要。
+3. 是理解后续 GLIN_LSM_BG 的铺垫。
+```
 
-Weakness:
+缺点：
 
-- In the update-only benchmark, it is not a complete online system.
-- The hybrid version still suffers from full rebuild or large delta double-read
-  cost.
-- With small `DELTA_SIZE`, rebuild is too frequent; with large `DELTA_SIZE`,
-  query cost grows.
+```text
+1. update-only 版本不是完整在线系统。
+2. hybrid 版本仍然受 full rebuild 或大 delta 双读影响。
+3. 如果只报 update_ns，会被质疑隐藏了 maintenance 成本。
+```
 
-Current paper status:
+论文定位：
 
-- Do not claim it as the final method.
-- Use as a motivation experiment: "foreground writes are cheap, but maintenance
-  must be scheduled carefully."
+```text
+不能作为最终方法。
+适合作为动机实验：前台写入便宜，但维护调度必须认真设计。
+```
 
 ### 3.4 GLIN_LSM_SEGMENTED
 
-Location:
+实现位置：
 
-- `src/benchmark/bench_hybrid_wkt.cpp`
+```text
+src/benchmark/bench_hybrid_wkt.cpp
+```
 
-Idea:
+核心思想：
 
-Avoid full rebuild. When the delta is full, build a new GLIN segment. Queries
-check base GLIN, all segments, and current delta. Segments are compacted in an
-LSM-like manner.
+避免每次 delta 满了就 full rebuild。delta 满后构建一个新的 GLIN segment。查询时查：
 
-Strength:
+```text
+base GLIN + all GLIN segments + current delta
+```
 
-- Avoids rebuilding the whole main GLIN on every flush.
-- More realistic than `GLIN_LSM_ASYNC`.
+优点：
 
-Weakness:
+```text
+1. 避免频繁 full rebuild。
+2. 比 GLIN_LSM_ASYNC 更像一个真实在线系统。
+```
 
-- Too many segments increase query cost.
-- Synchronous flush and compaction still block foreground workload.
-- Without strong pruning, query has to scan too many segment indexes.
+缺点：
 
-Current paper status:
+```text
+1. segment 太多时查询会变慢。
+2. flush 和 compaction 还是同步执行，会挡住前台。
+3. 没有强剪枝时，查询要查太多 segment。
+```
 
-- Not recommended as the final method.
-- Useful as an intermediate design step.
+论文定位：
+
+```text
+不建议作为最终方法。
+可以作为中间版本说明为什么需要 pruning 和 compaction。
+```
 
 ### 3.5 GLIN_LSM_SEGMENTED4
 
-Location:
+实现位置：
 
-- `src/benchmark/bench_hybrid_wkt.cpp`
+```text
+src/benchmark/bench_hybrid_wkt.cpp
+```
 
-Idea:
+核心思想：
 
-Use fanout-4 size-tiered compaction and segment pruning. A query can skip a
-segment if the segment envelope or Zmin/Zmax range cannot intersect the query.
+在 segmented LSM 基础上加入两个机制：
 
-Path:
+```text
+1. fanout=4 size-tiered compaction
+2. segment pruning
+```
+
+`fanout=4` 的意思是：同一层有 4 个 segment 后合并成上一层 1 个 segment。
+
+`segment pruning` 的意思是：查询时，如果一个 segment 的 envelope 或 Zmin/Zmax 范围明显不可能和 query 相交，就直接跳过它。
+
+流程：
 
 ```text
 delta R-tree -> GLIN segment
@@ -238,34 +369,41 @@ delta R-tree -> GLIN segment
 query -> base GLIN + pruned segments + delta
 ```
 
-Strength:
+优点：
 
-- Correctness is good in current Fig.17 tests:
-  - `answers_match_boost=1`
-- Better than the first segmented version.
-- Good ablation to show the benefit of fanout=4 and segment pruning.
+```text
+1. 当前 Fig.17 测试中 correctness 好，answers_match_boost=1。
+2. 比普通 segmented 版本更稳定。
+3. 很适合作为 ablation，对比 GLIN_LSM_BG。
+```
 
-Weakness:
+缺点：
 
-- Flush and compaction are still synchronous.
-- Foreground throughput is much worse than `GLIN_LSM_BG`.
+```text
+1. flush 和 compaction 仍然是同步维护。
+2. foreground throughput 明显低于 GLIN_LSM_BG。
+```
 
-Current paper status:
+论文定位：
 
-- Good ablation baseline.
-- Not the final system variant.
+```text
+适合作为 ablation baseline。
+不建议作为最终系统方案。
+```
 
 ### 3.6 GLIN_LSM_BG
 
-Location:
+实现位置：
 
-- `src/benchmark/bench_hybrid_wkt.cpp`
+```text
+src/benchmark/bench_hybrid_wkt.cpp
+```
 
-Idea:
+核心思想：
 
-Make segmented GLIN-LSM asynchronous. Foreground writes go to a delta R-tree.
-When the delta is full, it becomes a sealed pending delta. A background job
-builds GLIN segments and compacts segments. Queries check:
+把 segmented GLIN-LSM 的维护任务放到后台。前台写入只写 delta R-tree。delta 满了以后变成 sealed pending delta。后台任务负责把 pending delta 构建成 GLIN segment，并做 compaction。
+
+查询时需要查：
 
 ```text
 base GLIN
@@ -274,195 +412,269 @@ base GLIN
 + current delta R-tree
 ```
 
-Current implementation details:
+当前实现细节：
 
-- Uses `std::async` for one background maintenance job.
-- Uses fanout=4.
-- Uses segment pruning by envelope and Zmin/Zmax.
-- Uses grouped delta flush:
-  - During workload, wait until 4 sealed deltas are available before building a
-    GLIN segment.
-  - During final drain, flush the remaining partial group.
-- Tracks both foreground throughput and total throughput.
+```text
+1. 使用 std::async 启动一个后台维护任务。
+2. 使用 fanout=4。
+3. 查询时使用 envelope + Zmin/Zmax 做 segment pruning。
+4. 使用 grouped delta flush：
+   workload 过程中，攒够 4 个 sealed delta 才构建 GLIN segment；
+   workload 结束 drain 时，再处理不足 4 个的尾批。
+5. 同时报告 foreground throughput 和 total throughput。
+```
 
-Strength:
+优点：
 
-- Best current system variant.
-- Correctness matches Boost R-tree in current hybrid results:
-  - `answers_match_boost=1`
-- Foreground write-intensive throughput beats Boost R-tree in current 2M tests.
-- Maintenance cost is lower than synchronous segmented4.
+```text
+1. 当前最可用的 GLIN 动态更新扩展。
+2. 当前 2M hybrid 结果中 answers_match_boost=1，正确性对齐 Boost R-tree。
+3. 写密集 workload 中 foreground throughput 超过 Boost R-tree。
+4. maintenance_ns 明显低于 GLIN_LSM_SEGMENTED4。
+```
 
-Weakness:
+缺点：
 
-- It is multi-threaded/asynchronous, so it is not a fair drop-in replacement for
-  single-threaded baselines unless clearly labeled.
-- `drain_ns` is still non-trivial.
-- In write-intensive workloads, total throughput can still be lower than Boost
-  R-tree after counting final background drain.
+```text
+1. 它是异步/后台版本，不是原始单线程 GLIN baseline。
+2. drain_ns 仍然不小，说明后台维护还会欠账。
+3. 写密集 workload 中，如果看 total throughput，仍可能输给 Boost R-tree。
+```
 
-Current paper status:
+论文定位：
 
-- This is the most usable GLIN extension.
-- It should be positioned as a "system-level asynchronous variant", not as the
-  original GLIN paper baseline.
-- It supports a measured claim about foreground throughput, not a universal
-  claim that GLIN beats R-tree on every metric.
+```text
+当前最推荐保留的系统变体。
+应该称为 system-level asynchronous variant。
+不能说它是原始 GLIN baseline。
+不能说它所有指标都超过 Boost R-tree。
+```
 
-## 4. How to Run Experiments
+## 4. 如何运行实验
 
-### 4.1 Build
+### 4.1 编译
 
 ```bash
 cmake --build build --target bench_update_wkt bench_update_wkt_piece -j2
 cmake --build build --target bench_hybrid_wkt_piece -j2
 ```
 
-GEOS and Boost warnings are expected. The important part is that the build exits
-with code 0.
+说明：
 
-### 4.2 Fig.15 Insert Diagnostics
+```text
+GEOS 和 Boost 的 warning 很常见。
+只要最终 exit code 是 0，并且显示 Built target，就说明编译通过。
+```
 
-Default insert-order and Boost strategy diagnostics:
+### 4.2 Fig.15 插入诊断实验
+
+默认插入顺序和 Boost 策略诊断：
 
 ```bash
 RESET_RESULTS=1 ./scripts/run_fig15_insert_diagnostics.sh
 ```
 
-Run buffered GLIN:
+运行 GLIN_BUFFERED：
 
 ```bash
 INCLUDE_BUFFERED_GLIN=1 BUFFER_SIZE=10000 ./scripts/run_fig15_insert_diagnostics.sh
 ```
 
-Run update-only LSM variants:
+运行 update-only LSM 变体：
 
 ```bash
 INCLUDE_LSM_GLIN=1 INCLUDE_LSM_ASYNC_GLIN=1 DELTA_SIZE=100000 ./scripts/run_fig15_insert_diagnostics.sh
 ```
 
-Outputs:
+输出：
 
-- `results/fig15_insert_diagnostics/fig15_insert_diagnostics_summary.csv`
-- `results/fig15_insert_diagnostics/insert_order_sweep.csv`
-- `figures/fig15_insert_diagnostics/insert_order_sweep.png`
-- `figures/fig15_insert_diagnostics/boost_split_strategy_sweep.png`
-- `figures/fig15_insert_diagnostics/cell_size_sweep_glin.png`
+```text
+results/fig15_insert_diagnostics/fig15_insert_diagnostics_summary.csv
+results/fig15_insert_diagnostics/insert_order_sweep.csv
+figures/fig15_insert_diagnostics/insert_order_sweep.png
+figures/fig15_insert_diagnostics/boost_split_strategy_sweep.png
+figures/fig15_insert_diagnostics/cell_size_sweep_glin.png
+```
 
-### 4.3 Fig.17 Hybrid Workload
+### 4.3 Fig.17 Hybrid 查询 + 更新实验
 
-Current recommended command:
+当前推荐命令：
 
 ```bash
 RESET_RESULTS=1 INCLUDE_LSM_BG_GLIN=1 INCLUDE_LSM_SEGMENTED4_GLIN=1 LIMIT=2000000 DELTA_SIZE=100000 ./scripts/run_fig17_hybrid_1m.sh
 ```
 
-Useful smaller smoke command:
+小规模 smoke test：
 
 ```bash
 RESET_RESULTS=1 DATASETS=ROADS WORKLOAD=write LIMIT=200000 QUERY_LIMIT=200000 INCLUDE_LSM_BG_GLIN=1 INCLUDE_LSM_SEGMENTED4_GLIN=1 DELTA_SIZE=10000 PROGRESS_STEP_PERCENT=10 ./scripts/run_fig17_hybrid_1m.sh
 ```
 
-Outputs:
+输出：
 
-- `results/fig17_hybrid_2000000/fig17_hybrid_summary.csv`
-- `results/fig17_hybrid_2000000/fig17_hybrid_progress.csv`
-- `figures/fig17_hybrid_2000000/fig17_hybrid_curves_panel.png`
-- `figures/fig17_hybrid_2000000/fig17_hybrid_delta_pending_panel.png`
-- `figures/fig17_hybrid_2000000/fig17_hybrid_segment_count_panel.png`
-- `figures/fig17_hybrid_2000000/fig17_hybrid_maintenance_ns_panel.png`
-- `figures/fig17_hybrid_2000000/fig17_hybrid_summary_diagnostics.txt`
+```text
+results/fig17_hybrid_2000000/fig17_hybrid_summary.csv
+results/fig17_hybrid_2000000/fig17_hybrid_progress.csv
+figures/fig17_hybrid_2000000/fig17_hybrid_curves_panel.png
+figures/fig17_hybrid_2000000/fig17_hybrid_delta_pending_panel.png
+figures/fig17_hybrid_2000000/fig17_hybrid_segment_count_panel.png
+figures/fig17_hybrid_2000000/fig17_hybrid_maintenance_ns_panel.png
+figures/fig17_hybrid_2000000/fig17_hybrid_summary_diagnostics.txt
+```
 
-## 5. How to Read the New Metrics
+## 5. 新指标怎么看
 
-- `foreground throughput`
-  - CSV field: `throughput_transactions_per_sec`
-  - Meaning: throughput seen during the workload. For async variants, this is
-    the online query/update experience.
+### foreground throughput
 
-- `total throughput`
-  - CSV field: `total_throughput_transactions_per_sec`
-  - Meaning: throughput after adding `drain_ns` to workload time. This is a
-    stricter metric because it counts final background cleanup.
+CSV 字段：
 
-- `maintenance_ns`
-  - Time spent building GLIN segments or doing merge/compaction.
-  - High value means the method creates heavy background/index-maintenance work.
+```text
+throughput_transactions_per_sec
+```
 
-- `drain_ns`
-  - Time spent waiting after the workload for unfinished background jobs.
-  - High value means the background worker did not keep up.
+含义：
 
-- `delta_pending`
-  - Number of records still in current or sealed delta R-trees.
-  - High value means queries may pay more double-read cost.
+```text
+workload 正在执行时，前台看到的吞吐。
+对于 async 方法，它代表用户在线查询/写入时感受到的速度。
+```
 
-- `segment_count`
-  - Number of GLIN segments outside the base GLIN.
-  - High value means each query may touch more indexes.
+### total throughput
 
-- `candidate_answer_ratio`
-  - `candidates_total / answers_total`.
-  - Closer to 1 means better filtering.
+CSV 字段：
 
-- `answers_match_boost`
-  - `1` means the answer count matches Boost R-tree.
-  - `0` means either the index has a correctness issue or the baseline/result
-    accounting must be inspected.
+```text
+total_throughput_transactions_per_sec
+```
 
-Important note:
+含义：
 
-`GLIN_PIECEWISE` has `answers_match_boost=0` in the current Fig.17 summary.
-Therefore, do not use GLIN-piecewise as the correctness oracle for these hybrid
-results. Use Boost R-tree as the correctness reference.
+```text
+把 workload_ns 和 drain_ns 加在一起以后计算的吞吐。
+这个指标更严格，因为它把最后后台收尾时间也算进去了。
+```
 
-## 6. Current Results
+### maintenance_ns
 
-### 6.1 Insert-Order Diagnostic
+含义：
 
-Result file:
+```text
+后台或同步维护花掉的建索引、flush、merge、compaction 时间。
+数值越大，说明维护成本越重。
+```
 
-- `results/fig15_insert_diagnostics/insert_order_sweep.csv`
+### drain_ns
 
-Main observation:
+含义：
 
-Random insertion hurts GLIN, but Zmin insertion often helps GLIN over Boost
-R-tree.
+```text
+workload 结束后，等待后台任务完成的时间。
+数值越大，说明后台没有跟上前台，欠了维护债。
+```
 
-Selected throughput results:
+### delta_pending
 
-| Dataset | Order | GLIN ops/s | Boost R-tree ops/s | GLIN-piecewise ops/s | Observation |
+含义：
+
+```text
+还在 current delta 或 sealed pending delta 里的记录数。
+太大时，query 需要额外查很多 delta R-tree。
+```
+
+### segment_count
+
+含义：
+
+```text
+base GLIN 之外，还有多少个 GLIN segment。
+太大时，query 可能要查很多小索引。
+```
+
+### candidate_answer_ratio
+
+含义：
+
+```text
+candidates_total / answers_total
+候选数量 / 真答案数量。
+越接近 1，说明过滤越准。
+```
+
+### answers_match_boost
+
+含义：
+
+```text
+1 表示答案数量和 Boost R-tree 一致。
+0 表示要检查正确性或统计口径。
+```
+
+重要注意：
+
+```text
+当前 Fig.17 summary 里 GLIN_PIECEWISE 的 answers_match_boost=0。
+所以不要用 GLIN-piecewise 当正确性 oracle。
+当前应该用 Boost R-tree 作为正确性参照。
+```
+
+## 6. 当前实验结果
+
+### 6.1 插入顺序诊断
+
+结果文件：
+
+```text
+results/fig15_insert_diagnostics/insert_order_sweep.csv
+```
+
+核心观察：
+
+```text
+随机插入时 GLIN 吃亏。
+按 Zmin 顺序插入时 GLIN 往往超过 Boost R-tree。
+```
+
+部分结果：
+
+| Dataset | Order | GLIN ops/s | Boost R-tree ops/s | GLIN-piecewise ops/s | 观察 |
 |---|---:|---:|---:|---:|---|
-| AW | random | 582,709 | 904,195 | 563,943 | GLIN loses on random insert |
-| AW | zmin | 2,206,970 | 1,883,200 | 2,202,650 | GLIN wins on Zmin insert |
-| LW | random | 591,586 | 926,645 | 574,606 | GLIN loses on random insert |
-| LW | zmin | 2,217,880 | 1,903,880 | 2,192,780 | GLIN wins on Zmin insert |
-| ROADS | random | 732,469 | 921,380 | 707,036 | GLIN loses on random insert |
-| ROADS | zmin | 1,559,280 | 1,389,160 | 1,544,810 | GLIN wins on Zmin insert |
-| PARKS | random | 386,030 | 959,662 | 382,799 | GLIN loses badly on random insert |
-| PARKS | zmin | 1,309,360 | 1,164,110 | 1,328,000 | GLIN wins on Zmin insert |
+| AW | random | 582,709 | 904,195 | 563,943 | GLIN 随机插入较弱 |
+| AW | zmin | 2,206,970 | 1,883,200 | 2,202,650 | GLIN 按 Zmin 插入更强 |
+| LW | random | 591,586 | 926,645 | 574,606 | GLIN 随机插入较弱 |
+| LW | zmin | 2,217,880 | 1,903,880 | 2,192,780 | GLIN 按 Zmin 插入更强 |
+| ROADS | random | 732,469 | 921,380 | 707,036 | GLIN 随机插入较弱 |
+| ROADS | zmin | 1,559,280 | 1,389,160 | 1,544,810 | GLIN 按 Zmin 插入更强 |
+| PARKS | random | 386,030 | 959,662 | 382,799 | GLIN 随机插入明显吃亏 |
+| PARKS | zmin | 1,309,360 | 1,164,110 | 1,328,000 | GLIN 按 Zmin 插入更强 |
 
-Paper value:
+论文价值：
 
-- This is a strong workload characterization result.
-- It motivates buffering/LSM designs.
-- It is not by itself a system contribution.
+```text
+这是很有价值的 workload characterization。
+它说明 GLIN 的动态插入性能和插入顺序强相关。
+它可以作为后续 buffer/LSM 设计的动机。
+但它本身不是完整系统创新。
+```
 
-### 6.2 Hybrid Workload at 2M Records
+### 6.2 2M Hybrid 结果
 
-Result file:
+结果文件：
 
-- `results/fig17_hybrid_2000000/fig17_hybrid_summary.csv`
+```text
+results/fig17_hybrid_2000000/fig17_hybrid_summary.csv
+```
 
-Current command:
+运行命令：
 
 ```bash
 RESET_RESULTS=1 INCLUDE_LSM_BG_GLIN=1 INCLUDE_LSM_SEGMENTED4_GLIN=1 LIMIT=2000000 DELTA_SIZE=100000 ./scripts/run_fig17_hybrid_1m.sh
 ```
 
-#### Read-Intensive Workload
+#### 读密集 workload
 
-| Dataset | Index | Foreground tps | Total tps | maintenance_s | drain_s | correctness |
+读密集的意思是：查询比例高，更新比例低。当前脚本中大致是 90% query + 10% insert transaction。
+
+| Dataset | Index | Foreground tps | Total tps | maintenance_s | drain_s | 正确性 |
 |---|---|---:|---:|---:|---:|---:|
 | ROADS | GLIN-LSM-bg | 71.201 | 66.922 | 2.203 | 0.449 | OK |
 | ROADS | Boost R-tree | 67.846 | 67.846 | 0 | 0 | OK |
@@ -471,15 +683,19 @@ RESET_RESULTS=1 INCLUDE_LSM_BG_GLIN=1 INCLUDE_LSM_SEGMENTED4_GLIN=1 LIMIT=200000
 | PARKS | Boost R-tree | 52.748 | 52.748 | 0 | 0 | OK |
 | PARKS | GLIN-LSM-seg4 | 38.092 | 38.092 | 4.221 | 0 | OK |
 
-Read-intensive interpretation:
+解释：
 
-- `GLIN_LSM_BG` foreground throughput is slightly better than Boost R-tree.
-- Total throughput is close to Boost R-tree.
-- It is much better than synchronous `GLIN_LSM_SEGMENTED4`.
+```text
+GLIN_LSM_BG 的 foreground throughput 略高于 Boost R-tree。
+如果看 total throughput，则和 Boost R-tree 接近。
+它明显好于同步维护的 GLIN_LSM_SEGMENTED4。
+```
 
-#### Write-Intensive Workload
+#### 写密集 workload
 
-| Dataset | Index | Foreground tps | Total tps | maintenance_s | drain_s | correctness |
+写密集的意思是：查询和更新比例接近，当前脚本中大致是 50% query + 50% insert transaction。
+
+| Dataset | Index | Foreground tps | Total tps | maintenance_s | drain_s | 正确性 |
 |---|---|---:|---:|---:|---:|---:|
 | ROADS | GLIN-LSM-bg | 51.607 | 34.921 | 2.110 | 0.926 | OK |
 | ROADS | Boost R-tree | 37.869 | 37.869 | 0 | 0 | OK |
@@ -488,176 +704,309 @@ Read-intensive interpretation:
 | PARKS | Boost R-tree | 36.281 | 36.281 | 0 | 0 | OK |
 | PARKS | GLIN-LSM-seg4 | 15.137 | 15.137 | 4.376 | 0 | OK |
 
-Write-intensive interpretation:
+解释：
 
-- `GLIN_LSM_BG` foreground throughput beats Boost R-tree:
-  - ROADS: about 36 percent higher than Boost R-tree.
-  - PARKS: about 28 percent higher than Boost R-tree.
-- But total throughput is lower than Boost R-tree after counting `drain_ns`.
-- This means the foreground path is good, but the single background worker still
-  accumulates maintenance debt.
+```text
+如果只看 foreground throughput，GLIN_LSM_BG 超过 Boost R-tree：
+ROADS 大约高 36%。
+PARKS 大约高 28%。
 
-### 6.3 Maintenance Cost
+但如果看 total throughput，GLIN_LSM_BG 仍低于 Boost R-tree。
+原因是 drain_ns 仍然较大，说明后台维护没有完全跟上前台。
+```
 
-`GLIN_LSM_BG` reduces maintenance cost compared with `GLIN_LSM_SEGMENTED4`.
+### 6.3 维护成本对比
 
-Examples from 2M hybrid results:
+`GLIN_LSM_BG` 相比 `GLIN_LSM_SEGMENTED4` 明显减少了维护成本。
 
-| Dataset | Workload | seg4 maintenance_s | bg maintenance_s | Reduction |
+| Dataset | Workload | seg4 maintenance_s | bg maintenance_s | 降低幅度 |
 |---|---|---:|---:|---:|
-| ROADS | read | 3.916 | 2.203 | about 44 percent |
-| ROADS | write | 3.894 | 2.110 | about 46 percent |
-| PARKS | read | 4.221 | 2.376 | about 44 percent |
-| PARKS | write | 4.376 | 2.323 | about 47 percent |
+| ROADS | read | 3.916 | 2.203 | 约 44% |
+| ROADS | write | 3.894 | 2.110 | 约 46% |
+| PARKS | read | 4.221 | 2.376 | 约 44% |
+| PARKS | write | 4.376 | 2.323 | 约 47% |
 
-This supports the grouped flush + background scheduling design.
+这说明 grouped flush + background scheduling 是有效的。
 
-## 7. What Is a Paper Innovation?
+## 7. 哪些可以算论文创新点
 
-### Strongest Paper Story
+目前最稳的论文故事不是“GLIN-LSM-bg 全面打败 R-tree”，而是下面这个组合：
 
-The strongest current story is:
+### 7.1 Workload characterization
 
-1. Workload characterization:
-   - GLIN is highly sensitive to insertion order.
-   - Random insertion is bad, but Zmin-ordered insertion is strong.
+中文意思：工作负载特征分析。
 
-2. System mechanism:
-   - Use a delta index to absorb random writes.
-   - Convert random arrivals into sorted GLIN segments.
-   - Use fanout-4 compaction and segment pruning to control query overhead.
-   - Move segment construction/compaction to background maintenance.
+可以写：
 
-3. Evaluation artifact:
-   - Report both foreground throughput and total throughput.
-   - Report `maintenance_ns`, `drain_ns`, `delta_pending`, `segment_count`,
-     and correctness against Boost R-tree.
+```text
+GLIN 的动态插入性能对插入顺序非常敏感。
+随机插入破坏 ALEX/GLIN 的有序数组优势。
+按 Zmin 顺序插入时，GLIN 的性能显著提升。
+```
 
-This is more credible than saying only "we added an LSM buffer."
+这是一个比较强的观察。
 
-### Claims That Are Currently Supported
+### 7.2 System mechanism
 
-Supported:
+中文意思：系统机制设计。
 
-- Random insertion is a weakness of GLIN/ALEX-style ordered array storage.
-- Zmin-ordered insertion can make GLIN competitive or better than Boost R-tree.
-- Naive full-rebuild LSM is not enough.
-- Segmentation avoids full rebuild but needs compaction and pruning.
-- Background GLIN-LSM improves foreground throughput under hybrid workloads.
-- `GLIN_LSM_BG` is correct against Boost R-tree in current 2M hybrid results.
+可以写：
 
-Partially supported:
+```text
+使用 delta index 吸收随机写入。
+将随机 arrival 转换成按 Zmin 排序的 GLIN segment。
+使用 fanout=4 compaction 控制 segment 数量。
+使用 segment pruning 降低查询访问的 segment 数。
+使用 background maintenance 降低 foreground stall。
+```
 
-- `GLIN_LSM_BG` can outperform Boost R-tree in foreground throughput.
-- Background maintenance reduces foreground stalls.
+这部分是 GLIN-LSM-bg 的核心贡献。
 
-Not currently supported:
+### 7.3 Evaluation artifact
 
-- "GLIN-LSM-bg universally beats Boost R-tree."
-- "Maintenance is free."
-- "The async variant is a fair single-threaded baseline comparison."
-- "GLIN-piecewise is correct in current hybrid query accounting."
+中文意思：评测方法和指标贡献。
 
-## 8. Which Variant Should Be Used?
+可以写：
 
-Recommended final system variant:
+```text
+同时报告 foreground throughput 和 total throughput。
+显式报告 maintenance_ns、drain_ns、delta_pending、segment_count。
+使用 Boost R-tree 做 correctness reference。
+```
 
-- `GLIN_LSM_BG`
+这很重要，因为 async 方法如果只报 foreground throughput，会被审稿人质疑不公平。
 
-Use as ablations:
+## 8. 哪些结论目前支持，哪些不支持
 
-- `GLIN_LSM_SEGMENTED4`
-- `GLIN_LSM_ASYNC`
-- `GLIN_LSM`
-- `GLIN_BUFFERED`
+### 8.1 已经支持的结论
 
-Do not use as final method:
+```text
+1. 随机插入是 GLIN/ALEX 风格结构的弱点。
+2. Zmin 顺序插入能显著提升 GLIN 插入性能。
+3. naive full-rebuild LSM 不够好。
+4. segmented LSM 能避免 full rebuild，但必须配合 pruning 和 compaction。
+5. GLIN_LSM_BG 能提升 foreground throughput。
+6. 当前 2M hybrid 结果中，GLIN_LSM_BG 和 Boost R-tree 答案一致。
+```
 
-- `GLIN_BUFFERED`
-  - Reason: insert-only and limited as a full system.
+### 8.2 部分支持的结论
 
-- `GLIN_LSM`
-  - Reason: full rebuild cost is too high.
+```text
+1. GLIN_LSM_BG 在 foreground throughput 上可以超过 Boost R-tree。
+2. background maintenance 可以减少前台阻塞。
+```
 
-- `GLIN_LSM_ASYNC`
-  - Reason: useful as a write-path idealization, but not a complete fair system
-    result.
+注意这里要写“foreground throughput”，不能写“所有吞吐指标”。
 
-- `GLIN_LSM_SEGMENTED`
-  - Reason: too many segments and weak query behavior.
+### 8.3 目前不支持的结论
 
-- `GLIN_LSM_SEGMENTED4`
-  - Reason: correct and useful, but synchronous maintenance hurts foreground
-    throughput.
+```text
+1. GLIN_LSM_BG 全面超过 Boost R-tree。
+2. background maintenance 是免费的。
+3. async 变体和单线程 baseline 完全公平。
+4. GLIN-piecewise 在当前 hybrid query accounting 下可以作为正确性 oracle。
+```
 
-Use carefully:
+这些话论文里不能直接说。
 
-- `GLIN_PIECEWISE`
-  - Reason: useful as an existing GLIN variant, but current hybrid
-    `answers_match_boost=0`; do not use it as the correctness oracle.
+## 9. 哪个版本真正可用
 
-## 9. Fairness and Paper Wording
+### 9.1 推荐作为最终系统变体
 
-`GLIN_LSM_BG` uses asynchronous background maintenance. Therefore, it should not
-be presented as a direct replacement for the original single-threaded GLIN
-baseline.
+```text
+GLIN_LSM_BG
+```
 
-Recommended wording:
+原因：
 
-> We report GLIN-LSM-bg as a system-level asynchronous extension. Its foreground
-> throughput measures the online query/update path, while total throughput
-> includes the final drain cost of background maintenance.
+```text
+1. 当前效果最好。
+2. 正确性对齐 Boost R-tree。
+3. foreground throughput 有优势。
+4. 维护成本比同步 segmented4 更低。
+5. 机制完整：delta、segment、pruning、background maintenance 都有。
+```
 
-Avoid wording:
+但要注意：
 
-> GLIN-LSM-bg is the new GLIN baseline.
+```text
+它是 system-level asynchronous variant。
+不能当成原始 GLIN baseline。
+```
 
-Avoid wording:
+### 9.2 推荐作为 ablation
 
-> GLIN-LSM-bg always outperforms Boost R-tree.
+```text
+GLIN_LSM_SEGMENTED4
+GLIN_LSM_ASYNC
+GLIN_LSM
+GLIN_BUFFERED
+```
 
-Better claim:
+`ablation` 的意思是消融实验，也就是有意去掉某些机制，看看性能为什么变好或变差。
 
-> GLIN-LSM-bg improves foreground update throughput under hybrid workloads by
-> decoupling random writes from sorted GLIN segment construction. The improvement
-> comes with deferred maintenance, which is exposed through `maintenance_ns` and
-> `drain_ns`.
+### 9.3 不建议作为最终方法
 
-## 10. Current Decision
+#### GLIN_BUFFERED
 
-Do not keep randomly changing the implementation just to chase a small number.
-The current implementation is good enough to freeze as a research prototype:
+原因：
 
-- Use `GLIN_LSM_BG` as the main system extension.
-- Use `GLIN_LSM_SEGMENTED4` as the main ablation.
-- Keep `GLIN_BUFFERED`, `GLIN_LSM`, and `GLIN_LSM_ASYNC` as diagnostic
-  variants.
-- Focus next on stronger evaluation and paper framing.
+```text
+只适合 insert-only 诊断。
+不是完整 query/update 系统。
+实时性较弱。
+```
 
-## 11. Recommended Next Experiments
+#### GLIN_LSM
 
-High priority:
+原因：
 
-1. Repeat 2M hybrid workload with multiple seeds.
-2. Run larger workloads, for example 5M or 10M, to see whether `drain_ns`
-   becomes smaller relative to total workload time.
-3. Report foreground throughput and total throughput side by side.
-4. Report `maintenance_ns`, `drain_ns`, `delta_pending`, and `segment_count`.
-5. Add memory usage if possible.
+```text
+full rebuild 成本太高。
+DELTA_SIZE 难以同时兼顾写入和查询。
+```
 
-Medium priority:
+#### GLIN_LSM_ASYNC
 
-1. Vary `DELTA_SIZE` but present it as a sensitivity study, not manual tuning.
-2. Compare query selectivities, for example 0.1 percent, 1 percent, and 10
-   percent.
-3. Include AW/LW if hybrid query generation is stable for those datasets.
+原因：
 
-Low priority:
+```text
+更像 write-path idealization，也就是理想化写入路径。
+不是完整公平系统结果。
+```
 
-1. More background workers.
-2. More complicated compaction scheduling.
-3. Deletion-aware segmented GLIN-LSM.
+#### GLIN_LSM_SEGMENTED
 
-These are interesting but can easily turn into engineering work without a clear
-paper payoff.
+原因：
+
+```text
+segment 太多时查询负担重。
+缺少足够强的 pruning/compaction。
+```
+
+#### GLIN_LSM_SEGMENTED4
+
+原因：
+
+```text
+正确性好，也适合作为对照。
+但同步维护太重，foreground throughput 不好。
+```
+
+### 9.4 需要谨慎使用的版本
+
+```text
+GLIN_PIECEWISE
+```
+
+原因：
+
+```text
+它仍然是有价值的 GLIN 变体。
+但当前 Fig.17 hybrid summary 中 answers_match_boost=0。
+所以不能用它当 correctness oracle。
+```
+
+## 10. 论文中应该怎么写
+
+### 推荐表述
+
+```text
+We report GLIN-LSM-bg as a system-level asynchronous extension.
+Its foreground throughput measures the online query/update path,
+while total throughput includes the final drain cost of background maintenance.
+```
+
+中文意思：
+
+```text
+我们把 GLIN-LSM-bg 作为系统级异步扩展来报告。
+foreground throughput 反映在线查询/更新路径性能；
+total throughput 则把后台维护最终收尾成本也计算进去。
+```
+
+### 不建议这样写
+
+```text
+GLIN-LSM-bg is the new GLIN baseline.
+```
+
+问题：
+
+```text
+它不是原始 GLIN baseline，而是新增的系统级异步扩展。
+```
+
+不建议这样写：
+
+```text
+GLIN-LSM-bg always outperforms Boost R-tree.
+```
+
+问题：
+
+```text
+当前 total throughput 在写密集场景下没有超过 Boost R-tree。
+```
+
+### 更稳妥的 claim
+
+```text
+GLIN-LSM-bg improves foreground update throughput under hybrid workloads by
+decoupling random writes from sorted GLIN segment construction. The improvement
+comes with deferred maintenance, which is exposed through maintenance_ns and
+drain_ns.
+```
+
+中文意思：
+
+```text
+GLIN-LSM-bg 通过把随机写入和有序 GLIN segment 构建解耦，提高了 hybrid workload 下的前台更新吞吐。
+这种提升不是免费的，它带来了延迟维护成本；我们用 maintenance_ns 和 drain_ns 显式报告这个成本。
+```
+
+## 11. 当前决策
+
+目前不建议继续为了小幅提升盲目改实现。
+
+推荐冻结当前实现作为研究原型：
+
+```text
+1. GLIN_LSM_BG 作为主系统扩展。
+2. GLIN_LSM_SEGMENTED4 作为主要 ablation。
+3. GLIN_BUFFERED、GLIN_LSM、GLIN_LSM_ASYNC 作为诊断/动机实验。
+4. 后续重点转向更扎实的评测和论文表述。
+```
+
+## 12. 后续推荐实验
+
+### 高优先级
+
+```text
+1. 多个 seed 重复 2M hybrid workload。
+2. 跑更大规模，例如 5M 或 10M，看 drain_ns 相对占比是否下降。
+3. foreground throughput 和 total throughput 同时报告。
+4. 同时报告 maintenance_ns、drain_ns、delta_pending、segment_count。
+5. 如果可以，补充 memory usage。
+```
+
+### 中优先级
+
+```text
+1. 做 DELTA_SIZE sensitivity study。
+2. 比较不同 query selectivity，例如 0.1%、1%、10%。
+3. 如果 AW/LW 的 hybrid query generation 稳定，可以补充 AW/LW。
+```
+
+`sensitivity study` 的意思是敏感性实验，也就是改变一个参数，看结果是否稳定。
+
+### 低优先级
+
+```text
+1. 多后台 worker。
+2. 更复杂的 compaction scheduling。
+3. 删除 delete 也完整接入 segmented GLIN-LSM。
+```
+
+这些方向有价值，但容易变成大量工程工作。如果论文时间紧，不建议优先做。
 
