@@ -76,6 +76,8 @@ struct Options {
   std::size_t progress_step_percent = 10;
   std::size_t delta_size = 100000;
   bool include_lsm_async_glin = false;
+  bool include_lsm_segmented_glin = false;
+  bool include_lsm_segmented4_glin = false;
   bool append_csv = false;
 };
 
@@ -112,8 +114,12 @@ struct HybridResult {
   long long workload_ns = 0;
   long long maintenance_ns = 0;
   std::size_t pieces = 0;
+  std::size_t flush_count = 0;
   std::size_t merge_count = 0;
   std::size_t delta_pending = 0;
+  std::size_t segment_count = 0;
+  std::size_t max_segment_level = 0;
+  long long segments_pruned_total = 0;
   long long candidates_total = 0;
   long long answers_total = 0;
 };
@@ -136,8 +142,12 @@ struct ProgressResult {
   std::size_t insert_success_count = 0;
   std::size_t insert_failed_count = 0;
   std::size_t pieces = 0;
+  std::size_t flush_count = 0;
   std::size_t merge_count = 0;
   std::size_t delta_pending = 0;
+  std::size_t segment_count = 0;
+  std::size_t max_segment_level = 0;
+  long long segments_pruned_total = 0;
   long long candidates_total = 0;
   long long answers_total = 0;
 };
@@ -165,6 +175,8 @@ void print_usage(const char* program) {
       << "  --cell_size S                Z-order cell size (default: 5e-7)\n"
       << "  --progress_step_percent N    Output checkpoint step (default: 10)\n"
       << "  --include_lsm_async_glin 0|1 Also run GLIN-LSM-async (default: 0)\n"
+      << "  --include_lsm_segmented_glin 0|1 Also run segmented GLIN-LSM (default: 0)\n"
+      << "  --include_lsm_segmented4_glin 0|1 Also run fanout-4 pruned GLIN-LSM (default: 0)\n"
       << "  --delta_size N               Delta size before merge/rebuild (default: 100000)\n"
       << "  --seed N                     Random seed (default: 42)\n"
       << "  --output_csv PATH            Write summary CSV\n"
@@ -214,6 +226,10 @@ Options parse_args(int argc, char* argv[]) {
           static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--include_lsm_async_glin") {
       options.include_lsm_async_glin = std::stoi(require_value(key)) != 0;
+    } else if (key == "--include_lsm_segmented_glin") {
+      options.include_lsm_segmented_glin = std::stoi(require_value(key)) != 0;
+    } else if (key == "--include_lsm_segmented4_glin") {
+      options.include_lsm_segmented4_glin = std::stoi(require_value(key)) != 0;
     } else if (key == "--delta_size") {
       options.delta_size =
           static_cast<std::size_t>(std::stoull(require_value(key)));
@@ -557,6 +573,182 @@ std::unique_ptr<alex::Glin<double, Geometry*>> build_glin_index_by_ids(
   return index;
 }
 
+struct GlinSegment {
+  std::size_t level = 0;
+  std::vector<std::size_t> ids;
+  std::vector<std::tuple<double, double, double, double>> pieces;
+  std::unique_ptr<alex::Glin<double, Geometry*>> index;
+  geos::geom::Envelope envelope;
+  double zmin = 0.0;
+  double zmax = 0.0;
+};
+
+GlinSegment build_glin_segment(const Options& options,
+                               const std::vector<GeometryPtr>& geometries,
+                               const std::vector<std::size_t>& ids,
+                               std::size_t level) {
+  GlinSegment segment;
+  segment.level = level;
+  segment.ids = zmin_sorted_batch_ids(options, geometries, ids, 0, ids.size());
+  bool first = true;
+  for (std::size_t id : segment.ids) {
+    const geos::geom::Envelope* envelope =
+        geometries[id]->getEnvelopeInternal();
+    if (first) {
+      segment.envelope = *envelope;
+      segment.zmin = 0.0;
+      segment.zmax = 0.0;
+      curve_shape_projection(geometries[id].get(), "z", options.cell_xmin,
+                             options.cell_ymin, options.cell_size,
+                             options.cell_size, segment.zmin, segment.zmax);
+      first = false;
+    } else {
+      segment.envelope.expandToInclude(envelope);
+      double current_zmin = 0.0;
+      double current_zmax = 0.0;
+      curve_shape_projection(geometries[id].get(), "z", options.cell_xmin,
+                             options.cell_ymin, options.cell_size,
+                             options.cell_size, current_zmin, current_zmax);
+      segment.zmin = std::min(segment.zmin, current_zmin);
+      segment.zmax = std::max(segment.zmax, current_zmax);
+    }
+  }
+  segment.index =
+      build_glin_index_by_ids(options, geometries, segment.ids, segment.pieces);
+  return segment;
+}
+
+std::size_t max_segment_level(const std::vector<GlinSegment>& segments) {
+  std::size_t max_level = 0;
+  for (const auto& segment : segments) {
+    max_level = std::max(max_level, segment.level);
+  }
+  return max_level;
+}
+
+std::size_t total_segment_pieces(
+    const std::vector<std::tuple<double, double, double, double>>& base_pieces,
+    const std::vector<GlinSegment>& segments) {
+  std::size_t total = base_pieces.size();
+  for (const auto& segment : segments) {
+    total += segment.pieces.size();
+  }
+  return total;
+}
+
+void compact_binary_segments(const Options& options,
+                             const std::vector<GeometryPtr>& geometries,
+                             std::vector<GlinSegment>& segments,
+                             long long& maintenance_ns,
+                             std::size_t& merge_count) {
+  while (true) {
+    std::size_t first = segments.size();
+    std::size_t second = segments.size();
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+      for (std::size_t j = i + 1; j < segments.size(); ++j) {
+        if (segments[i].level == segments[j].level) {
+          first = i;
+          second = j;
+          break;
+        }
+      }
+      if (first != segments.size()) {
+        break;
+      }
+    }
+    if (first == segments.size()) {
+      break;
+    }
+
+    std::vector<std::size_t> merged_ids;
+    merged_ids.reserve(segments[first].ids.size() + segments[second].ids.size());
+    merged_ids.insert(merged_ids.end(), segments[first].ids.begin(),
+                      segments[first].ids.end());
+    merged_ids.insert(merged_ids.end(), segments[second].ids.begin(),
+                      segments[second].ids.end());
+    std::size_t next_level = segments[first].level + 1;
+
+    segments.erase(segments.begin() + second);
+    segments.erase(segments.begin() + first);
+
+    auto start = std::chrono::high_resolution_clock::now();
+    GlinSegment compacted =
+        build_glin_segment(options, geometries, merged_ids, next_level);
+    auto end = std::chrono::high_resolution_clock::now();
+    maintenance_ns += ns_count(end - start);
+    ++merge_count;
+    segments.push_back(std::move(compacted));
+  }
+}
+
+void compact_size_tiered_segments(const Options& options,
+                                  const std::vector<GeometryPtr>& geometries,
+                                  std::vector<GlinSegment>& segments,
+                                  std::size_t fanout,
+                                  long long& maintenance_ns,
+                                  std::size_t& merge_count) {
+  if (fanout < 2) {
+    throw std::runtime_error("compaction fanout must be at least 2");
+  }
+  while (true) {
+    bool found = false;
+    std::size_t level_to_compact = 0;
+    std::vector<std::size_t> compact_indices;
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+      std::size_t level = segments[i].level;
+      std::vector<std::size_t> same_level;
+      for (std::size_t j = 0; j < segments.size(); ++j) {
+        if (segments[j].level == level) {
+          same_level.push_back(j);
+        }
+      }
+      if (same_level.size() >= fanout) {
+        level_to_compact = level;
+        compact_indices.assign(same_level.begin(),
+                               same_level.begin() + fanout);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      break;
+    }
+
+    std::vector<std::size_t> merged_ids;
+    for (std::size_t index : compact_indices) {
+      merged_ids.insert(merged_ids.end(), segments[index].ids.begin(),
+                        segments[index].ids.end());
+    }
+    std::sort(compact_indices.rbegin(), compact_indices.rend());
+    for (std::size_t index : compact_indices) {
+      segments.erase(segments.begin() + index);
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+    GlinSegment compacted =
+        build_glin_segment(options, geometries, merged_ids, level_to_compact + 1);
+    auto end = std::chrono::high_resolution_clock::now();
+    maintenance_ns += ns_count(end - start);
+    ++merge_count;
+    segments.push_back(std::move(compacted));
+  }
+}
+
+bool envelopes_intersect(const geos::geom::Envelope& a,
+                         const geos::geom::Envelope& b) {
+  return !(a.getMaxX() < b.getMinX() || b.getMaxX() < a.getMinX() ||
+           a.getMaxY() < b.getMinY() || b.getMaxY() < a.getMinY());
+}
+
+bool segment_may_intersect_query(const GlinSegment& segment,
+                                 const QueryCase& query, double query_zmin,
+                                 double query_zmax) {
+  if (!envelopes_intersect(segment.envelope, query.envelope)) {
+    return false;
+  }
+  return !(query_zmax < segment.zmin || segment.zmax < query_zmin);
+}
+
 Box box_from_envelope(const geos::geom::Envelope* envelope) {
   return Box(Point(envelope->getMinX(), envelope->getMinY()),
              Point(envelope->getMaxX(), envelope->getMaxY()));
@@ -629,8 +821,12 @@ void maybe_capture_progress(std::vector<ProgressResult>& progress,
     row.insert_success_count = state.insert_success_count;
     row.insert_failed_count = state.insert_failed_count;
     row.pieces = state.pieces;
+    row.flush_count = state.flush_count;
     row.merge_count = state.merge_count;
     row.delta_pending = state.delta_pending;
+    row.segment_count = state.segment_count;
+    row.max_segment_level = state.max_segment_level;
+    row.segments_pruned_total = state.segments_pruned_total;
     row.candidates_total = state.candidates_total;
     row.answers_total = state.answers_total;
     progress.push_back(row);
@@ -834,6 +1030,157 @@ HybridResult run_glin_lsm_async_hybrid(
   return result;
 }
 
+HybridResult run_glin_lsm_segmented_hybrid(
+    const Options& options, const std::vector<GeometryPtr>& geometries,
+    const std::vector<std::size_t>& ids, const std::vector<QueryCase>& queries,
+    const std::string& workload, double query_fraction,
+    std::size_t initial_count, std::size_t total_insert_count,
+    std::size_t batch_size, const std::string& index_name,
+    std::size_t compaction_fanout, bool enable_segment_pruning,
+    std::vector<ProgressResult>& progress) {
+  std::vector<std::size_t> base_ids(ids.begin(), ids.begin() + initial_count);
+  base_ids = zmin_sorted_batch_ids(options, geometries, base_ids, 0,
+                                   base_ids.size());
+
+  std::vector<std::tuple<double, double, double, double>> base_pieces;
+  auto build_start = std::chrono::high_resolution_clock::now();
+  std::unique_ptr<alex::Glin<double, Geometry*>> base_index =
+      build_glin_index_by_ids(options, geometries, base_ids, base_pieces);
+  auto build_end = std::chrono::high_resolution_clock::now();
+
+  RTree delta_index;
+  std::vector<std::size_t> delta_ids;
+  delta_ids.reserve(options.delta_size);
+  std::vector<GlinSegment> segments;
+
+  HybridResult result;
+  result.index = index_name;
+  result.workload = workload;
+  result.query_fraction = query_fraction;
+  result.loaded_count = geometries.size();
+  result.initial_count = initial_count;
+  result.total_insert_count = total_insert_count;
+  result.build_ns = ns_count(build_end - build_start);
+  result.pieces = base_pieces.size();
+
+  std::vector<std::size_t> checkpoints = make_progress_checkpoints(
+      geometries.size(), total_insert_count, options.progress_step_percent);
+  std::size_t next_checkpoint = 0;
+  std::size_t next_query = 0;
+  std::size_t next_insert_offset = 0;
+  std::size_t queries_per_insert =
+      query_transactions_before_insert(query_fraction);
+
+  auto workload_start = std::chrono::high_resolution_clock::now();
+  while (next_insert_offset < total_insert_count) {
+    for (std::size_t q = 0; q < queries_per_insert; ++q) {
+      const QueryCase& query = queries[next_query % queries.size()];
+      ++next_query;
+
+      int base_candidates = 0;
+      std::vector<Geometry*> base_result;
+      base_index->glin_find(query.geometry, "z", options.cell_xmin,
+                            options.cell_ymin, options.cell_size,
+                            options.cell_size, base_pieces, base_result,
+                            base_candidates);
+
+      std::size_t segment_candidates = 0;
+      std::size_t segment_answers = 0;
+      double query_zmin = 0.0;
+      double query_zmax = 0.0;
+      if (enable_segment_pruning) {
+        curve_shape_projection(query.geometry, "z", options.cell_xmin,
+                               options.cell_ymin, options.cell_size,
+                               options.cell_size, query_zmin, query_zmax);
+      }
+      for (auto& segment : segments) {
+        if (enable_segment_pruning &&
+            !segment_may_intersect_query(segment, query, query_zmin,
+                                         query_zmax)) {
+          ++result.segments_pruned_total;
+          continue;
+        }
+        int current_candidates = 0;
+        std::vector<Geometry*> segment_result;
+        segment.index->glin_find(query.geometry, "z", options.cell_xmin,
+                                 options.cell_ymin, options.cell_size,
+                                 options.cell_size, segment.pieces,
+                                 segment_result, current_candidates);
+        segment_candidates += static_cast<std::size_t>(current_candidates);
+        segment_answers += segment_result.size();
+      }
+
+      std::vector<RTreeValue> delta_result;
+      delta_index.query(bgi::intersects(box_from_query(query)),
+                        std::back_inserter(delta_result));
+      std::size_t delta_answers = 0;
+      for (const auto& candidate : delta_result) {
+        Geometry* payload = geometries[candidate.second].get();
+        if (query.geometry->intersects(payload)) {
+          ++delta_answers;
+        }
+      }
+
+      ++result.query_transactions;
+      ++result.transaction_count;
+      result.candidates_total += static_cast<long long>(
+          base_candidates + segment_candidates + delta_result.size());
+      result.answers_total += static_cast<long long>(
+          base_result.size() + segment_answers + delta_answers);
+    }
+
+    std::size_t remaining = total_insert_count - next_insert_offset;
+    std::size_t current_batch = std::min(batch_size, remaining);
+    for (std::size_t i = 0; i < current_batch; ++i) {
+      std::size_t id = ids[initial_count + next_insert_offset + i];
+      delta_index.insert(std::make_pair(
+          box_from_envelope(geometries[id]->getEnvelopeInternal()), id));
+      delta_ids.push_back(id);
+      ++result.insert_success_count;
+
+      if (delta_ids.size() >= options.delta_size) {
+        auto flush_start = std::chrono::high_resolution_clock::now();
+        GlinSegment segment =
+            build_glin_segment(options, geometries, delta_ids, 0);
+        auto flush_end = std::chrono::high_resolution_clock::now();
+        result.maintenance_ns += ns_count(flush_end - flush_start);
+        ++result.flush_count;
+
+        segments.push_back(std::move(segment));
+        delta_index.clear();
+        delta_ids.clear();
+        if (compaction_fanout == 2) {
+          compact_binary_segments(options, geometries, segments,
+                                  result.maintenance_ns, result.merge_count);
+        } else {
+          compact_size_tiered_segments(options, geometries, segments,
+                                       compaction_fanout,
+                                       result.maintenance_ns,
+                                       result.merge_count);
+        }
+      }
+    }
+    next_insert_offset += current_batch;
+    ++result.insert_transactions;
+    ++result.transaction_count;
+    result.delta_pending = delta_ids.size();
+    result.segment_count = segments.size();
+    result.max_segment_level = max_segment_level(segments);
+    result.pieces = total_segment_pieces(base_pieces, segments);
+    maybe_capture_progress(progress, result.index, workload, query_fraction,
+                           geometries.size(), initial_count, total_insert_count,
+                           checkpoints, next_checkpoint, workload_start,
+                           result);
+  }
+  auto workload_end = std::chrono::high_resolution_clock::now();
+  result.workload_ns = ns_count(workload_end - workload_start);
+  result.delta_pending = delta_ids.size();
+  result.segment_count = segments.size();
+  result.max_segment_level = max_segment_level(segments);
+  result.pieces = total_segment_pieces(base_pieces, segments);
+  return result;
+}
+
 template <typename QueryFn, typename InsertFn>
 HybridResult run_tree_hybrid(const Options& options,
                              const std::string& index_name,
@@ -1027,7 +1374,8 @@ void write_summary_csv(const std::string& path, const Options& options,
               "lines_seen,parse_errors,load_ns,build_ns,workload_ns,maintenance_ns,"
               "throughput_transactions_per_sec,transaction_count,query_transactions,"
               "insert_transactions,insert_success_count,insert_failed_count,pieces,"
-              "merge_count,delta_pending,delta_size,candidates_total,answers_total\n";
+              "flush_count,merge_count,delta_pending,delta_size,segment_count,"
+              "max_segment_level,segments_pruned_total,candidates_total,answers_total\n";
   }
   for (const auto& result : results) {
     double throughput = result.workload_ns == 0
@@ -1048,8 +1396,11 @@ void write_summary_csv(const std::string& path, const Options& options,
            << result.transaction_count << "," << result.query_transactions << ","
            << result.insert_transactions << "," << result.insert_success_count
            << "," << result.insert_failed_count << "," << result.pieces << ","
+           << result.flush_count << ","
            << result.merge_count << "," << result.delta_pending << ","
-           << options.delta_size << ","
+           << options.delta_size << "," << result.segment_count << ","
+           << result.max_segment_level << "," << result.segments_pruned_total
+           << ","
            << result.candidates_total << "," << result.answers_total << "\n";
   }
 }
@@ -1072,8 +1423,9 @@ void write_progress_csv(const std::string& path, const Options& options,
               "insert_transactions,insert_order,piece_limit,cell_xmin,cell_ymin,"
               "cell_size,seed,lines_seen,parse_errors,load_ns,build_ns,"
               "elapsed_workload_ns,maintenance_ns,throughput_transactions_per_sec,"
-              "insert_success_count,insert_failed_count,pieces,merge_count,"
-              "delta_pending,delta_size,candidates_total,answers_total\n";
+              "insert_success_count,insert_failed_count,pieces,flush_count,"
+              "merge_count,delta_pending,delta_size,segment_count,"
+              "max_segment_level,segments_pruned_total,candidates_total,answers_total\n";
   }
   for (const auto& result : results) {
     double throughput =
@@ -1096,8 +1448,11 @@ void write_progress_csv(const std::string& path, const Options& options,
            << result.maintenance_ns << "," << throughput << ","
            << result.insert_success_count << ","
            << result.insert_failed_count << "," << result.pieces << ","
+           << result.flush_count << ","
            << result.merge_count << "," << result.delta_pending << ","
-           << options.delta_size << ","
+           << options.delta_size << "," << result.segment_count << ","
+           << result.max_segment_level << "," << result.segments_pruned_total
+           << ","
            << result.candidates_total << "," << result.answers_total << "\n";
   }
 }
@@ -1128,8 +1483,12 @@ void print_result(const HybridResult& result) {
             << " inserted=" << result.insert_success_count
             << " failed=" << result.insert_failed_count
             << " pieces=" << result.pieces
+            << " flushes=" << result.flush_count
             << " merges=" << result.merge_count
             << " delta_pending=" << result.delta_pending
+            << " segments=" << result.segment_count
+            << " max_level=" << result.max_segment_level
+            << " pruned_segments=" << result.segments_pruned_total
             << " build_ms=" << result.build_ns / 1e6
             << " workload_ms=" << result.workload_ns / 1e6
             << " maintenance_ms=" << result.maintenance_ns / 1e6
@@ -1179,6 +1538,18 @@ int main(int argc, char* argv[]) {
         summary_results.push_back(run_glin_lsm_async_hybrid(
             options, geometries, ids, queries, workload.first, workload.second,
             initial_count, total_insert_count, batch_size, progress_results));
+      }
+      if (options.include_lsm_segmented_glin) {
+        summary_results.push_back(run_glin_lsm_segmented_hybrid(
+            options, geometries, ids, queries, workload.first, workload.second,
+            initial_count, total_insert_count, batch_size,
+            "GLIN_LSM_SEGMENTED", 2, false, progress_results));
+      }
+      if (options.include_lsm_segmented4_glin) {
+        summary_results.push_back(run_glin_lsm_segmented_hybrid(
+            options, geometries, ids, queries, workload.first, workload.second,
+            initial_count, total_insert_count, batch_size,
+            "GLIN_LSM_SEGMENTED4", 4, true, progress_results));
       }
       summary_results.push_back(run_boost_hybrid(
           options, geometries, ids, queries, workload.first, workload.second,

@@ -39,6 +39,8 @@ QUERY_COUNT="${QUERY_COUNT:-100}"  # 每种选择性生成多少条查询语句
 QUERY_SELECTIVITIES="${QUERY_SELECTIVITIES:-1%}" #查询 AABB 矩形的空间面积占整个数据集全域空间的百分比； 当前脚本一次只能执行一个选择性，
 PROGRESS_STEP_PERCENT="${PROGRESS_STEP_PERCENT:-10}"
 INCLUDE_LSM_ASYNC_GLIN="${INCLUDE_LSM_ASYNC_GLIN:-0}"
+INCLUDE_LSM_SEGMENTED_GLIN="${INCLUDE_LSM_SEGMENTED_GLIN:-0}"
+INCLUDE_LSM_SEGMENTED4_GLIN="${INCLUDE_LSM_SEGMENTED4_GLIN:-0}"
 DELTA_SIZE="${DELTA_SIZE:-100000}"
 DATA_ROOT="${DATA_ROOT:-/mnt/hgfs}"    # 原始数据集路径
 QUERY_ROOT="${QUERY_ROOT:-queries/fig17_hybrid_${QUERY_LIMIT}}" # 查询 csv 文件存储根目录
@@ -153,6 +155,8 @@ for dataset in $DATASETS; do
     --seed "$SEED" \
     --progress_step_percent "$PROGRESS_STEP_PERCENT" \
     --include_lsm_async_glin "$INCLUDE_LSM_ASYNC_GLIN" \
+    --include_lsm_segmented_glin "$INCLUDE_LSM_SEGMENTED_GLIN" \
+    --include_lsm_segmented4_glin "$INCLUDE_LSM_SEGMENTED4_GLIN" \
     --delta_size "$DELTA_SIZE" \
     --output_csv "$SUMMARY_CSV" \
     --progress_csv "$PROGRESS_CSV" \
