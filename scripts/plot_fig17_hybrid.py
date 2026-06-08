@@ -14,14 +14,16 @@ import matplotlib.pyplot as plt
 
 INDEX_LABELS = {
     "GLIN_PIECEWISE": "GLIN-piecewise",
+    "GLIN_LSM_ASYNC": "GLIN-LSM-async",
     "Boost_Rtree": "Boost R-tree",
     "GEOS_Quadtree": "Quadtree",
 }
 
-INDEX_ORDER = ["GLIN_PIECEWISE", "GEOS_Quadtree", "Boost_Rtree"]
+INDEX_ORDER = ["GLIN_PIECEWISE", "GLIN_LSM_ASYNC", "GEOS_Quadtree", "Boost_Rtree"]
 
 STYLE = {
     "GLIN_PIECEWISE": {"marker": "o", "linestyle": "-", "color": "#1f77b4"},
+    "GLIN_LSM_ASYNC": {"marker": "D", "linestyle": "-.", "color": "#9467bd"},
     "GEOS_Quadtree": {"marker": "s", "linestyle": "--", "color": "#d62728"},
     "Boost_Rtree": {"marker": "^", "linestyle": ":", "color": "#2ca02c"},
 }

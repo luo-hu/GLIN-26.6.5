@@ -14,6 +14,9 @@ import pandas as pd
 DATASET_ORDER = ["AW", "LW", "ROADS", "PARKS"]
 INDEX_ORDER = [
     "GLIN",
+    "GLIN_BUFFERED",
+    "GLIN_LSM",
+    "GLIN_LSM_ASYNC",
     "GLIN_PIECEWISE",
     "Boost_Rtree",
     "Boost_Rtree_linear",
@@ -23,6 +26,9 @@ INDEX_ORDER = [
 ]
 INDEX_LABELS = {
     "GLIN": "GLIN",
+    "GLIN_BUFFERED": "GLIN-buffered",
+    "GLIN_LSM": "GLIN-LSM",
+    "GLIN_LSM_ASYNC": "GLIN-LSM-async",
     "GLIN_PIECEWISE": "GLIN-piecewise",
     "Boost_Rtree": "Boost linear",
     "Boost_Rtree_linear": "Boost linear",
@@ -32,6 +38,9 @@ INDEX_LABELS = {
 }
 INDEX_COLORS = {
     "GLIN": "#3B6EA8",
+    "GLIN_BUFFERED": "#2F9C95",
+    "GLIN_LSM": "#5B8F2A",
+    "GLIN_LSM_ASYNC": "#9A8F2A",
     "GLIN_PIECEWISE": "#70A37F",
     "Boost_Rtree": "#C46A4A",
     "Boost_Rtree_linear": "#C46A4A",
@@ -41,6 +50,9 @@ INDEX_COLORS = {
 }
 MARKERS = {
     "GLIN": "o",
+    "GLIN_BUFFERED": "X",
+    "GLIN_LSM": "*",
+    "GLIN_LSM_ASYNC": "h",
     "GLIN_PIECEWISE": "s",
     "Boost_Rtree": "^",
     "Boost_Rtree_linear": "^",
@@ -83,8 +95,14 @@ def parse_args():
 
 def load_csv(path, experiment):
     path = Path(path)
+    if str(path) == ".":
+        raise ValueError(
+            f"{experiment} CSV path is empty; pass an explicit CSV file path."
+        )
     if not path.exists():
         raise FileNotFoundError(path)
+    if path.is_dir():
+        raise ValueError(f"{experiment} CSV path is a directory, not a file: {path}")
     df = pd.read_csv(path)
     missing = REQUIRED_COLUMNS.difference(df.columns)
     if missing:
@@ -174,7 +192,8 @@ def plot_cell_lines(df, path, dpi):
 
     for ax, dataset in zip(axes, datasets):
         sub = df[df["dataset"] == dataset]
-        for index in ["GLIN", "GLIN_PIECEWISE"]:
+        for index in ["GLIN", "GLIN_BUFFERED", "GLIN_LSM",
+                      "GLIN_LSM_ASYNC", "GLIN_PIECEWISE"]:
             cur = sub[sub["index"] == index].sort_values("cell_size")
             if cur.empty:
                 continue
@@ -202,7 +221,7 @@ def plot_cell_lines(df, path, dpi):
         ax.axis("off")
 
     fig.suptitle("GLIN insertion throughput under cell_size sweep", y=0.99)
-    fig.legend(handles, labels, frameon=False, ncol=2, loc="upper center",
+    fig.legend(handles, labels, frameon=False, ncol=5, loc="upper center",
                bbox_to_anchor=(0.5, 0.945))
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.savefig(path, dpi=dpi)
@@ -232,9 +251,11 @@ def main():
         plot_grouped_bars(
             boost[boost["operation"] == "insert"],
             "index",
-            ["GLIN", "Boost_Rtree_linear", "Boost_Rtree_quadratic",
+            ["GLIN", "GLIN_BUFFERED", "GLIN_LSM", "GLIN_LSM_ASYNC",
+             "Boost_Rtree_linear", "Boost_Rtree_quadratic",
              "Boost_Rtree_rstar", "GEOS_Quadtree"],
-            ["GLIN", "Boost_Rtree_linear", "Boost_Rtree_quadratic",
+            ["GLIN", "GLIN_BUFFERED", "GLIN_LSM", "GLIN_LSM_ASYNC",
+             "Boost_Rtree_linear", "Boost_Rtree_quadratic",
              "Boost_Rtree_rstar", "GEOS_Quadtree"],
             "Boost split strategy sweep, random insertion",
             "Index / split strategy",
@@ -247,7 +268,8 @@ def main():
             order[order["operation"] == "insert"],
             "insert_order",
             ["random", "file", "zmin"],
-            ["GLIN", "GLIN_PIECEWISE", "Boost_Rtree", "GEOS_Quadtree"],
+            ["GLIN", "GLIN_BUFFERED", "GLIN_LSM", "GLIN_LSM_ASYNC",
+             "GLIN_PIECEWISE", "Boost_Rtree", "GEOS_Quadtree"],
             "Insertion order sweep",
             "Insertion order",
             output_dir / "insert_order_sweep.png",

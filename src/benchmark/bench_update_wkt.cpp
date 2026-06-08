@@ -29,6 +29,7 @@
 #include <random>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -65,6 +66,11 @@ struct Options {
   double cell_size = 0.0000005;
   std::size_t progress_step_percent = 10;
   bool include_baselines = true;
+  bool include_buffered_glin = false;
+  bool include_lsm_glin = false;
+  bool include_lsm_async_glin = false;
+  std::size_t buffer_size = 10000;
+  std::size_t delta_size = 100000;
   bool append_csv = false;
 };
 //LoadStats：文件加载统计：读取行数、解析报错数、文件加载耗时
@@ -82,9 +88,12 @@ struct UpdateResult {
   std::size_t update_count = 0;
   long long build_ns = 0;
   long long update_ns = 0;
+  long long maintenance_ns = 0;
   std::size_t success_count = 0;
   std::size_t failed_count = 0;
   std::size_t pieces = 0;
+  std::size_t merge_count = 0;
+  std::size_t delta_pending = 0;
 };
 //ProgressResult：进度打点数据，每 5%/10% 更新记录瞬时性能，写入 progress.csv 画折线图
 struct ProgressResult {
@@ -97,9 +106,12 @@ struct ProgressResult {
   double update_percent = 0.0;
   long long build_ns = 0;
   long long elapsed_update_ns = 0;
+  long long maintenance_ns = 0;
   std::size_t success_count = 0;
   std::size_t failed_count = 0;
   std::size_t pieces = 0;
+  std::size_t merge_count = 0;
+  std::size_t delta_pending = 0;
 };
 
 void print_usage(const char* program) {
@@ -114,6 +126,11 @@ void print_usage(const char* program) {
       << "  --insert_order random|file|zmin  Record order for insert workload (default: random)\n"
       << "  --boost_strategy linear|quadratic|rstar|all  Boost R-tree split strategy (default: linear)\n"
       << "  --include_baselines 0|1  Run Boost/Quadtree in non-PIECE target (default: 1)\n"
+      << "  --include_buffered_glin 0|1  Also run GLIN_BUFFERED insert experiment (default: 0)\n"
+      << "  --buffer_size N         Micro-batch size for GLIN_BUFFERED (default: 10000)\n"
+      << "  --include_lsm_glin 0|1  Also run GLIN_LSM delta-buffer experiment (default: 0)\n"
+      << "  --include_lsm_async_glin 0|1  Also run GLIN_LSM_ASYNC write-path experiment (default: 0)\n"
+      << "  --delta_size N          Merge threshold for GLIN_LSM delta index (default: 100000)\n"
       << "  --seed N                 Random seed for shuffling records (default: 42)\n"
       << "  --piece_limit N          Records per piece for PIECE build (default: 10000)\n"
       << "  --cell_xmin X            Z-order longitude origin (default: -180)\n"
@@ -154,6 +171,18 @@ Options parse_args(int argc, char* argv[]) {
       options.boost_strategy = require_value(key);
     } else if (key == "--include_baselines") {
       options.include_baselines = (require_value(key) != "0");
+    } else if (key == "--include_buffered_glin") {
+      options.include_buffered_glin = (require_value(key) != "0");
+    } else if (key == "--include_lsm_glin") {
+      options.include_lsm_glin = (require_value(key) != "0");
+    } else if (key == "--include_lsm_async_glin") {
+      options.include_lsm_async_glin = (require_value(key) != "0");
+    } else if (key == "--buffer_size") {
+      options.buffer_size =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--delta_size") {
+      options.delta_size =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--seed") {
       options.seed = static_cast<std::uint64_t>(std::stoull(require_value(key)));
     } else if (key == "--piece_limit") {
@@ -210,6 +239,12 @@ Options parse_args(int argc, char* argv[]) {
   if (options.progress_step_percent == 0 ||
       options.progress_step_percent > 100) {
     throw std::runtime_error("--progress_step_percent must be between 1 and 100");
+  }
+  if (options.buffer_size == 0) {
+    throw std::runtime_error("--buffer_size must be greater than 0");
+  }
+  if (options.delta_size == 0) {
+    throw std::runtime_error("--delta_size must be greater than 0");
   }
   return options;
 }
@@ -400,6 +435,37 @@ std::vector<Geometry*> raw_ptrs_by_ids(const std::vector<GeometryPtr>& geometrie
   return raw;
 }
 
+std::vector<std::size_t> zmin_sorted_batch_ids(
+    const Options& options, const std::vector<GeometryPtr>& geometries,
+    const std::vector<std::size_t>& ids, std::size_t begin, std::size_t end) {
+  std::vector<std::pair<double, std::size_t>> keyed_ids;
+  keyed_ids.reserve(end - begin);
+  for (std::size_t i = begin; i < end; ++i) {
+    std::size_t id = ids[i];
+    double zmin = 0.0;
+    double zmax = 0.0;
+    curve_shape_projection(geometries[id].get(), "z", options.cell_xmin,
+                           options.cell_ymin, options.cell_size,
+                           options.cell_size, zmin, zmax);
+    keyed_ids.emplace_back(zmin, id);
+  }
+  std::sort(keyed_ids.begin(), keyed_ids.end(),
+            [](const std::pair<double, std::size_t>& a,
+               const std::pair<double, std::size_t>& b) {
+              if (a.first != b.first) {
+                return a.first < b.first;
+              }
+              return a.second < b.second;
+            });
+
+  std::vector<std::size_t> sorted_ids;
+  sorted_ids.reserve(keyed_ids.size());
+  for (const auto& keyed_id : keyed_ids) {
+    sorted_ids.push_back(keyed_id.second);
+  }
+  return sorted_ids;
+}
+
 Box box_from_envelope(const geos::geom::Envelope* envelope) {
   return Box(Point(envelope->getMinX(), envelope->getMinY()),
              Point(envelope->getMaxX(), envelope->getMaxY()));
@@ -466,7 +532,11 @@ void capture_progress(const Options& options,
                       std::size_t updates_done,
                       std::size_t success_count,
                       std::size_t failed_count,
-                      std::size_t pieces) {
+                      std::size_t pieces,
+                      std::size_t merge_count = 0,
+                      std::size_t delta_pending = 0,
+                      long long maintenance_ns = 0,
+                      long long elapsed_update_ns_override = -1) {
   if (options.progress_csv.empty()) {
     return;
   }
@@ -485,10 +555,15 @@ void capture_progress(const Options& options,
         100.0 * static_cast<double>(row.checkpoint_update_count) /
         static_cast<double>(loaded_count);
     row.build_ns = build_ns;
-    row.elapsed_update_ns = ns_count(now - update_start);
+    row.elapsed_update_ns = elapsed_update_ns_override >= 0
+                                ? elapsed_update_ns_override
+                                : ns_count(now - update_start);
+    row.maintenance_ns = maintenance_ns;
     row.success_count = success_count;
     row.failed_count = failed_count;
     row.pieces = pieces;
+    row.merge_count = merge_count;
+    row.delta_pending = delta_pending;
     progress.push_back(row);
     ++next_checkpoint;
   }
@@ -570,6 +645,353 @@ UpdateResult run_glin_insert(const Options& options,
   result.pieces = pieces.size();
   return result;
 }
+
+#ifndef PIECE
+std::unique_ptr<alex::Glin<double, Geometry*>> build_glin_index_by_ids(
+    const Options& options, const std::vector<GeometryPtr>& geometries,
+    const std::vector<std::size_t>& ids,
+    std::vector<std::tuple<double, double, double, double>>& pieces) {
+  std::unique_ptr<alex::Glin<double, Geometry*>> index(
+      new alex::Glin<double, Geometry*>());
+  pieces.clear();
+  std::vector<Geometry*> raw = raw_ptrs_by_ids(geometries, ids, 0, ids.size());
+  index->glin_bulk_load(raw, options.piece_limit, "z", options.cell_xmin,
+                        options.cell_ymin, options.cell_size,
+                        options.cell_size, pieces);
+  return index;
+}
+
+UpdateResult run_glin_buffered_insert(const Options& options,
+                                      const std::vector<GeometryPtr>& geometries,
+                                      const std::vector<std::size_t>& ids,
+                                      std::size_t initial_count,
+                                      std::vector<ProgressResult>& progress) {
+  alex::Glin<double, Geometry*> index;
+  std::vector<std::tuple<double, double, double, double>> pieces;
+
+  std::vector<Geometry*> initial_geometries =
+      raw_ptrs_by_ids(geometries, ids, 0, initial_count);
+  auto build_start = std::chrono::high_resolution_clock::now();
+  index.glin_bulk_load(initial_geometries, options.piece_limit, "z",
+                       options.cell_xmin, options.cell_ymin,
+                       options.cell_size, options.cell_size, pieces);
+  auto build_end = std::chrono::high_resolution_clock::now();
+  long long build_ns = ns_count(build_end - build_start);
+
+  const std::string index_name = "GLIN_BUFFERED";
+  const std::size_t update_count = geometries.size() - initial_count;
+  std::vector<std::size_t> checkpoints = make_progress_checkpoints(
+      geometries.size(), update_count, options.progress_step_percent);
+  std::size_t next_checkpoint = 0;
+
+  std::size_t success_count = 0;
+  std::size_t failed_count = 0;
+  std::size_t updates_done = 0;
+  auto update_start = std::chrono::high_resolution_clock::now();
+  for (std::size_t batch_begin = initial_count; batch_begin < geometries.size();
+       batch_begin += options.buffer_size) {
+    std::size_t batch_end =
+        std::min(batch_begin + options.buffer_size, geometries.size());
+    std::vector<std::size_t> batch_ids =
+        zmin_sorted_batch_ids(options, geometries, ids, batch_begin, batch_end);
+    for (std::size_t id : batch_ids) {
+      Geometry* geometry = geometries[id].get();
+      geos::geom::Envelope* envelope =
+          const_cast<geos::geom::Envelope*>(geometry->getEnvelopeInternal());
+      auto result = index.glin_insert(
+          std::make_tuple(geometry, envelope), "z",
+          options.cell_xmin, options.cell_ymin, options.cell_size,
+          options.cell_size, options.piece_limit, pieces);
+      if (result.second) {
+        ++success_count;
+      } else {
+        ++failed_count;
+      }
+      ++updates_done;
+      if (!options.progress_csv.empty() &&
+          next_checkpoint < checkpoints.size() &&
+          updates_done >= checkpoints[next_checkpoint]) {
+        capture_progress(options, progress, index_name, "insert",
+                         geometries.size(), initial_count, update_count,
+                         build_ns, checkpoints, next_checkpoint, update_start,
+                         updates_done, success_count, failed_count,
+                         pieces.size());
+      }
+    }
+  }
+  auto update_end = std::chrono::high_resolution_clock::now();
+
+  UpdateResult result;
+  result.index = index_name;
+  result.operation = "insert";
+  result.loaded_count = geometries.size();
+  result.initial_count = initial_count;
+  result.update_count = update_count;
+  result.build_ns = build_ns;
+  result.update_ns = ns_count(update_end - update_start);
+  result.success_count = success_count;
+  result.failed_count = failed_count;
+  result.pieces = pieces.size();
+  return result;
+}
+
+UpdateResult run_glin_lsm_insert(const Options& options,
+                                 const std::vector<GeometryPtr>& geometries,
+                                 const std::vector<std::size_t>& ids,
+                                 std::size_t initial_count,
+                                 std::vector<ProgressResult>& progress) {
+  std::vector<std::tuple<double, double, double, double>> pieces;
+  std::vector<std::size_t> main_ids(ids.begin(), ids.begin() + initial_count);
+
+  auto build_start = std::chrono::high_resolution_clock::now();
+  std::unique_ptr<alex::Glin<double, Geometry*>> main_index =
+      build_glin_index_by_ids(options, geometries, main_ids, pieces);
+  auto build_end = std::chrono::high_resolution_clock::now();
+  long long build_ns = ns_count(build_end - build_start);
+
+  const std::string index_name = "GLIN_LSM";
+  const std::size_t update_count = geometries.size() - initial_count;
+  std::vector<std::size_t> checkpoints = make_progress_checkpoints(
+      geometries.size(), update_count, options.progress_step_percent);
+  std::size_t next_checkpoint = 0;
+
+  std::vector<std::size_t> delta_ids;
+  delta_ids.reserve(options.delta_size);
+  RTreeLinear delta_index;
+
+  std::size_t success_count = 0;
+  std::size_t failed_count = 0;
+  std::size_t updates_done = 0;
+  std::size_t merge_count = 0;
+  long long maintenance_ns = 0;
+  auto update_start = std::chrono::high_resolution_clock::now();
+  for (std::size_t i = initial_count; i < geometries.size(); ++i) {
+    std::size_t id = ids[i];
+    delta_index.insert(
+        std::make_pair(box_from_envelope(geometries[id]->getEnvelopeInternal()), id));
+    delta_ids.push_back(id);
+    ++success_count;
+    ++updates_done;
+
+    if (delta_ids.size() >= options.delta_size) {
+      std::vector<std::size_t> merged_ids = main_ids;
+      merged_ids.insert(merged_ids.end(), delta_ids.begin(), delta_ids.end());
+      auto maintenance_start = std::chrono::high_resolution_clock::now();
+      merged_ids =
+          zmin_sorted_batch_ids(options, geometries, merged_ids, 0, merged_ids.size());
+      main_index = build_glin_index_by_ids(options, geometries, merged_ids, pieces);
+      auto maintenance_end = std::chrono::high_resolution_clock::now();
+      maintenance_ns += ns_count(maintenance_end - maintenance_start);
+      main_ids.swap(merged_ids);
+      delta_ids.clear();
+      delta_index = RTreeLinear();
+      ++merge_count;
+    }
+
+    if (!options.progress_csv.empty() &&
+        next_checkpoint < checkpoints.size() &&
+        updates_done >= checkpoints[next_checkpoint]) {
+      capture_progress(options, progress, index_name, "insert",
+                       geometries.size(), initial_count, update_count, build_ns,
+                       checkpoints, next_checkpoint, update_start,
+                       updates_done, success_count, failed_count,
+                       pieces.size(), merge_count, delta_ids.size(),
+                       maintenance_ns);
+    }
+  }
+  auto update_end = std::chrono::high_resolution_clock::now();
+
+  UpdateResult result;
+  result.index = index_name;
+  result.operation = "insert";
+  result.loaded_count = geometries.size();
+  result.initial_count = initial_count;
+  result.update_count = update_count;
+  result.build_ns = build_ns;
+  result.update_ns = ns_count(update_end - update_start);
+  result.success_count = success_count;
+  result.failed_count = failed_count;
+  result.pieces = pieces.size();
+  result.merge_count = merge_count;
+  result.delta_pending = delta_ids.size();
+  result.maintenance_ns = maintenance_ns;
+  return result;
+}
+
+UpdateResult run_glin_lsm_async_insert(
+    const Options& options, const std::vector<GeometryPtr>& geometries,
+    const std::vector<std::size_t>& ids, std::size_t initial_count,
+    std::vector<ProgressResult>& progress) {
+  std::vector<std::tuple<double, double, double, double>> pieces;
+  std::vector<std::size_t> main_ids(ids.begin(), ids.begin() + initial_count);
+
+  auto build_start = std::chrono::high_resolution_clock::now();
+  std::unique_ptr<alex::Glin<double, Geometry*>> main_index =
+      build_glin_index_by_ids(options, geometries, main_ids, pieces);
+  auto build_end = std::chrono::high_resolution_clock::now();
+  long long build_ns = ns_count(build_end - build_start);
+
+  const std::string index_name = "GLIN_LSM_ASYNC";
+  const std::size_t update_count = geometries.size() - initial_count;
+  std::vector<std::size_t> checkpoints = make_progress_checkpoints(
+      geometries.size(), update_count, options.progress_step_percent);
+  std::size_t next_checkpoint = 0;
+
+  std::vector<std::size_t> delta_ids;
+  delta_ids.reserve(options.delta_size);
+  RTreeLinear delta_index;
+
+  std::size_t success_count = 0;
+  std::size_t failed_count = 0;
+  std::size_t updates_done = 0;
+  std::size_t merge_count = 0;
+  long long update_ns = 0;
+  long long maintenance_ns = 0;
+  auto update_start = std::chrono::high_resolution_clock::now();
+  for (std::size_t i = initial_count; i < geometries.size(); ++i) {
+    std::size_t id = ids[i];
+    auto write_start = std::chrono::high_resolution_clock::now();
+    delta_index.insert(
+        std::make_pair(box_from_envelope(geometries[id]->getEnvelopeInternal()), id));
+    delta_ids.push_back(id);
+    auto write_end = std::chrono::high_resolution_clock::now();
+    update_ns += ns_count(write_end - write_start);
+    ++success_count;
+    ++updates_done;
+
+    if (delta_ids.size() >= options.delta_size) {
+      std::vector<std::size_t> merged_ids = main_ids;
+      merged_ids.insert(merged_ids.end(), delta_ids.begin(), delta_ids.end());
+      auto maintenance_start = std::chrono::high_resolution_clock::now();
+      merged_ids =
+          zmin_sorted_batch_ids(options, geometries, merged_ids, 0, merged_ids.size());
+      main_index = build_glin_index_by_ids(options, geometries, merged_ids, pieces);
+      auto maintenance_end = std::chrono::high_resolution_clock::now();
+      maintenance_ns += ns_count(maintenance_end - maintenance_start);
+      main_ids.swap(merged_ids);
+      delta_ids.clear();
+      delta_index = RTreeLinear();
+      ++merge_count;
+    }
+
+    if (!options.progress_csv.empty() &&
+        next_checkpoint < checkpoints.size() &&
+        updates_done >= checkpoints[next_checkpoint]) {
+      capture_progress(options, progress, index_name, "insert",
+                       geometries.size(), initial_count, update_count, build_ns,
+                       checkpoints, next_checkpoint, update_start,
+                       updates_done, success_count, failed_count,
+                       pieces.size(), merge_count, delta_ids.size(),
+                       maintenance_ns, update_ns);
+    }
+  }
+
+  UpdateResult result;
+  result.index = index_name;
+  result.operation = "insert";
+  result.loaded_count = geometries.size();
+  result.initial_count = initial_count;
+  result.update_count = update_count;
+  result.build_ns = build_ns;
+  result.update_ns = update_ns;
+  result.maintenance_ns = maintenance_ns;
+  result.success_count = success_count;
+  result.failed_count = failed_count;
+  result.pieces = pieces.size();
+  result.merge_count = merge_count;
+  result.delta_pending = delta_ids.size();
+  return result;
+}
+
+UpdateResult run_glin_lsm_async_delete(
+    const Options& options, const std::vector<GeometryPtr>& geometries,
+    const std::vector<std::size_t>& ids, std::size_t delete_count,
+    std::vector<ProgressResult>& progress) {
+  std::vector<std::tuple<double, double, double, double>> pieces;
+  std::vector<std::size_t> main_ids(ids.begin(), ids.end());
+
+  auto build_start = std::chrono::high_resolution_clock::now();
+  std::unique_ptr<alex::Glin<double, Geometry*>> main_index =
+      build_glin_index_by_ids(options, geometries, main_ids, pieces);
+  auto build_end = std::chrono::high_resolution_clock::now();
+  long long build_ns = ns_count(build_end - build_start);
+
+  const std::string index_name = "GLIN_LSM_ASYNC";
+  std::vector<std::size_t> checkpoints = make_progress_checkpoints(
+      geometries.size(), delete_count, options.progress_step_percent);
+  std::size_t next_checkpoint = 0;
+
+  std::unordered_set<std::size_t> tombstones;
+  tombstones.reserve(options.delta_size);
+
+  std::size_t success_count = 0;
+  std::size_t failed_count = 0;
+  std::size_t updates_done = 0;
+  std::size_t merge_count = 0;
+  long long update_ns = 0;
+  long long maintenance_ns = 0;
+  auto update_start = std::chrono::high_resolution_clock::now();
+  for (std::size_t i = 0; i < delete_count; ++i) {
+    std::size_t id = ids[i];
+    auto write_start = std::chrono::high_resolution_clock::now();
+    auto inserted = tombstones.insert(id);
+    auto write_end = std::chrono::high_resolution_clock::now();
+    update_ns += ns_count(write_end - write_start);
+    if (inserted.second) {
+      ++success_count;
+    } else {
+      ++failed_count;
+    }
+    ++updates_done;
+
+    if (tombstones.size() >= options.delta_size) {
+      auto maintenance_start = std::chrono::high_resolution_clock::now();
+      std::vector<std::size_t> kept_ids;
+      kept_ids.reserve(main_ids.size() - tombstones.size());
+      for (std::size_t main_id : main_ids) {
+        if (tombstones.find(main_id) == tombstones.end()) {
+          kept_ids.push_back(main_id);
+        }
+      }
+      kept_ids =
+          zmin_sorted_batch_ids(options, geometries, kept_ids, 0, kept_ids.size());
+      main_index = build_glin_index_by_ids(options, geometries, kept_ids, pieces);
+      auto maintenance_end = std::chrono::high_resolution_clock::now();
+      maintenance_ns += ns_count(maintenance_end - maintenance_start);
+      main_ids.swap(kept_ids);
+      tombstones.clear();
+      ++merge_count;
+    }
+
+    if (!options.progress_csv.empty() &&
+        next_checkpoint < checkpoints.size() &&
+        updates_done >= checkpoints[next_checkpoint]) {
+      capture_progress(options, progress, index_name, "delete",
+                       geometries.size(), geometries.size(), delete_count,
+                       build_ns, checkpoints, next_checkpoint, update_start,
+                       updates_done, success_count, failed_count,
+                       pieces.size(), merge_count, tombstones.size(),
+                       maintenance_ns, update_ns);
+    }
+  }
+
+  UpdateResult result;
+  result.index = index_name;
+  result.operation = "delete";
+  result.loaded_count = geometries.size();
+  result.initial_count = geometries.size();
+  result.update_count = delete_count;
+  result.build_ns = build_ns;
+  result.update_ns = update_ns;
+  result.maintenance_ns = maintenance_ns;
+  result.success_count = success_count;
+  result.failed_count = failed_count;
+  result.pieces = pieces.size();
+  result.merge_count = merge_count;
+  result.delta_pending = tombstones.size();
+  return result;
+}
+#endif
 
 UpdateResult run_glin_delete(const Options& options,
                              const std::vector<GeometryPtr>& geometries,
@@ -919,8 +1341,9 @@ void write_csv(const std::string& path, const Options& options,
   if (write_header) {
     output << "dataset,index,operation,loaded_count,initial_count,update_count,"
               "insert_order,boost_strategy,piece_limit,cell_xmin,cell_ymin,cell_size,seed,lines_seen,"
-              "parse_errors,load_ns,build_ns,update_ns,avg_update_ns,"
-              "throughput_ops_per_sec,success_count,failed_count,pieces\n";
+              "parse_errors,load_ns,build_ns,update_ns,maintenance_ns,avg_update_ns,"
+              "throughput_ops_per_sec,success_count,failed_count,pieces,"
+              "merge_count,delta_pending,buffer_size,delta_size\n";
   }
 
   for (const auto& result : results) {
@@ -941,9 +1364,12 @@ void write_csv(const std::string& path, const Options& options,
            << options.seed << "," << stats.lines_seen << ","
            << stats.parse_errors << "," << stats.load_ns << ","
            << result.build_ns << "," << result.update_ns << ","
+           << result.maintenance_ns << ","
            << avg_update_ns << "," << throughput << ","
            << result.success_count << "," << result.failed_count << ","
-           << result.pieces << "\n";
+           << result.pieces << "," << result.merge_count << ","
+           << result.delta_pending << "," << options.buffer_size << ","
+           << options.delta_size << "\n";
   }
 }
 
@@ -973,8 +1399,9 @@ void write_progress_csv(const std::string& path, const Options& options,
     output << "dataset,index,operation,loaded_count,initial_count,"
               "total_update_count,checkpoint_update_count,update_percent,"
               "insert_order,boost_strategy,piece_limit,cell_xmin,cell_ymin,cell_size,seed,lines_seen,"
-              "parse_errors,load_ns,build_ns,elapsed_update_ns,"
-              "throughput_records_per_sec,success_count,failed_count,pieces\n";
+              "parse_errors,load_ns,build_ns,elapsed_update_ns,maintenance_ns,"
+              "throughput_records_per_sec,success_count,failed_count,pieces,"
+              "merge_count,delta_pending,buffer_size,delta_size\n";
   }
 
   for (const auto& result : results) {
@@ -993,8 +1420,11 @@ void write_progress_csv(const std::string& path, const Options& options,
            << options.seed << "," << stats.lines_seen << ","
            << stats.parse_errors << "," << stats.load_ns << ","
            << result.build_ns << "," << result.elapsed_update_ns << ","
+           << result.maintenance_ns << ","
            << throughput << "," << result.success_count << ","
-           << result.failed_count << "," << result.pieces << "\n";
+           << result.failed_count << "," << result.pieces << ","
+           << result.merge_count << "," << result.delta_pending << ","
+           << options.buffer_size << "," << options.delta_size << "\n";
   }
 }
 
@@ -1018,11 +1448,14 @@ void print_result(const Options& options, const LoadStats& stats,
             << " success=" << result.success_count
             << " failed=" << result.failed_count
             << " pieces=" << result.pieces
+            << " merges=" << result.merge_count
+            << " delta_pending=" << result.delta_pending
             << " lines_seen=" << stats.lines_seen
             << " parse_errors=" << stats.parse_errors
             << " load_ms=" << stats.load_ns / 1e6
             << " build_ms=" << result.build_ns / 1e6
             << " update_ms=" << result.update_ns / 1e6
+            << " maintenance_ms=" << result.maintenance_ns / 1e6
             << " avg_update_ns=" << avg_update_ns
             << " throughput_ops_per_sec=" << throughput << "\n";
   // dataset	数据集名称
@@ -1075,6 +1508,18 @@ int main(int argc, char* argv[]) {
       results.push_back(run_glin_insert(options, geometries, ids, initial_count,
                                         progress_results));
 #ifndef PIECE
+      if (options.include_buffered_glin) {
+        results.push_back(run_glin_buffered_insert(
+            options, geometries, ids, initial_count, progress_results));
+      }
+      if (options.include_lsm_glin) {
+        results.push_back(run_glin_lsm_insert(
+            options, geometries, ids, initial_count, progress_results));
+      }
+      if (options.include_lsm_async_glin) {
+        results.push_back(run_glin_lsm_async_insert(
+            options, geometries, ids, initial_count, progress_results));
+      }
       if (options.include_baselines) {
         for (const auto& strategy : selected_boost_strategies(options)) {
           run_boost_insert_for_strategy(options, strategy, geometries, ids,
@@ -1090,6 +1535,10 @@ int main(int argc, char* argv[]) {
       results.push_back(run_glin_delete(options, geometries, ids, delete_count,
                                         progress_results));
 #ifndef PIECE
+      if (options.include_lsm_async_glin) {
+        results.push_back(run_glin_lsm_async_delete(
+            options, geometries, ids, delete_count, progress_results));
+      }
       if (options.include_baselines) {
         for (const auto& strategy : selected_boost_strategies(options)) {
           run_boost_delete_for_strategy(options, strategy, geometries, ids,

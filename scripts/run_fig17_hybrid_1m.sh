@@ -38,6 +38,8 @@ SEED="${SEED:-42}" # 全局随机种子，固定 = 实验可复现
 QUERY_COUNT="${QUERY_COUNT:-100}"  # 每种选择性生成多少条查询语句
 QUERY_SELECTIVITIES="${QUERY_SELECTIVITIES:-1%}" #查询 AABB 矩形的空间面积占整个数据集全域空间的百分比； 当前脚本一次只能执行一个选择性，
 PROGRESS_STEP_PERCENT="${PROGRESS_STEP_PERCENT:-10}"
+INCLUDE_LSM_ASYNC_GLIN="${INCLUDE_LSM_ASYNC_GLIN:-0}"
+DELTA_SIZE="${DELTA_SIZE:-100000}"
 DATA_ROOT="${DATA_ROOT:-/mnt/hgfs}"    # 原始数据集路径
 QUERY_ROOT="${QUERY_ROOT:-queries/fig17_hybrid_${QUERY_LIMIT}}" # 查询 csv 文件存储根目录
 AUTO_GENERATE_QUERIES="${AUTO_GENERATE_QUERIES:-1}"      #默认是1，就是说它会根据根据数据集和数据量大小LIMIT自动调用JTS/Java 生成 STRtree-KNN 查询文件来生成query窗口，如果设置为0，需要自己提前准备好查询窗口
@@ -150,6 +152,8 @@ for dataset in $DATASETS; do
     --cell_size "$CELL_SIZE" \
     --seed "$SEED" \
     --progress_step_percent "$PROGRESS_STEP_PERCENT" \
+    --include_lsm_async_glin "$INCLUDE_LSM_ASYNC_GLIN" \
+    --delta_size "$DELTA_SIZE" \
     --output_csv "$SUMMARY_CSV" \
     --progress_csv "$PROGRESS_CSV" \
     ${append_flag:-}
