@@ -3,7 +3,16 @@
 
 import argparse
 import csv
+import re
 from pathlib import Path
+
+
+SELECTIVITY_TAGS = {
+    "0p001pct": "0.001%",
+    "0p01pct": "0.01%",
+    "0p1pct": "0.1%",
+    "1pct": "1%",
+}
 
 
 def parse_args():
@@ -12,6 +21,11 @@ def parse_args():
     )
     parser.add_argument("--result_dir", required=True)
     parser.add_argument("--output_csv", required=True)
+    parser.add_argument(
+        "--exclude_datasets",
+        default="",
+        help="Datasets to exclude, separated by comma or spaces. Example: ZGAP_WIDE",
+    )
     return parser.parse_args()
 
 
@@ -25,6 +39,13 @@ def as_float(row, field):
 def load_rows(path):
     with open(path, newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def selectivity_from_name(path):
+    match = re.search(r"_(0p001pct|0p01pct|0p1pct|1pct)_", path.name)
+    if not match:
+        return "1%"
+    return SELECTIVITY_TAGS[match.group(1)]
 
 
 def summarize_file(path):
@@ -92,6 +113,7 @@ def summarize_file(path):
     )
 
     return {
+        "selectivity": selectivity_from_name(path),
         "dataset": dataset,
         "index": index,
         "relationship": relationship,
@@ -125,10 +147,17 @@ def summarize_file(path):
     }
 
 
+def split_names(value):
+    if not value:
+        return set()
+    return {item for item in re.split(r"[,\s]+", value.strip()) if item}
+
+
 def main():
     args = parse_args()
     result_dir = Path(args.result_dir)
     output_csv = Path(args.output_csv)
+    excluded_datasets = split_names(args.exclude_datasets)
 
     summaries = []
     for path in sorted(result_dir.glob("*_*.csv")):
@@ -136,21 +165,26 @@ def main():
             continue
         summary = summarize_file(path)
         if summary:
+            if summary["dataset"] in excluded_datasets:
+                continue
             summaries.append(summary)
 
     boost_answers = {}
     for summary in summaries:
         if summary["index"] == "Boost_Rtree":
-            boost_answers[summary["dataset"]] = summary["answers"]
+            boost_answers[(summary["dataset"], summary["selectivity"])] = summary[
+                "answers"
+            ]
 
     for summary in summaries:
-        expected = boost_answers.get(summary["dataset"])
+        expected = boost_answers.get((summary["dataset"], summary["selectivity"]))
         if expected is not None:
             delta = summary["answers"] - expected
             summary["answers_delta_vs_boost"] = delta
             summary["answers_match_boost"] = 1 if delta == 0 else 0
 
     fieldnames = [
+        "selectivity",
         "dataset",
         "index",
         "relationship",
@@ -192,7 +226,8 @@ def main():
     print(f"Summary CSV: {output_csv}")
     for summary in summaries:
         print(
-            f"{summary['dataset']} {summary['index']} "
+            f"{summary['dataset']} {summary['selectivity']} {summary['index']} "
+            f"block={summary['block_size']} "
             f"answers={summary['answers']} candidates={summary['candidates']} "
             f"ratio={summary['candidate_answer_ratio']:.3f} "
             f"avg_total_ns={summary['avg_total_ns']:.1f} "
@@ -202,4 +237,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

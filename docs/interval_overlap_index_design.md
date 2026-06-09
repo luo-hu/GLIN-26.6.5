@@ -982,9 +982,9 @@ figures/interval_overlap_2000000/
 当前已经生成：
 
 ```text
-figures/interval_overlap_2000000/interval_overlap_avg_total_ms.png
-figures/interval_overlap_2000000/interval_overlap_candidate_answer_ratio.png
-figures/interval_overlap_2000000/interval_overlap_pruning_detail.png
+figures/interval_overlap_2000000/interval_overlap_1pct_avg_total_ms.png
+figures/interval_overlap_2000000/interval_overlap_1pct_candidate_answer_ratio.png
+figures/interval_overlap_2000000/interval_overlap_1pct_pruning_detail.png
 figures/interval_overlap_2000000/interval_overlap_diagnostics.txt
 ```
 
@@ -1022,4 +1022,266 @@ python3 scripts/plot_interval_overlap_diagnostics.py \
 
 ```bash
 RESET_RESULTS=1 DATASETS="ROADS PARKS" LIMIT=2000000 QUERY_LIMIT=2000000 BLOCK_SIZE=1024 bash scripts/run_interval_overlap_diagnostics.sh
+```
+
+## 14. 补充 QuadTree、selectivity、block size 和 synthetic 实验
+
+### 14.1 为什么正式 Intersects 对比里不默认放原始 GLIN
+
+这个不是漏掉，而是因为当前仓库里的两个 GLIN WKT benchmark 语义不同：
+
+```text
+bench_glin_wkt        -> index=GLIN           -> relationship=contains
+bench_glin_wkt_piece  -> index=GLIN_PIECEWISE -> relationship=intersects
+```
+
+中文解释：
+
+```text
+原始 GLIN 在当前代码路径里跑的是 contains。
+contains 的意思是 query window 完全包含 candidate geometry。
+intersects 的意思是 query window 和 candidate geometry 有交集即可。
+
+这两个不是同一个查询任务。
+如果把原始 GLIN 放进 Intersects 排名表，它的 answers 不应该和 Boost_Rtree 对齐，
+这样比较会误导读者。
+```
+
+所以：
+
+```text
+Intersects 正式对比：
+IntervalOverlapIndex
+GLIN_PIECEWISE
+Boost_Rtree
+GEOS_Quadtree
+
+Contains 正式对比：
+GLIN
+Boost_Rtree
+GEOS_Quadtree
+```
+
+如果只是想做 sanity check，可以打开：
+
+```bash
+INCLUDE_GLIN_CONTAINS=1 bash scripts/run_interval_overlap_diagnostics.sh
+```
+
+但它只能说明原始 GLIN 的 contains 表现，不能作为 Intersects 方法排名。
+
+### 14.2 为什么要加 GEOS_Quadtree
+
+`GEOS_Quadtree` 是应该加的，因为它是空间索引里常见的 tree baseline。
+
+新增 runner 现在默认：
+
+```text
+INCLUDE_QUADTREE=1
+```
+
+也就是会自动跑：
+
+```text
+IntervalOverlapIndex
+GLIN_PIECEWISE
+Boost_Rtree
+GEOS_Quadtree
+```
+
+### 14.3 ROADS/PARKS 2M + QuadTree 正式结果
+
+运行命令：
+
+```bash
+RESET_RESULTS=1 DATASETS="ROADS PARKS" LIMIT=2000000 QUERY_LIMIT=2000000 \
+QUERY_ROOT=queries/fig17_hybrid_2000000 \
+RESULT_DIR=results/interval_overlap_2000000_with_quadtree \
+FIGURE_DIR=figures/interval_overlap_2000000_with_quadtree \
+SELECTIVITY_TAGS=1pct BLOCK_SIZES=1024 INCLUDE_QUADTREE=1 AUTO_BUILD=0 \
+bash scripts/run_interval_overlap_diagnostics.sh
+```
+
+输出：
+
+```text
+results/interval_overlap_2000000_with_quadtree/interval_overlap_summary.csv
+figures/interval_overlap_2000000_with_quadtree/interval_overlap_1pct_avg_total_ms.png
+figures/interval_overlap_2000000_with_quadtree/interval_overlap_1pct_candidate_answer_ratio.png
+figures/interval_overlap_2000000_with_quadtree/interval_overlap_1pct_pruning_detail.png
+```
+
+当前结果：
+
+| Dataset | Index | avg_total_ms | candidates | answers | candidate_answer_ratio | answers_match_boost |
+|---|---|---:|---:|---:|---:|---:|
+| ROADS | IntervalOverlapIndex | 13.736 | 2,490,131 | 2,490,128 | 1.000001 | 1 |
+| ROADS | Boost_Rtree | 15.998 | 2,490,131 | 2,490,128 | 1.000001 | 1 |
+| ROADS | GLIN_PIECEWISE | 16.346 | 2,742,009 | 2,490,128 | 1.101152 | 1 |
+| ROADS | GEOS_Quadtree | 22.026 | 2,561,859 | 2,490,128 | 1.028857 | 1 |
+| PARKS | IntervalOverlapIndex | 18.697 | 3,249,304 | 3,249,257 | 1.000014 | 1 |
+| PARKS | Boost_Rtree | 20.263 | 3,249,304 | 3,249,257 | 1.000014 | 1 |
+| PARKS | GLIN_PIECEWISE | 21.410 | 3,551,775 | 3,249,257 | 1.093104 | 1 |
+| PARKS | GEOS_Quadtree | 22.281 | 3,541,049 | 3,249,257 | 1.089802 | 1 |
+
+解释：
+
+```text
+IntervalOverlapIndex 在这轮 ROADS/PARKS 2M、1% fixed query workload 上：
+1. answers 与 Boost_Rtree 完全一致；
+2. candidate/answer ratio 接近 1；
+3. 平均 query time 同时优于 GLIN_PIECEWISE、Boost_Rtree、GEOS_Quadtree。
+```
+
+仍然要注意：
+
+```text
+这还只是 1% query window。
+论文里不能只靠这一组结果下最终结论。
+```
+
+### 14.4 Selectivity sensitivity 怎么跑
+
+`selectivity` 是查询窗口大小/答案规模的控制变量。
+
+中文理解：
+
+```text
+0.001% / 0.01% / 0.1% / 1%
+可以理解为 query 越来越大、返回答案越来越多。
+```
+
+运行：
+
+```bash
+RESET_RESULTS=1 DATASETS="ROADS PARKS" LIMIT=2000000 QUERY_LIMIT=2000000 \
+QUERY_ROOT=queries/fig17_hybrid_2000000 \
+RESULT_DIR=results/interval_overlap_selectivity_2000000 \
+FIGURE_DIR=figures/interval_overlap_selectivity_2000000 \
+SELECTIVITY_TAGS="0p001pct 0p01pct 0p1pct 1pct" \
+BLOCK_SIZES=1024 INCLUDE_QUADTREE=1 \
+bash scripts/run_interval_overlap_diagnostics.sh
+```
+
+如果某些 query CSV 还没有生成，可以打开：
+
+```bash
+AUTO_GENERATE_QUERIES=1
+```
+
+注意：
+
+```text
+QUERY_ROOT 下需要有：
+ROADS_jts_strtree_knn_0p001pct.csv
+ROADS_jts_strtree_knn_0p01pct.csv
+ROADS_jts_strtree_knn_0p1pct.csv
+ROADS_jts_strtree_knn_1pct.csv
+PARKS_jts_strtree_knn_...
+```
+
+### 14.5 Block size sensitivity 怎么跑
+
+`block size` 是 IntervalOverlapIndex 里每个 block 放多少条按 Zmin 排序的记录。
+
+中文理解：
+
+```text
+block size 小：
+block 更多，summary 更细，剪枝可能更准，但 block 管理开销更大。
+
+block size 大：
+block 更少，summary 更粗，管理开销小，但可能少剪枝、多扫描。
+```
+
+运行：
+
+```bash
+RESET_RESULTS=1 DATASETS="ROADS PARKS" LIMIT=2000000 QUERY_LIMIT=2000000 \
+QUERY_ROOT=queries/fig17_hybrid_2000000 \
+RESULT_DIR=results/interval_overlap_block_sweep_2000000 \
+FIGURE_DIR=figures/interval_overlap_block_sweep_2000000 \
+SELECTIVITY_TAGS=1pct \
+BLOCK_SIZES="256 512 1024 2048 4096" \
+INCLUDE_QUADTREE=1 \
+bash scripts/run_interval_overlap_diagnostics.sh
+```
+
+看图时重点看：
+
+```text
+avg_total_ms:
+不同 block size 下平均查询时间。
+
+pruning_detail:
+prefix_records 到 records_scanned 的下降幅度。
+
+candidate_answer_ratio:
+是否仍然接近 1。
+```
+
+### 14.6 Synthetic 数据怎么跑
+
+当前仓库里有合成数据生成器：
+
+```text
+scripts/prepare_synthetic_rectangles.sh
+scripts/prepare_glin_synthetic_geo_points.sh
+```
+
+对于 Intersects，优先用 rectangle synthetic：
+
+```text
+SYNTHETIC_KIND=rectangles
+```
+
+原因：
+
+```text
+Intersects 更关心面/矩形/线段这类有空间范围的对象。
+point synthetic 可以测 pipeline，但对 Intersects 的挑战性不如 rectangle synthetic。
+```
+
+小规模 smoke test：
+
+```bash
+RESET_RESULTS=1 DATASETS=UNIF_S LIMIT=1000 QUERY_LIMIT=1000 \
+QUERY_ROOT=queries/interval_overlap_smoke_1000 \
+RESULT_DIR=results/interval_overlap_smoke_1000 \
+FIGURE_DIR=figures/interval_overlap_smoke_1000 \
+PREPARE_DATA=1 AUTO_GENERATE_QUERIES=1 \
+SELECTIVITY_TAGS="0p1pct 1pct" BLOCK_SIZES="128 256" \
+SYNTHETIC_KIND=rectangles \
+bash scripts/run_interval_overlap_diagnostics.sh
+```
+
+这条 smoke 已经跑通：
+
+```text
+UNIF_S 1000 条 synthetic rectangle。
+IntervalOverlapIndex、GLIN_PIECEWISE、Boost_Rtree、GEOS_Quadtree 都能跑。
+answers_match_boost = 1。
+```
+
+正式 synthetic 建议：
+
+```bash
+RESET_RESULTS=1 DATASETS="UNIF_S UNIF_L DIAG_S DIAG_L" LIMIT=1000000 QUERY_LIMIT=1000000 \
+QUERY_ROOT=queries/interval_overlap_synthetic_1000000 \
+RESULT_DIR=results/interval_overlap_synthetic_1000000 \
+FIGURE_DIR=figures/interval_overlap_synthetic_1000000 \
+PREPARE_DATA=1 AUTO_GENERATE_QUERIES=1 \
+SELECTIVITY_TAGS="0p001pct 0p01pct 0p1pct 1pct" \
+BLOCK_SIZES="512 1024 2048" \
+SYNTHETIC_KIND=rectangles INCLUDE_QUADTREE=1 \
+bash scripts/run_interval_overlap_diagnostics.sh
+```
+
+论文里 synthetic 的用法：
+
+```text
+真实数据 ROADS/PARKS 说明方法对实际地图对象有效。
+Synthetic UNIF/DIAG 说明方法在可控分布下是否稳定。
+Block size sensitivity 说明参数不是靠碰运气调出来的。
+Selectivity sensitivity 说明 query 大小变化时方法是否仍然有效。
 ```
