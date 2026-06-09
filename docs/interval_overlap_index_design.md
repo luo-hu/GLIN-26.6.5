@@ -767,3 +767,259 @@ answers = 20
 这个 smoke test 规模很小，不能作为论文结论。
 下一步需要在 ROADS/PARKS/AW/LW 和固定 query workload 上系统验证。
 ```
+
+## 13. ROADS/PARKS 2M 正式 query workload 对比
+
+已经新增正式对比脚本：
+
+```text
+scripts/run_interval_overlap_diagnostics.sh
+scripts/summarize_interval_overlap_diagnostics.py
+```
+
+运行命令：
+
+```bash
+RESET_RESULTS=1 DATASETS="ROADS PARKS" LIMIT=2000000 QUERY_LIMIT=2000000 BLOCK_SIZE=1024 bash scripts/run_interval_overlap_diagnostics.sh
+```
+
+对比对象：
+
+```text
+IntervalOverlapIndex
+GLIN_PIECEWISE
+Boost_Rtree
+```
+
+三者使用同一批 query 文件：
+
+```text
+queries/fig17_hybrid_2000000/ROADS_jts_strtree_knn_1pct.csv
+queries/fig17_hybrid_2000000/PARKS_jts_strtree_knn_1pct.csv
+```
+
+输出：
+
+```text
+results/interval_overlap_2000000/ROADS_interval_overlap.csv
+results/interval_overlap_2000000/ROADS_glin_piecewise.csv
+results/interval_overlap_2000000/ROADS_boost_rtree.csv
+results/interval_overlap_2000000/PARKS_interval_overlap.csv
+results/interval_overlap_2000000/PARKS_glin_piecewise.csv
+results/interval_overlap_2000000/PARKS_boost_rtree.csv
+results/interval_overlap_2000000/interval_overlap_summary.csv
+```
+
+### 13.1 正确性
+
+当前结果：
+
+```text
+ROADS:
+IntervalOverlapIndex answers = 2,490,128
+GLIN_PIECEWISE answers       = 2,490,128
+Boost_Rtree answers          = 2,490,128
+
+PARKS:
+IntervalOverlapIndex answers = 3,249,257
+GLIN_PIECEWISE answers       = 3,249,257
+Boost_Rtree answers          = 3,249,257
+```
+
+解释：
+
+```text
+IntervalOverlapIndex 在 ROADS/PARKS 的 2M 固定 query workload 上和 Boost R-tree 答案一致。
+这说明当前 block maxZmax + MBR pruning 没有产生 false negative。
+```
+
+### 13.2 查询时间
+
+| Dataset | Index | avg_total_ns | avg_total_ms | answers_match_boost |
+|---|---|---:|---:|---:|
+| ROADS | IntervalOverlapIndex | 13,656,971.68 | 13.657 | 1 |
+| ROADS | GLIN_PIECEWISE | 15,650,507.52 | 15.651 | 1 |
+| ROADS | Boost_Rtree | 16,250,759.32 | 16.251 | 1 |
+| PARKS | IntervalOverlapIndex | 18,368,633.63 | 18.369 | 1 |
+| PARKS | GLIN_PIECEWISE | 20,838,326.03 | 20.838 | 1 |
+| PARKS | Boost_Rtree | 20,518,349.75 | 20.518 | 1 |
+
+相对提升：
+
+```text
+ROADS:
+IntervalOverlapIndex 比 GLIN_PIECEWISE 快约 1.146x。
+IntervalOverlapIndex 比 Boost_Rtree 快约 1.190x。
+
+PARKS:
+IntervalOverlapIndex 比 GLIN_PIECEWISE 快约 1.134x。
+IntervalOverlapIndex 比 Boost_Rtree 快约 1.117x。
+```
+
+注意：
+
+```text
+这是 100 个 1% JTS STRtree KNN query window 上的平均查询时间。
+当前还不是完整论文结论，后续还需要更多 selectivity、更多 seed 和更多数据集。
+```
+
+### 13.3 候选数量
+
+| Dataset | Index | candidates | answers | candidate_answer_ratio |
+|---|---|---:|---:|---:|
+| ROADS | IntervalOverlapIndex | 2,490,131 | 2,490,128 | 1.000001 |
+| ROADS | GLIN_PIECEWISE | 2,742,009 | 2,490,128 | 1.101152 |
+| ROADS | Boost_Rtree | 2,490,131 | 2,490,128 | 1.000001 |
+| PARKS | IntervalOverlapIndex | 3,249,304 | 3,249,257 | 1.000014 |
+| PARKS | GLIN_PIECEWISE | 3,551,775 | 3,249,257 | 1.093104 |
+| PARKS | Boost_Rtree | 3,249,304 | 3,249,257 | 1.000014 |
+
+解释：
+
+```text
+IntervalOverlapIndex 的 exact_calls/candidates 与 Boost_Rtree 几乎一致。
+GLIN_PIECEWISE 的候选数比 IntervalOverlapIndex 多：
+ROADS 多约 10.1%。
+PARKS 多约 9.3%。
+```
+
+这正好对应 GLIN 的 query augmentation 问题：
+
+```text
+GLIN_PIECEWISE 为了避免漏答案，会多扫一些不必要候选。
+IntervalOverlapIndex 通过 [Zmin, Zmax] overlap 和 block maxZmax，把这部分候选压了下来。
+```
+
+### 13.4 Block skipping 效果
+
+| Dataset | prefix_records | records_scanned | visited_blocks | skipped_zmax_blocks | skipped_mbr_blocks | skipped_block_ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| ROADS | 121,549,950 | 4,063,962 | 4,020 | 87,568 | 27,166 | 0.966149 |
+| PARKS | 117,007,639 | 4,972,435 | 4,903 | 76,696 | 32,715 | 0.957109 |
+
+解释：
+
+```text
+prefix_records 是只按 Zmin <= R 会进入扫描范围的记录数。
+records_scanned 是 block-level pruning 后真正进入 leaf 扫描的记录数。
+```
+
+ROADS：
+
+```text
+121,549,950 -> 4,063,962
+扫描记录数减少到约 3.34%。
+```
+
+PARKS：
+
+```text
+117,007,639 -> 4,972,435
+扫描记录数减少到约 4.25%。
+```
+
+这说明：
+
+```text
+block.maxZmax 和 block MBR 的安全剪枝在正式 workload 上有效。
+```
+
+### 13.5 当前结论
+
+这组结果比 smoke test 更有价值，可以支持下面的初步判断：
+
+```text
+IntervalOverlapIndex 在 ROADS/PARKS 2M 真实数据和固定 query workload 上：
+1. 与 Boost R-tree 答案一致；
+2. 显著减少 Zmin-only 前缀扫描范围；
+3. 候选数量接近 Boost R-tree；
+4. 平均查询时间优于 GLIN_PIECEWISE 和 Boost_Rtree。
+```
+
+论文上可以谨慎表述为：
+
+```text
+On ROADS and PARKS with 2M geometries and 1% JTS STRtree KNN query windows,
+the interval-overlap prototype preserves exactness and reduces candidate
+inflation compared with GLIN-piecewise.
+```
+
+中文意思：
+
+```text
+在 ROADS/PARKS 2M 数据和 1% JTS STRtree KNN 查询窗口上，
+IntervalOverlapIndex 原型保持了正确性，并减少了 GLIN-piecewise 的候选膨胀。
+```
+
+仍然不能过度声称：
+
+```text
+不能说它已经是完整 learned index。
+不能说它已经 fully dynamic。
+不能说所有数据和所有 selectivity 都优于 R-tree。
+```
+
+### 13.6 新增可视化输出
+
+为了后续更容易看结果，新增绘图脚本：
+
+```text
+scripts/plot_interval_overlap_diagnostics.py
+```
+
+正式 runner 现在会在汇总 CSV 后自动画图：
+
+```text
+scripts/run_interval_overlap_diagnostics.sh
+```
+
+默认输出目录：
+
+```text
+figures/interval_overlap_2000000/
+```
+
+当前已经生成：
+
+```text
+figures/interval_overlap_2000000/interval_overlap_avg_total_ms.png
+figures/interval_overlap_2000000/interval_overlap_candidate_answer_ratio.png
+figures/interval_overlap_2000000/interval_overlap_pruning_detail.png
+figures/interval_overlap_2000000/interval_overlap_diagnostics.txt
+```
+
+每张图的含义：
+
+```text
+interval_overlap_avg_total_ms.png
+平均每个 query 花多少毫秒。越低越好。
+
+interval_overlap_candidate_answer_ratio.png
+候选数 / 最终答案数。越接近 1 越好。
+它表示索引多送了多少对象给 GEOS 精确判断。
+
+interval_overlap_pruning_detail.png
+只看 IntervalOverlapIndex 的剪枝效果。
+prefix_records 是如果只按 Zmin <= query.Zmax 会落入前缀范围的记录数。
+records_scanned 是经过 block maxZmax + block MBR 剪枝后真正扫描的记录数。
+skipped block ratio 是被安全跳过的 block 比例。
+
+interval_overlap_diagnostics.txt
+文字版简要诊断，包括相对 Boost_Rtree/GLIN-piecewise 的 speedup、
+candidate/answer ratio、skipped block ratio 和 answers_match_boost。
+```
+
+如果只想重新画图，不重新跑 2M benchmark：
+
+```bash
+python3 scripts/plot_interval_overlap_diagnostics.py \
+  --input results/interval_overlap_2000000/interval_overlap_summary.csv \
+  --output_dir figures/interval_overlap_2000000 \
+  --figure_prefix interval_overlap
+```
+
+如果想完整重新跑正式对比：
+
+```bash
+RESET_RESULTS=1 DATASETS="ROADS PARKS" LIMIT=2000000 QUERY_LIMIT=2000000 BLOCK_SIZE=1024 bash scripts/run_interval_overlap_diagnostics.sh
+```
