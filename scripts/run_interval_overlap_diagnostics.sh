@@ -106,6 +106,15 @@ GLIN_PIECEWISE、Boost_Rtree、GEOS_Quadtree 做对比。
     1：缺 query 文件就自动调用 JTS query generator 生成。
     默认：0
 
+  REGENERATE_QUERIES
+    1：即使 query CSV 已存在，也重新生成。
+    默认：0
+
+  REGENERATE_STALE_QUERIES
+    1：如果 data WKT 比 query CSV 更新，就把 query 视为过期并重新生成。
+    这可以防止 10k smoke query 被 1M 正式实验复用。
+    默认：1
+
   PREPARE_DATA
     0：不自动生成数据。
     1：如果 synthetic 数据不存在，就自动生成。
@@ -174,6 +183,8 @@ GLIN_PIECEWISE、Boost_Rtree、GEOS_Quadtree 做对比。
   ZGAP_MIXED
     这是专门给 IO_OVERFLOW 准备的 mixed fat-object 数据集。
     它不是所有对象都很大，而是大多数小对象 + 少量长/胖对象。
+    默认数据目录是 data/synthetic/zrange_gap_mixed_${LIMIT}，
+    这样 10k smoke 和 1M 正式实验不会共用同一个 WKT 文件。
     如果想跑它：
       DATASETS=ZGAP_MIXED PREPARE_DATA=1 AUTO_GENERATE_QUERIES=1 \
       INCLUDE_IO_OVERFLOW=1 OVERFLOW_FRACTIONS="0.001 0.01 0.05" \
@@ -267,7 +278,24 @@ INCLUDE_IO_BLOCK_MBR="${INCLUDE_IO_BLOCK_MBR:-1}"
 # INCLUDE_IO_OVERFLOW=1：运行 main index + fat-object overflow R-tree 版本。
 INCLUDE_IO_OVERFLOW="${INCLUDE_IO_OVERFLOW:-0}"
 
-# OVERFLOW_FRACTIONS：长对象分流比例。
+# OVERFLOW_FRACTIONS：长对象分流比例。意思是：把多少比例的“长对象 / 胖对象”从主 IO-blockMBR 索引里拿出来，单独放到 overflow R-tree 里。
+#这里的 “长对象 / 胖对象” 不是看真实面积，而是看：Zmax - Zmin，也就是一个对象在 Z-order 空间里跨度有多长。跨度越长，它越容易污染 block 的范围，让主索引剪枝变差。
+#举例：OVERFLOW_FRACTIONS="0.001 0.01 0.05" 表示会分别测试三种 IO-overflow 配置：
+
+#0.001 = 0.1% 的对象放进 overflow
+#0.01  = 1% 的对象放进 overflow
+#0.05  = 5% 的对象放进 overflow
+#如果数据集有 1,000,000 个对象：
+
+#0.001 -> 取 Zmax-Zmin 最大的 1,000 个对象放进 overflow
+#0.01  -> 取 Zmax-Zmin 最大的 10,000 个对象放进 overflow
+#0.05  -> 取 Zmax-Zmin 最大的 50,000 个对象放进 overflow
+#查询时会查两部分：
+
+#主 IO-blockMBR 索引：查普通对象
+#overflow R-tree：查被分流出去的长对象
+#所以它不是越大越好。OVERFLOW_FRACTIONS 太小，可能没有把真正污染 block 的对象分出去；太大，又会让 overflow R-tree 变重，查询多查很多对象。
+
 OVERFLOW_FRACTIONS="${OVERFLOW_FRACTIONS:-0.01}"
 
 # INCLUDE_GLIN_CONTAINS 只做原始 GLIN 的 contains sanity check。
@@ -286,6 +314,12 @@ PREPARE_DATA="${PREPARE_DATA:-0}"
 # 默认 0，所以缺 query 文件会报错并提醒你打开这个开关。
 AUTO_GENERATE_QUERIES="${AUTO_GENERATE_QUERIES:-0}"
 
+# REGENERATE_QUERIES=1：强制重新生成 query CSV。
+REGENERATE_QUERIES="${REGENERATE_QUERIES:-0}"
+
+# REGENERATE_STALE_QUERIES=1：如果 query 比 data 更旧，自动视为需要重生成。
+REGENERATE_STALE_QUERIES="${REGENERATE_STALE_QUERIES:-1}"
+
 # QUERY_COUNT：每个 selectivity 生成多少个 query window。
 QUERY_COUNT="${QUERY_COUNT:-100}"
 
@@ -301,6 +335,10 @@ SYN_WORK_DIR="${SYN_WORK_DIR:-data/synthetic/rectangles}"
 
 # ZGAP_WORK_DIR：Zmin/Zmax gap 压力数据集放这里。
 ZGAP_WORK_DIR="${ZGAP_WORK_DIR:-data/synthetic/zrange_gap}"
+
+# ZGAP_MIXED_WORK_DIR：mixed fat-object 数据集放这里。
+# 默认带 LIMIT，避免 10k smoke 数据污染 1M/2M 正式实验。
+ZGAP_MIXED_WORK_DIR="${ZGAP_MIXED_WORK_DIR:-data/synthetic/zrange_gap_mixed_${LIMIT}}"
 
 mkdir -p "$RESULT_DIR"
 
@@ -339,7 +377,7 @@ declare -A DATA_FILES=(
   [DIAG_S]="$SYN_WORK_DIR/DIAG_S.wkt"
   [DIAG_L]="$SYN_WORK_DIR/DIAG_L.wkt"
   [ZGAP_WIDE]="$ZGAP_WORK_DIR/ZGAP_WIDE.wkt"
-  [ZGAP_MIXED]="$ZGAP_WORK_DIR/ZGAP_MIXED.wkt"
+  [ZGAP_MIXED]="$ZGAP_MIXED_WORK_DIR/ZGAP_MIXED.wkt"
 )
 
 data_file_for_dataset() {
@@ -368,6 +406,48 @@ query_file_for_dataset() {
   echo "$QUERY_ROOT/${dataset}_jts_strtree_knn_${tag}.csv"
 }
 
+file_line_count() {
+  local path="$1"
+  if [[ ! -f "$path" ]]; then
+    echo 0
+    return
+  fi
+  wc -l < "$path" | tr -d '[:space:]'
+}
+
+synthetic_file_needs_generation() {
+  local path="$1"
+  if [[ ! -s "$path" ]]; then
+    return 0
+  fi
+  local rows
+  rows="$(file_line_count "$path")"
+  [[ "$rows" -lt "$LIMIT" ]]
+}
+
+validate_synthetic_size() {
+  local dataset="$1"
+  local path="$2"
+  case "$dataset" in
+    UNIF_S|UNIF_L|DIAG_S|DIAG_L|ZGAP_WIDE|ZGAP_MIXED|OSM_AU_POINTS)
+      ;;
+    *)
+      return
+      ;;
+  esac
+
+  local rows
+  rows="$(file_line_count "$path")"
+  if [[ "$rows" -lt "$LIMIT" ]]; then
+    echo "Error: $dataset 数据行数不足。" >&2
+    echo "  data_file=$path" >&2
+    echo "  file_rows=$rows, LIMIT=$LIMIT" >&2
+    echo "这通常说明 smoke 小数据被正式实验复用了。" >&2
+    echo "解决方法：使用 PREPARE_DATA=1 自动生成足够大的数据，或指定新的 DATA_FILE_${dataset}/工作目录。" >&2
+    exit 1
+  fi
+}
+
 prepare_data_if_needed() {
   if [[ "$PREPARE_DATA" != "1" ]]; then
     return
@@ -389,7 +469,8 @@ prepare_data_if_needed() {
         " $DATASETS " == *" DIAG_S "* || " $DATASETS " == *" DIAG_L "* ]]; then
     local missing=0
     for synthetic in UNIF_S UNIF_L DIAG_S DIAG_L; do
-      if [[ " $DATASETS " == *" $synthetic "* && ! -s "$(data_file_for_dataset "$synthetic")" ]]; then
+      if [[ " $DATASETS " == *" $synthetic "* ]] && \
+         synthetic_file_needs_generation "$(data_file_for_dataset "$synthetic")"; then
         missing=1
       fi
     done
@@ -411,16 +492,27 @@ prepare_data_if_needed() {
 
   if [[ " $DATASETS " == *" ZGAP_WIDE "* ]]; then
     local zgap_wkt="$ZGAP_WORK_DIR/ZGAP_WIDE.wkt"
-    if [[ ! -s "$zgap_wkt" ]]; then
+    if synthetic_file_needs_generation "$zgap_wkt"; then
+      if [[ -s "$zgap_wkt" ]]; then
+        echo "Existing ZGAP_WIDE has $(file_line_count "$zgap_wkt") rows < LIMIT=$LIMIT; regenerating."
+      fi
       NUM="$LIMIT" OUT_DIR="$ZGAP_WORK_DIR" NAME=ZGAP_WIDE SEED="$SEED" AUTO_BUILD=0 \
         scripts/prepare_zrange_gap_dataset.sh
     fi
   fi
 
   if [[ " $DATASETS " == *" ZGAP_MIXED "* ]]; then
-    local mixed_wkt="$ZGAP_WORK_DIR/ZGAP_MIXED.wkt"
-    if [[ ! -s "$mixed_wkt" ]]; then
-      NUM="$LIMIT" OUT_DIR="$ZGAP_WORK_DIR" NAME=ZGAP_MIXED SEED="$SEED" AUTO_BUILD=0 \
+    local mixed_wkt
+    mixed_wkt="$(data_file_for_dataset ZGAP_MIXED)"
+    if synthetic_file_needs_generation "$mixed_wkt"; then
+      if [[ -s "$mixed_wkt" ]]; then
+        echo "Existing ZGAP_MIXED has $(file_line_count "$mixed_wkt") rows < LIMIT=$LIMIT; regenerating."
+      fi
+      local mixed_dir
+      local mixed_name
+      mixed_dir="$(dirname "$mixed_wkt")"
+      mixed_name="$(basename "$mixed_wkt" .wkt)"
+      NUM="$LIMIT" OUT_DIR="$mixed_dir" NAME="$mixed_name" SEED="$SEED" AUTO_BUILD=0 \
         scripts/prepare_zrange_mixed_dataset.sh
     fi
   fi
@@ -429,21 +521,35 @@ prepare_data_if_needed() {
 generate_queries_if_needed() {
   local dataset="$1"
   local data_file="$2"
-  local all_queries_exist=1
+  local needs_generation="$REGENERATE_QUERIES"
+  local reason=""
+  if [[ "$REGENERATE_QUERIES" == "1" ]]; then
+    reason="REGENERATE_QUERIES=1"
+  fi
   for tag in $SELECTIVITY_TAGS; do
-    if [[ ! -s "$(query_file_for_dataset "$dataset" "$tag")" ]]; then
-      all_queries_exist=0
+    local query_file
+    query_file="$(query_file_for_dataset "$dataset" "$tag")"
+    if [[ ! -s "$query_file" ]]; then
+      needs_generation=1
+      reason="missing query file: $query_file"
+    elif [[ "$REGENERATE_STALE_QUERIES" == "1" && "$query_file" -ot "$data_file" ]]; then
+      needs_generation=1
+      reason="stale query file older than data: $query_file"
     fi
   done
-  if [[ "$all_queries_exist" == "1" ]]; then
+  if [[ "$needs_generation" != "1" ]]; then
     return
   fi
-  if [[ "$AUTO_GENERATE_QUERIES" != "1" ]]; then
-    echo "Error: missing query file for $dataset under $QUERY_ROOT" >&2
+  if [[ "$AUTO_GENERATE_QUERIES" != "1" && "$REGENERATE_QUERIES" != "1" ]]; then
+    echo "Error: query file for $dataset under $QUERY_ROOT needs generation." >&2
+    echo "Reason: $reason" >&2
     echo "Set AUTO_GENERATE_QUERIES=1 to generate ${dataset}_jts_strtree_knn_*.csv." >&2
     exit 1
   fi
 
+  if [[ -n "$reason" ]]; then
+    echo "Generating queries for $dataset: $reason"
+  fi
   mkdir -p "$QUERY_ROOT"
   scripts/generate_jts_strtree_knn_queries.sh \
     "$(realpath "$data_file")" \
@@ -464,6 +570,7 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
       echo "如果不想跑这个数据集，请用 DATASETS=\"ROADS PARKS\" 指定要跑的数据集。" >&2
       exit 1
     fi
+    validate_synthetic_size "$dataset" "$data_file"
     generate_queries_if_needed "$dataset" "$data_file"
 
     for tag in $SELECTIVITY_TAGS; do

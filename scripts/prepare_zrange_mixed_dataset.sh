@@ -21,7 +21,7 @@ set -euo pipefail
 #   SEED=42
 
 NUM=${NUM:-1000000}
-OUT_DIR=${OUT_DIR:-data/synthetic/zrange_gap}
+OUT_DIR=${OUT_DIR:-data/synthetic/zrange_gap_mixed_${NUM}}
 NAME=${NAME:-ZGAP_MIXED}
 SEED=${SEED:-42}
 XMIN=${XMIN:--180}
