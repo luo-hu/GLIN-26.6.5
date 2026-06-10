@@ -14,6 +14,8 @@ SELECTIVITY_TAGS = {
     "1pct": "1%",
 }
 
+IO_INDEXES = {"IntervalOverlapIndex", "IO_BLOCK_MBR", "IO_OVERFLOW"}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -64,6 +66,9 @@ def summarize_file(path):
     load_ns = as_float(first, "load_ns")
     block_size = int(as_float(first, "block_size"))
     block_count = int(as_float(first, "block_count"))
+    overflow_count = int(as_float(first, "overflow_count"))
+    overflow_fraction = as_float(first, "overflow_fraction")
+    overflow_span_threshold = as_float(first, "overflow_span_threshold")
 
     probe_ns = sum(as_float(row, "probe_ns") for row in rows)
     refine_ns = sum(as_float(row, "refine_ns") for row in rows)
@@ -73,7 +78,7 @@ def summarize_file(path):
 
     answers = sum(int(as_float(row, "answers")) for row in rows)
 
-    if index == "IntervalOverlapIndex":
+    if index in IO_INDEXES:
         candidates = sum(int(as_float(row, "exact_calls")) for row in rows)
         records_scanned = sum(int(as_float(row, "records_scanned")) for row in rows)
         interval_candidates = sum(
@@ -90,6 +95,18 @@ def summarize_file(path):
         skipped_mbr_blocks = sum(
             int(as_float(row, "skipped_mbr_blocks")) for row in rows
         )
+        overflow_probe_candidates = sum(
+            int(as_float(row, "overflow_probe_candidates")) for row in rows
+        )
+        overflow_interval_candidates = sum(
+            int(as_float(row, "overflow_interval_candidates")) for row in rows
+        )
+        overflow_exact_calls = sum(
+            int(as_float(row, "overflow_exact_calls")) for row in rows
+        )
+        overflow_answers = sum(
+            int(as_float(row, "overflow_answers")) for row in rows
+        )
     else:
         candidates = sum(int(as_float(row, "candidates")) for row in rows)
         records_scanned = 0
@@ -101,6 +118,10 @@ def summarize_file(path):
         visited_blocks = int(sum(as_float(row, "visited_leaf") for row in rows))
         skipped_zmax_blocks = 0
         skipped_mbr_blocks = 0
+        overflow_probe_candidates = 0
+        overflow_interval_candidates = 0
+        overflow_exact_calls = 0
+        overflow_answers = 0
 
     candidate_answer_ratio = 0 if answers == 0 else candidates / answers
     avg_probe_ns = 0 if query_count == 0 else probe_ns / query_count
@@ -121,6 +142,9 @@ def summarize_file(path):
         "query_count": query_count,
         "block_size": block_size,
         "block_count": block_count,
+        "overflow_count": overflow_count,
+        "overflow_fraction": overflow_fraction,
+        "overflow_span_threshold": overflow_span_threshold,
         "load_ns": int(load_ns),
         "build_ns": int(build_ns),
         "probe_ns": int(probe_ns),
@@ -142,6 +166,10 @@ def summarize_file(path):
         "skipped_zmax_blocks": skipped_zmax_blocks,
         "skipped_mbr_blocks": skipped_mbr_blocks,
         "skipped_block_ratio": skipped_block_ratio,
+        "overflow_probe_candidates": overflow_probe_candidates,
+        "overflow_interval_candidates": overflow_interval_candidates,
+        "overflow_exact_calls": overflow_exact_calls,
+        "overflow_answers": overflow_answers,
         "answers_match_boost": "",
         "answers_delta_vs_boost": "",
     }
@@ -192,6 +220,9 @@ def main():
         "query_count",
         "block_size",
         "block_count",
+        "overflow_count",
+        "overflow_fraction",
+        "overflow_span_threshold",
         "load_ns",
         "build_ns",
         "probe_ns",
@@ -213,6 +244,10 @@ def main():
         "skipped_zmax_blocks",
         "skipped_mbr_blocks",
         "skipped_block_ratio",
+        "overflow_probe_candidates",
+        "overflow_interval_candidates",
+        "overflow_exact_calls",
+        "overflow_answers",
         "answers_match_boost",
         "answers_delta_vs_boost",
     ]
@@ -228,6 +263,8 @@ def main():
         print(
             f"{summary['dataset']} {summary['selectivity']} {summary['index']} "
             f"block={summary['block_size']} "
+            f"overflow_fraction={summary['overflow_fraction']:.4g} "
+            f"overflow_count={summary['overflow_count']} "
             f"answers={summary['answers']} candidates={summary['candidates']} "
             f"ratio={summary['candidate_answer_ratio']:.3f} "
             f"avg_total_ns={summary['avg_total_ns']:.1f} "

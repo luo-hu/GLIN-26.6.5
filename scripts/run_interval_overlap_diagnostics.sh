@@ -9,7 +9,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 用法：
   ./scripts/run_interval_overlap_diagnostics.sh
 
-这个脚本用于跑 IntervalOverlapIndex 的 Intersects 查询实验，并和
+这个脚本用于跑 IO_BLOCK_MBR / IO_OVERFLOW 的 Intersects 查询实验，并和
 GLIN_PIECEWISE、Boost_Rtree、GEOS_Quadtree 做对比。
 
 重要提醒：
@@ -146,6 +146,19 @@ GLIN_PIECEWISE、Boost_Rtree、GEOS_Quadtree 做对比。
     0：不跑 GEOS_Quadtree。
     默认：1
 
+  INCLUDE_IO_BLOCK_MBR
+    1：运行 IO_BLOCK_MBR，也就是当前的 maxZmax + block MBR + record MBR 版本。
+    默认：1
+
+  INCLUDE_IO_OVERFLOW
+    1：运行 IO_OVERFLOW，也就是 main index + fat-object overflow R-tree 版本。
+    默认：0
+
+  OVERFLOW_FRACTIONS
+    IO_OVERFLOW 中按 Zmax-Zmin 跨度分流到 overflow 的对象比例。
+    多个值用空格分开，例如 "0.001 0.01 0.05"。
+    默认：0.01
+
   INCLUDE_GLIN_CONTAINS
     1：额外跑原始 GLIN contains sanity check。
     注意：它不是 Intersects，不能放进 Intersects 排名。
@@ -239,6 +252,15 @@ FIGURE_DIR="${FIGURE_DIR:-figures/interval_overlap_${LIMIT}}"
 
 # INCLUDE_QUADTREE=1：加入 GEOS_Quadtree 作为 baseline。
 INCLUDE_QUADTREE="${INCLUDE_QUADTREE:-1}"
+
+# INCLUDE_IO_BLOCK_MBR=1：运行当前基础增强版 IO。
+INCLUDE_IO_BLOCK_MBR="${INCLUDE_IO_BLOCK_MBR:-1}"
+
+# INCLUDE_IO_OVERFLOW=1：运行 main index + fat-object overflow R-tree 版本。
+INCLUDE_IO_OVERFLOW="${INCLUDE_IO_OVERFLOW:-0}"
+
+# OVERFLOW_FRACTIONS：长对象分流比例。
+OVERFLOW_FRACTIONS="${OVERFLOW_FRACTIONS:-0.01}"
 
 # INCLUDE_GLIN_CONTAINS 只做原始 GLIN 的 contains sanity check。
 # 注意：原始 GLIN 当前不是 Intersects，不能和 Intersects 方法放在同一张排名表。
@@ -436,20 +458,43 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
       fi
 
       for block_size in $BLOCK_SIZES; do
-        interval_csv="$RESULT_DIR/${dataset}_${tag}_b${block_size}_interval_overlap.csv"
-        if ! should_run_file "$interval_csv"; then
-          continue
+        if [[ "$INCLUDE_IO_BLOCK_MBR" == "1" ]]; then
+          block_mbr_csv="$RESULT_DIR/${dataset}_${tag}_b${block_size}_io_block_mbr.csv"
+          if should_run_file "$block_mbr_csv"; then
+            echo "Running IO_BLOCK_MBR for $dataset $tag block=$block_size"
+            ./build/bench_interval_overlap_wkt \
+              --data_file "$data_file" \
+              --query_file "$query_file" \
+              --dataset_name "$dataset" \
+              --limit "$LIMIT" \
+              --block_size "$block_size" \
+              --cell_size "$CELL_SIZE" \
+              --variant block_mbr \
+              --seed "$SEED" \
+              --output_csv "$block_mbr_csv"
+          fi
         fi
-        echo "Running IntervalOverlapIndex for $dataset $tag block=$block_size"
-        ./build/bench_interval_overlap_wkt \
-          --data_file "$data_file" \
-          --query_file "$query_file" \
-          --dataset_name "$dataset" \
-          --limit "$LIMIT" \
-          --block_size "$block_size" \
-          --cell_size "$CELL_SIZE" \
-          --seed "$SEED" \
-          --output_csv "$interval_csv"
+
+        if [[ "$INCLUDE_IO_OVERFLOW" == "1" ]]; then
+          for overflow_fraction in $OVERFLOW_FRACTIONS; do
+            overflow_tag="${overflow_fraction//./p}"
+            overflow_csv="$RESULT_DIR/${dataset}_${tag}_b${block_size}_of${overflow_tag}_io_overflow.csv"
+            if should_run_file "$overflow_csv"; then
+              echo "Running IO_OVERFLOW for $dataset $tag block=$block_size overflow=$overflow_fraction"
+              ./build/bench_interval_overlap_wkt \
+                --data_file "$data_file" \
+                --query_file "$query_file" \
+                --dataset_name "$dataset" \
+                --limit "$LIMIT" \
+                --block_size "$block_size" \
+                --cell_size "$CELL_SIZE" \
+                --variant overflow \
+                --overflow_fraction "$overflow_fraction" \
+                --seed "$SEED" \
+                --output_csv "$overflow_csv"
+            fi
+          done
+        fi
       done
 
       glin_piece_csv="$RESULT_DIR/${dataset}_${tag}_glin_piecewise.csv"

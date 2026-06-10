@@ -16,8 +16,14 @@
 #include <geos/io/WKTReader.h>
 #include <geos/util/GEOSException.h>
 
+#include <boost/geometry.hpp>
+#include <boost/geometry/geometries/box.hpp>
+#include <boost/geometry/geometries/point_xy.hpp>
+#include <boost/geometry/index/rtree.hpp>
+
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -33,6 +39,11 @@ namespace {
 
 using Geometry = geos::geom::Geometry;
 using GeometryPtr = std::unique_ptr<Geometry>;
+namespace bg = boost::geometry;
+namespace bgi = boost::geometry::index;
+using BoostPoint = bg::model::d2::point_xy<double>;
+using BoostBox = bg::model::box<BoostPoint>;
+using RTreeValue = std::pair<BoostBox, std::size_t>;
 
 struct Options {
   std::string data_file;
@@ -46,6 +57,8 @@ struct Options {
   double cell_xmin = -180.0;
   double cell_ymin = -90.0;
   double cell_size = 0.0000005;
+  std::string variant = "block_mbr";
+  double overflow_fraction = 0.01;
   bool enable_zmax_skip = true;
   bool enable_block_mbr_skip = true;
   bool enable_record_mbr_filter = true;
@@ -87,6 +100,9 @@ struct IntervalIndex {
   std::vector<IntervalRecord> records;
   std::vector<IntervalBlock> blocks;
   std::vector<double> zmins;
+  std::vector<IntervalRecord> overflow_records;
+  bgi::rtree<RTreeValue, bgi::quadratic<16>> overflow_rtree;
+  double overflow_span_threshold = std::numeric_limits<double>::infinity();
 };
 
 struct QueryResult {
@@ -105,6 +121,10 @@ struct QueryResult {
   std::size_t mbr_candidates = 0;
   std::size_t exact_calls = 0;
   std::size_t answers = 0;
+  std::size_t overflow_probe_candidates = 0;
+  std::size_t overflow_interval_candidates = 0;
+  std::size_t overflow_exact_calls = 0;
+  std::size_t overflow_answers = 0;
 };
 
 template <typename Duration>
@@ -125,6 +145,8 @@ void print_usage(const char* program) {
       << "  --cell_xmin X                Z-order longitude origin (default: -180)\n"
       << "  --cell_ymin Y                Z-order latitude origin (default: -90)\n"
       << "  --cell_size S                Z-order cell size for x/y (default: 5e-7)\n"
+      << "  --variant block_mbr|overflow Index variant (default: block_mbr)\n"
+      << "  --overflow_fraction F        Top span fraction sent to overflow when variant=overflow (default: 0.01)\n"
       << "  --disable_zmax_skip 0|1      Disable block maxZmax skip when 1 (default: 0)\n"
       << "  --disable_block_mbr_skip 0|1 Disable block MBR skip when 1 (default: 0)\n"
       << "  --disable_record_mbr_filter 0|1 Disable record MBR filter when 1 (default: 0)\n"
@@ -166,6 +188,10 @@ Options parse_args(int argc, char* argv[]) {
       options.cell_ymin = std::stod(require_value(key));
     } else if (key == "--cell_size") {
       options.cell_size = std::stod(require_value(key));
+    } else if (key == "--variant") {
+      options.variant = require_value(key);
+    } else if (key == "--overflow_fraction") {
+      options.overflow_fraction = std::stod(require_value(key));
     } else if (key == "--disable_zmax_skip") {
       options.enable_zmax_skip = std::stoi(require_value(key)) == 0;
     } else if (key == "--disable_block_mbr_skip") {
@@ -191,6 +217,12 @@ Options parse_args(int argc, char* argv[]) {
   }
   if (options.block_size == 0) {
     throw std::runtime_error("--block_size must be greater than 0");
+  }
+  if (options.variant != "block_mbr" && options.variant != "overflow") {
+    throw std::runtime_error("--variant must be block_mbr or overflow");
+  }
+  if (options.overflow_fraction < 0.0 || options.overflow_fraction >= 1.0) {
+    throw std::runtime_error("--overflow_fraction must be in [0, 1)");
   }
   return options;
 }
@@ -309,6 +341,11 @@ bool envelopes_intersect(const geos::geom::Envelope& a,
            a.getMaxY() < b.getMinY() || b.getMaxY() < a.getMinY());
 }
 
+BoostBox boost_box_from_envelope(const geos::geom::Envelope& envelope) {
+  return BoostBox(BoostPoint(envelope.getMinX(), envelope.getMinY()),
+                  BoostPoint(envelope.getMaxX(), envelope.getMaxY()));
+}
+
 std::vector<Geometry*> raw_ptrs(const std::vector<GeometryPtr>& geometries) {
   std::vector<Geometry*> raw;
   raw.reserve(geometries.size());
@@ -417,7 +454,8 @@ std::vector<QueryCase> make_random_queries(const std::vector<Geometry*>& geometr
 IntervalIndex build_interval_index(const Options& options,
                                    const std::vector<GeometryPtr>& geometries) {
   IntervalIndex index;
-  index.records.reserve(geometries.size());
+  std::vector<IntervalRecord> all_records;
+  all_records.reserve(geometries.size());
 
   for (std::size_t i = 0; i < geometries.size(); ++i) {
     Geometry* geometry = geometries[i].get();
@@ -432,7 +470,46 @@ IntervalIndex build_interval_index(const Options& options,
     record.envelope = *geometry->getEnvelopeInternal();
     record.geometry = geometry;
     record.id = i;
-    index.records.push_back(record);
+    all_records.push_back(record);
+  }
+
+  if (options.variant == "overflow" && options.overflow_fraction > 0.0 &&
+      !all_records.empty()) {
+    std::size_t overflow_count = static_cast<std::size_t>(
+        std::ceil(options.overflow_fraction * all_records.size()));
+    overflow_count = std::min(overflow_count, all_records.size());
+    if (overflow_count > 0) {
+      std::vector<std::pair<double, std::size_t>> spans;
+      spans.reserve(all_records.size());
+      for (std::size_t i = 0; i < all_records.size(); ++i) {
+        spans.emplace_back(all_records[i].zmax - all_records[i].zmin, i);
+      }
+      std::sort(spans.begin(), spans.end(),
+                [](const auto& a, const auto& b) {
+                  if (a.first != b.first) {
+                    return a.first > b.first;
+                  }
+                  return a.second < b.second;
+                });
+      index.overflow_span_threshold = spans[overflow_count - 1].first;
+      std::vector<char> is_overflow(all_records.size(), 0);
+      for (std::size_t i = 0; i < overflow_count; ++i) {
+        is_overflow[spans[i].second] = 1;
+      }
+      index.records.reserve(all_records.size() - overflow_count);
+      index.overflow_records.reserve(overflow_count);
+      for (std::size_t i = 0; i < all_records.size(); ++i) {
+        if (is_overflow[i]) {
+          index.overflow_records.push_back(all_records[i]);
+        } else {
+          index.records.push_back(all_records[i]);
+        }
+      }
+    }
+  }
+
+  if (index.records.empty() && index.overflow_records.empty()) {
+    index.records = all_records;
   }
 
   std::sort(index.records.begin(), index.records.end(),
@@ -464,6 +541,17 @@ IntervalIndex build_interval_index(const Options& options,
       block.mbr.expandToInclude(&index.records[i].envelope);
     }
     index.blocks.push_back(block);
+  }
+
+  std::vector<RTreeValue> overflow_values;
+  overflow_values.reserve(index.overflow_records.size());
+  for (std::size_t i = 0; i < index.overflow_records.size(); ++i) {
+    overflow_values.emplace_back(
+        boost_box_from_envelope(index.overflow_records[i].envelope), i);
+  }
+  if (!overflow_values.empty()) {
+    index.overflow_rtree =
+        bgi::rtree<RTreeValue, bgi::quadratic<16>>(overflow_values);
   }
 
   return index;
@@ -534,6 +622,28 @@ QueryResult query_interval_index(const Options& options,
       }
     }
   }
+
+  if (!index.overflow_records.empty()) {
+    std::vector<RTreeValue> overflow_hits;
+    index.overflow_rtree.query(
+        bgi::intersects(boost_box_from_envelope(query_envelope)),
+        std::back_inserter(overflow_hits));
+    result.overflow_probe_candidates = overflow_hits.size();
+    for (const auto& hit : overflow_hits) {
+      const IntervalRecord& record = index.overflow_records[hit.second];
+      if (record.zmin > query_zmax || record.zmax < query_zmin) {
+        continue;
+      }
+      ++result.overflow_interval_candidates;
+      ++result.overflow_exact_calls;
+      ++result.exact_calls;
+      if (query.geometry->intersects(record.geometry)) {
+        ++result.overflow_answers;
+        ++result.answers;
+      }
+    }
+  }
+
   auto refine_end = std::chrono::high_resolution_clock::now();
   result.refine_ns = ns_count(refine_end - refine_start);
   result.total_ns = result.probe_ns + result.refine_ns;
@@ -556,13 +666,18 @@ void write_csv(const std::string& path, const Options& options,
 
   output
       << "dataset,index,relationship,loaded_count,block_size,block_count,"
+         "overflow_count,overflow_fraction,overflow_span_threshold,"
          "cell_xmin,cell_ymin,cell_size,seed,lines_seen,parse_errors,load_ns,"
          "build_ns,enable_zmax_skip,enable_block_mbr_skip,"
          "enable_record_mbr_filter,query_id,source_geometry_id,probe_ns,"
          "refine_ns,total_ns,prefix_records,prefix_blocks,visited_blocks,"
          "skipped_zmax_blocks,skipped_mbr_blocks,records_scanned,"
          "interval_candidates,mbr_candidates,exact_calls,answers,"
-         "candidate_answer_ratio\n";
+         "overflow_probe_candidates,overflow_interval_candidates,"
+         "overflow_exact_calls,overflow_answers,candidate_answer_ratio\n";
+
+  const char* index_name =
+      options.variant == "overflow" ? "IO_OVERFLOW" : "IO_BLOCK_MBR";
 
   for (const auto& result : results) {
     double candidate_answer_ratio =
@@ -570,9 +685,11 @@ void write_csv(const std::string& path, const Options& options,
             ? 0.0
             : static_cast<double>(result.exact_calls) /
                   static_cast<double>(result.answers);
-    output << options.dataset_name << ",IntervalOverlapIndex,intersects,"
+    output << options.dataset_name << "," << index_name << ",intersects,"
            << loaded_count << "," << options.block_size << ","
-           << index.blocks.size() << "," << options.cell_xmin << ","
+           << index.blocks.size() << "," << index.overflow_records.size()
+           << "," << options.overflow_fraction << ","
+           << index.overflow_span_threshold << "," << options.cell_xmin << ","
            << options.cell_ymin << "," << options.cell_size << ","
            << options.seed << "," << stats.lines_seen << ","
            << stats.parse_errors << "," << load_ns << "," << build_ns << ","
@@ -587,6 +704,10 @@ void write_csv(const std::string& path, const Options& options,
            << result.skipped_mbr_blocks << "," << result.records_scanned << ","
            << result.interval_candidates << "," << result.mbr_candidates << ","
            << result.exact_calls << "," << result.answers << ","
+           << result.overflow_probe_candidates << ","
+           << result.overflow_interval_candidates << ","
+           << result.overflow_exact_calls << "," << result.overflow_answers
+           << ","
            << candidate_answer_ratio << "\n";
   }
 }
@@ -607,6 +728,10 @@ void print_summary(const Options& options, const LoadStats& stats,
   std::size_t total_mbr_candidates = 0;
   std::size_t total_exact_calls = 0;
   std::size_t total_answers = 0;
+  std::size_t total_overflow_probe_candidates = 0;
+  std::size_t total_overflow_interval_candidates = 0;
+  std::size_t total_overflow_exact_calls = 0;
+  std::size_t total_overflow_answers = 0;
 
   for (const auto& result : results) {
     total_probe_ns += result.probe_ns;
@@ -621,6 +746,10 @@ void print_summary(const Options& options, const LoadStats& stats,
     total_mbr_candidates += result.mbr_candidates;
     total_exact_calls += result.exact_calls;
     total_answers += result.answers;
+    total_overflow_probe_candidates += result.overflow_probe_candidates;
+    total_overflow_interval_candidates += result.overflow_interval_candidates;
+    total_overflow_exact_calls += result.overflow_exact_calls;
+    total_overflow_answers += result.overflow_answers;
   }
 
   double candidate_answer_ratio =
@@ -634,13 +763,18 @@ void print_summary(const Options& options, const LoadStats& stats,
                                 total_skipped_mbr_blocks) /
                 static_cast<double>(total_prefix_blocks);
 
+  const char* index_name =
+      options.variant == "overflow" ? "IO_OVERFLOW" : "IO_BLOCK_MBR";
   std::cout << std::fixed << std::setprecision(3);
   std::cout << "dataset=" << options.dataset_name
-            << " index=IntervalOverlapIndex"
+            << " index=" << index_name
             << " relationship=intersects"
             << " loaded=" << loaded_count
             << " blocks=" << index.blocks.size()
             << " block_size=" << options.block_size
+            << " overflow_count=" << index.overflow_records.size()
+            << " overflow_fraction=" << options.overflow_fraction
+            << " overflow_span_threshold=" << index.overflow_span_threshold
             << " queries=" << results.size()
             << " lines_seen=" << stats.lines_seen
             << " parse_errors=" << stats.parse_errors
@@ -664,6 +798,12 @@ void print_summary(const Options& options, const LoadStats& stats,
             << " mbr_candidates=" << total_mbr_candidates
             << " exact_calls=" << total_exact_calls
             << " answers=" << total_answers
+            << " overflow_probe_candidates="
+            << total_overflow_probe_candidates
+            << " overflow_interval_candidates="
+            << total_overflow_interval_candidates
+            << " overflow_exact_calls=" << total_overflow_exact_calls
+            << " overflow_answers=" << total_overflow_answers
             << " candidate_answer_ratio=" << candidate_answer_ratio << "\n";
 }
 
@@ -715,4 +855,3 @@ int main(int argc, char* argv[]) {
   }
   return 0;
 }
-

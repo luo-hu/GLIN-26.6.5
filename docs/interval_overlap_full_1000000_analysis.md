@@ -497,6 +497,118 @@ improves over the GLIN-piecewise baseline.
 6. 把 ZGAP_WIDE 单独放 stress test，不和普通数据混在主图平均里。
 ```
 
+## 11. 命名修正和 IO_OVERFLOW
+
+之前图和 CSV 里的：
+
+```text
+IntervalOverlapIndex
+```
+
+容易造成误解，因为当前实现不只是基础的 `maxZmax`，还包含：
+
+```text
+block.maxZmax 剪枝
+block MBR 剪枝
+record MBR filter
+GEOS exact intersects
+```
+
+所以现在代码里把它明确命名为：
+
+```text
+IO_BLOCK_MBR
+```
+
+中文意思：
+
+```text
+Interval-overlap index with block MBR pruning。
+也就是：区间重叠索引 + block MBR 剪枝版本。
+```
+
+新增版本：
+
+```text
+IO_OVERFLOW
+```
+
+中文意思：
+
+```text
+main index + fat-object overflow R-tree。
+也就是：主索引存普通对象，把 Zmax-Zmin 跨度最大的长对象分流到 overflow R-tree。
+```
+
+### 11.1 如何运行 IO_OVERFLOW
+
+小规模测试：
+
+```bash
+RESET_RESULTS=1 OVERWRITE=1 \
+DATASETS=ZGAP_WIDE LIMIT=10000 QUERY_LIMIT=1000000 \
+QUERY_ROOT=queries/interval_overlap_full_1000000 \
+RESULT_DIR=results/interval_overlap_overflow_zgap_smoke_10000 \
+FIGURE_DIR=figures/interval_overlap_overflow_zgap_smoke_10000 \
+SELECTIVITY_TAGS=1pct BLOCK_SIZES=512 \
+INCLUDE_IO_BLOCK_MBR=1 \
+INCLUDE_IO_OVERFLOW=1 \
+OVERFLOW_FRACTIONS="0.01 0.05" \
+INCLUDE_QUADTREE=1 AUTO_BUILD=0 \
+./scripts/run_interval_overlap_diagnostics.sh
+```
+
+正式测试建议：
+
+```bash
+RESET_RESULTS=1 OVERWRITE=1 \
+DATASETS="AW LW ROADS PARKS ZGAP_WIDE" \
+LIMIT=1000000 QUERY_LIMIT=1000000 \
+QUERY_ROOT=queries/interval_overlap_full_1000000 \
+RESULT_DIR=results/interval_overlap_overflow_full_1000000 \
+FIGURE_DIR=figures/interval_overlap_overflow_full_1000000 \
+SELECTIVITY_TAGS="0p001pct 0p01pct 0p1pct 1pct" \
+BLOCK_SIZES="512 1024 2048" \
+INCLUDE_IO_BLOCK_MBR=1 \
+INCLUDE_IO_OVERFLOW=1 \
+OVERFLOW_FRACTIONS="0.001 0.01 0.05" \
+INCLUDE_QUADTREE=1 \
+./scripts/run_interval_overlap_diagnostics.sh
+```
+
+### 11.2 已验证的 smoke 结果
+
+UNIF_S 1000 条、1% 查询：
+
+```text
+IO_BLOCK_MBR answers = 1029
+IO_OVERFLOW  answers = 1029
+Boost_Rtree  answers = 1029
+answers_match_boost = 1
+```
+
+ZGAP_WIDE 10000 条、1% 查询：
+
+```text
+IO_BLOCK_MBR             avg_total_ns = 1,188,681
+IO_OVERFLOW fraction=1%  avg_total_ns = 1,169,915
+IO_OVERFLOW fraction=5%  avg_total_ns = 1,129,507
+Boost_Rtree              avg_total_ns = 1,336,399
+GEOS_Quadtree            avg_total_ns = 1,113,794
+GLIN_PIECEWISE           avg_total_ns = 1,258,900
+```
+
+解释：
+
+```text
+IO_OVERFLOW 在这个小 ZGAP smoke 上比 IO_BLOCK_MBR 更快，
+说明 fat-object overflow 的方向是有希望的。
+
+但它仍略慢于 GEOS_Quadtree。
+这符合之前判断：ZGAP_WIDE 是极端压力数据，长对象太多时，
+overflow 只能缓解主索引污染，不能消除海量答案枚举成本。
+```
+
 最推荐的论文结构：
 
 ```text

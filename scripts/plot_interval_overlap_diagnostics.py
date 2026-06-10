@@ -14,23 +14,29 @@ import matplotlib.pyplot as plt
 
 
 INDEX_ORDER = [
-    "IntervalOverlapIndex",
+    "IO_BLOCK_MBR",
+    "IO_OVERFLOW",
     "GLIN_PIECEWISE",
     "Boost_Rtree",
     "GEOS_Quadtree",
 ]
 INDEX_LABELS = {
-    "IntervalOverlapIndex": "IntervalOverlapIndex",
+    "IntervalOverlapIndex": "IO-blockMBR",
+    "IO_BLOCK_MBR": "IO-blockMBR",
+    "IO_OVERFLOW": "IO-overflow",
     "GLIN_PIECEWISE": "GLIN-piecewise",
     "Boost_Rtree": "Boost R-tree",
     "GEOS_Quadtree": "GEOS Quadtree",
 }
 INDEX_COLORS = {
     "IntervalOverlapIndex": "#2F6F73",
+    "IO_BLOCK_MBR": "#2F6F73",
+    "IO_OVERFLOW": "#2D9CDB",
     "GLIN_PIECEWISE": "#6D8F3F",
     "Boost_Rtree": "#B86442",
     "GEOS_Quadtree": "#7C5FB3",
 }
+IO_INDEXES = {"IntervalOverlapIndex", "IO_BLOCK_MBR", "IO_OVERFLOW"}
 BLOCK_COLORS = {
     128: "#4E79A7",
     256: "#59A14F",
@@ -122,9 +128,15 @@ def load_rows(path):
         for row in reader:
             parsed = dict(row)
             block_size = row.get("block_size", "0") or "0"
+            overflow_fraction = row.get("overflow_fraction", "0") or "0"
             parsed["plot_index"] = row["index"]
-            if row["index"] == "IntervalOverlapIndex":
-                parsed["plot_index"] = f"IntervalOverlapIndex b{int(float(block_size))}"
+            if row["index"] == "IO_OVERFLOW":
+                fraction_tag = str(float(overflow_fraction)).replace(".", "p")
+                parsed["plot_index"] = (
+                    f"IO_OVERFLOW f{fraction_tag} b{int(float(block_size))}"
+                )
+            elif row["index"] in IO_INDEXES:
+                parsed["plot_index"] = f"{row['index']} b{int(float(block_size))}"
             parsed["avg_total_ms"] = as_float(row, "avg_total_ns") / 1e6
             parsed["candidate_answer_ratio"] = as_float(
                 row, "candidate_answer_ratio"
@@ -153,10 +165,17 @@ def ordered_values(found, preferred):
 
 
 def plot_index_order(value):
-    if value.startswith("IntervalOverlapIndex"):
+    if value.startswith("IntervalOverlapIndex") or value.startswith("IO_BLOCK_MBR") or value.startswith("IO_OVERFLOW"):
         match = re.search(r"b(\d+)", value)
         block_size = int(match.group(1)) if match else 0
-        return (0, block_size)
+        variant_order = 1 if value.startswith("IO_OVERFLOW") else 0
+        fraction_match = re.search(r"f([0-9p]+)", value)
+        fraction = (
+            float(fraction_match.group(1).replace("p", "."))
+            if fraction_match
+            else 0.0
+        )
+        return (variant_order, fraction, block_size)
     base = value
     return (INDEX_ORDER.index(base) if base in INDEX_ORDER else len(INDEX_ORDER), value)
 
@@ -170,16 +189,24 @@ def find_row(rows, dataset, index):
 
 def label_for_plot_index(index):
     if index.startswith("IntervalOverlapIndex b"):
-        return index.replace("IntervalOverlapIndex", "IO")
+        return index.replace("IntervalOverlapIndex", "IO-block")
+    if index.startswith("IO_BLOCK_MBR b"):
+        return index.replace("IO_BLOCK_MBR", "IO-block")
+    if index.startswith("IO_OVERFLOW b"):
+        return index.replace("IO_OVERFLOW", "IO-overflow")
+    if index.startswith("IO_OVERFLOW f"):
+        return index.replace("IO_OVERFLOW", "IO-overflow").replace(" f", " of=")
     return INDEX_LABELS.get(index, index)
 
 
 def color_for_plot_index(index):
-    if index.startswith("IntervalOverlapIndex"):
+    if index.startswith("IntervalOverlapIndex") or index.startswith("IO_BLOCK_MBR") or index.startswith("IO_OVERFLOW"):
         match = re.search(r"b(\d+)", index)
         if match:
-            return BLOCK_COLORS.get(int(match.group(1)), INDEX_COLORS["IntervalOverlapIndex"])
-        return INDEX_COLORS["IntervalOverlapIndex"]
+            if index.startswith("IO_OVERFLOW"):
+                return INDEX_COLORS["IO_OVERFLOW"]
+            return BLOCK_COLORS.get(int(match.group(1)), INDEX_COLORS["IO_BLOCK_MBR"])
+        return INDEX_COLORS["IO_BLOCK_MBR"]
     return INDEX_COLORS.get(index)
 
 
@@ -233,7 +260,7 @@ def block_size_of(row):
 
 
 def plot_block_sensitivity(rows, output_dir, figure_prefix, selectivity, dpi):
-    interval_rows = [row for row in rows if row["index"] == "IntervalOverlapIndex"]
+    interval_rows = [row for row in rows if row["index"] in IO_INDEXES]
     if not interval_rows:
         return None
 
@@ -268,7 +295,7 @@ def plot_block_sensitivity(rows, output_dir, figure_prefix, selectivity, dpi):
             zorder=4,
         )
 
-    ax.set_title(f"IntervalOverlap block sensitivity {selectivity}")
+    ax.set_title(f"IO block sensitivity {selectivity}")
     ax.set_xlabel("Block size")
     ax.set_ylabel("Average query time (ms)")
     ax.grid(True, linestyle="--", alpha=0.32)
@@ -283,7 +310,7 @@ def plot_block_sensitivity(rows, output_dir, figure_prefix, selectivity, dpi):
 
 
 def plot_interval_pruning(rows, output_dir, figure_prefix, selectivity, dpi):
-    interval_rows = [row for row in rows if row["index"] == "IntervalOverlapIndex"]
+    interval_rows = [row for row in rows if row["index"] in IO_INDEXES]
     if not interval_rows:
         return None
 
@@ -297,7 +324,7 @@ def plot_interval_pruning(rows, output_dir, figure_prefix, selectivity, dpi):
         ),
     )
     labels = [
-        f"{row['dataset']}\nb{int(float(row['block_size']))}" for row in interval_rows
+        f"{row['dataset']}\n{label_for_plot_index(row['plot_index'])}" for row in interval_rows
     ]
     scanned = []
     prefix = []
@@ -370,7 +397,7 @@ def write_diagnostics(rows, output_dir, figure_prefix):
                 boost = find_row(subset, dataset, "Boost_Rtree")
                 interval_candidates = [
                     row for row in subset
-                    if row["dataset"] == dataset and row["index"] == "IntervalOverlapIndex"
+                    if row["dataset"] == dataset and row["index"] in IO_INDEXES
                 ]
                 interval = (
                     min(interval_candidates, key=lambda item: item["avg_total_ms"])
