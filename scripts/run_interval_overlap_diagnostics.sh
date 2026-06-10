@@ -69,7 +69,7 @@ GLIN_PIECEWISE、Boost_Rtree、GEOS_Quadtree 做对比。
     PREPARE_DATA=1 \
     AUTO_GENERATE_QUERIES=1 \
     JTS_JAVA_HEAP=20g \
-    DATASETS="ROADS PARKS UNIF_S UNIF_L DIAG_S DIAG_L ZGAP_WIDE" \
+    DATASETS="ROADS PARKS UNIF_S UNIF_L DIAG_S DIAG_L ZGAP_WIDE ZGAP_MIXED" \
     LIMIT=1000000 \
     QUERY_LIMIT=1000000 \
     SYNTHETIC_KIND=rectangles \
@@ -84,7 +84,7 @@ GLIN_PIECEWISE、Boost_Rtree、GEOS_Quadtree 做对比。
 常用参数：
   DATASETS
     要跑哪些数据集。默认是 "ROADS PARKS"。
-    可选：AW LW ROADS PARKS OSM_AU_POINTS UNIF_S UNIF_L DIAG_S DIAG_L ZGAP_WIDE
+    可选：AW LW ROADS PARKS OSM_AU_POINTS UNIF_S UNIF_L DIAG_S DIAG_L ZGAP_WIDE ZGAP_MIXED
 
   LIMIT
     每个数据集最多加载多少条 geometry。默认 2000000。
@@ -171,6 +171,14 @@ GLIN_PIECEWISE、Boost_Rtree、GEOS_Quadtree 做对比。
       DATASETS=ZGAP_WIDE PREPARE_DATA=1 AUTO_GENERATE_QUERIES=1 \
         ./scripts/run_interval_overlap_diagnostics.sh
 
+  ZGAP_MIXED
+    这是专门给 IO_OVERFLOW 准备的 mixed fat-object 数据集。
+    它不是所有对象都很大，而是大多数小对象 + 少量长/胖对象。
+    如果想跑它：
+      DATASETS=ZGAP_MIXED PREPARE_DATA=1 AUTO_GENERATE_QUERIES=1 \
+      INCLUDE_IO_OVERFLOW=1 OVERFLOW_FRACTIONS="0.001 0.01 0.05" \
+        ./scripts/run_interval_overlap_diagnostics.sh
+
 输出：
   RESULT_DIR/interval_overlap_summary.csv
   FIGURE_DIR/interval_overlap_*_avg_total_ms.png
@@ -191,7 +199,7 @@ QUERY_LIMIT="${QUERY_LIMIT:-$LIMIT}"
 
 # DATASETS：要跑哪些数据集。
 # 默认只跑真实数据 ROADS/PARKS，避免没准备 synthetic 时一上来就报错。
-# 可选：AW LW ROADS PARKS OSM_AU_POINTS UNIF_S UNIF_L DIAG_S DIAG_L ZGAP_WIDE
+# 可选：AW LW ROADS PARKS OSM_AU_POINTS UNIF_S UNIF_L DIAG_S DIAG_L ZGAP_WIDE ZGAP_MIXED
 DATASETS="${DATASETS:-ROADS PARKS}"
 
 # DATA_ROOT：真实数据所在目录。ROADS/PARKS 默认从 /mnt/hgfs 读取。
@@ -331,6 +339,7 @@ declare -A DATA_FILES=(
   [DIAG_S]="$SYN_WORK_DIR/DIAG_S.wkt"
   [DIAG_L]="$SYN_WORK_DIR/DIAG_L.wkt"
   [ZGAP_WIDE]="$ZGAP_WORK_DIR/ZGAP_WIDE.wkt"
+  [ZGAP_MIXED]="$ZGAP_WORK_DIR/ZGAP_MIXED.wkt"
 )
 
 data_file_for_dataset() {
@@ -405,6 +414,14 @@ prepare_data_if_needed() {
     if [[ ! -s "$zgap_wkt" ]]; then
       NUM="$LIMIT" OUT_DIR="$ZGAP_WORK_DIR" NAME=ZGAP_WIDE SEED="$SEED" AUTO_BUILD=0 \
         scripts/prepare_zrange_gap_dataset.sh
+    fi
+  fi
+
+  if [[ " $DATASETS " == *" ZGAP_MIXED "* ]]; then
+    local mixed_wkt="$ZGAP_WORK_DIR/ZGAP_MIXED.wkt"
+    if [[ ! -s "$mixed_wkt" ]]; then
+      NUM="$LIMIT" OUT_DIR="$ZGAP_WORK_DIR" NAME=ZGAP_MIXED SEED="$SEED" AUTO_BUILD=0 \
+        scripts/prepare_zrange_mixed_dataset.sh
     fi
   fi
 }

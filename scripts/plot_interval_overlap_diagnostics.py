@@ -36,6 +36,14 @@ INDEX_COLORS = {
     "Boost_Rtree": "#B86442",
     "GEOS_Quadtree": "#7C5FB3",
 }
+OVERFLOW_COLORS = {
+    0.001: "#1F77B4",
+    0.005: "#17A2A4",
+    0.01: "#2CA02C",
+    0.02: "#FF7F0E",
+    0.05: "#D62728",
+    0.10: "#9467BD",
+}
 IO_INDEXES = {"IntervalOverlapIndex", "IO_BLOCK_MBR", "IO_OVERFLOW"}
 BLOCK_COLORS = {
     128: "#4E79A7",
@@ -53,6 +61,14 @@ BLOCK_MARKERS = {
     2048: "P",
     4096: "X",
 }
+BLOCK_HATCHES = {
+    128: "",
+    256: "//",
+    512: "\\\\",
+    1024: "xx",
+    2048: "..",
+    4096: "++",
+}
 DATASET_ORDER = [
     "AW",
     "LW",
@@ -64,6 +80,7 @@ DATASET_ORDER = [
     "DIAG_S",
     "DIAG_L",
     "ZGAP_WIDE",
+    "ZGAP_MIXED",
 ]
 
 REQUIRED_COLUMNS = {
@@ -195,6 +212,10 @@ def label_for_plot_index(index):
     if index.startswith("IO_OVERFLOW b"):
         return index.replace("IO_OVERFLOW", "IO-overflow")
     if index.startswith("IO_OVERFLOW f"):
+        match = re.search(r"IO_OVERFLOW f([0-9p]+) b(\d+)", index)
+        if match:
+            fraction = match.group(1).replace("p", ".")
+            return f"IO-overflow of={fraction} b{match.group(2)}"
         return index.replace("IO_OVERFLOW", "IO-overflow").replace(" f", " of=")
     return INDEX_LABELS.get(index, index)
 
@@ -204,10 +225,43 @@ def color_for_plot_index(index):
         match = re.search(r"b(\d+)", index)
         if match:
             if index.startswith("IO_OVERFLOW"):
-                return INDEX_COLORS["IO_OVERFLOW"]
+                fraction = overflow_fraction_for_plot_index(index)
+                return color_for_overflow_fraction(fraction)
             return BLOCK_COLORS.get(int(match.group(1)), INDEX_COLORS["IO_BLOCK_MBR"])
         return INDEX_COLORS["IO_BLOCK_MBR"]
     return INDEX_COLORS.get(index)
+
+
+def overflow_fraction_for_plot_index(index):
+    fraction_match = re.search(r"f([0-9p]+)", index)
+    if not fraction_match:
+        return 0.0
+    return float(fraction_match.group(1).replace("p", "."))
+
+
+def color_for_overflow_fraction(fraction):
+    if fraction in OVERFLOW_COLORS:
+        return OVERFLOW_COLORS[fraction]
+    palette = [
+        "#1F77B4",
+        "#FF7F0E",
+        "#2CA02C",
+        "#D62728",
+        "#9467BD",
+        "#8C564B",
+        "#E377C2",
+        "#7F7F7F",
+        "#BCBD22",
+        "#17BECF",
+    ]
+    return palette[abs(hash(round(fraction, 6))) % len(palette)]
+
+
+def hatch_for_plot_index(index):
+    match = re.search(r"b(\d+)", index)
+    if not match:
+        return ""
+    return BLOCK_HATCHES.get(int(match.group(1)), "")
 
 
 def plot_grouped_bars(rows, output_dir, figure_prefix, selectivity, metric, ylabel, filename,
@@ -234,6 +288,7 @@ def plot_grouped_bars(rows, output_dir, figure_prefix, selectivity, metric, ylab
             width=bar_width * 0.92,
             label=label_for_plot_index(index),
             color=color_for_plot_index(index),
+            hatch=hatch_for_plot_index(index),
             edgecolor="black",
             linewidth=0.45,
         )

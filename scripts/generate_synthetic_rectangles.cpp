@@ -7,6 +7,8 @@
 //   uniform:  rectangle centers are uniform in the configured coordinate range.
 //   diagonal: rectangle centers follow the lower-left to upper-right diagonal,
 //             with configurable Gaussian noise around the diagonal.
+//   mixed_fat: mostly small rectangles, with a small fraction of very large
+//              rectangles that stress block summaries.
 
 #include <algorithm>
 #include <fstream>
@@ -30,6 +32,11 @@ struct Options {
   double max_width = 0.001;
   double min_height = 0.0001;
   double max_height = 0.001;
+  double fat_fraction = 0.01;
+  double fat_min_width = 30.0;
+  double fat_max_width = 120.0;
+  double fat_min_height = 15.0;
+  double fat_max_height = 60.0;
   double diagonal_noise = 0.01;
   std::uint64_t seed = 42;
   bool avoid_clamp = false;
@@ -39,7 +46,8 @@ void print_usage(const char* program) {
   std::cerr
       << "Usage: " << program << " --dist uniform --num 1000000 --output_file data/synthetic/UNIF_S.wkt [options]\n"
       << "Options:\n"
-      << "  --dist uniform|diagonal   Rectangle center distribution (default: uniform)\n"
+      << "  --dist uniform|diagonal|mixed_fat\n"
+      << "                            Rectangle center distribution (default: uniform)\n"
       << "  --num N                   Number of rectangles (default: 10000)\n"
       << "  --output_file PATH        Output WKT file\n"
       << "  --xmin X                  Coordinate range min x (default: -180)\n"
@@ -50,6 +58,11 @@ void print_usage(const char* program) {
       << "  --max_width W             Maximum rectangle width (default: 0.001)\n"
       << "  --min_height H            Minimum rectangle height (default: 0.0001)\n"
       << "  --max_height H            Maximum rectangle height (default: 0.001)\n"
+      << "  --fat_fraction F          Fraction of fat rectangles for mixed_fat (default: 0.01)\n"
+      << "  --fat_min_width W         Minimum fat rectangle width (default: 30)\n"
+      << "  --fat_max_width W         Maximum fat rectangle width (default: 120)\n"
+      << "  --fat_min_height H        Minimum fat rectangle height (default: 15)\n"
+      << "  --fat_max_height H        Maximum fat rectangle height (default: 60)\n"
       << "  --diagonal_noise F        Diagonal noise as fraction of y range (default: 0.01)\n"
       << "  --avoid_clamp             Sample centers so rectangles do not touch world bounds\n"
       << "  --seed N                  Random seed (default: 42)\n";
@@ -88,6 +101,16 @@ Options parse_args(int argc, char* argv[]) {
       options.min_height = std::stod(require_value(key));
     } else if (key == "--max_height") {
       options.max_height = std::stod(require_value(key));
+    } else if (key == "--fat_fraction") {
+      options.fat_fraction = std::stod(require_value(key));
+    } else if (key == "--fat_min_width") {
+      options.fat_min_width = std::stod(require_value(key));
+    } else if (key == "--fat_max_width") {
+      options.fat_max_width = std::stod(require_value(key));
+    } else if (key == "--fat_min_height") {
+      options.fat_min_height = std::stod(require_value(key));
+    } else if (key == "--fat_max_height") {
+      options.fat_max_height = std::stod(require_value(key));
     } else if (key == "--diagonal_noise") {
       options.diagonal_noise = std::stod(require_value(key));
     } else if (key == "--avoid_clamp") {
@@ -102,8 +125,9 @@ Options parse_args(int argc, char* argv[]) {
     }
   }
 
-  if (options.dist != "uniform" && options.dist != "diagonal") {
-    throw std::runtime_error("--dist must be uniform or diagonal");
+  if (options.dist != "uniform" && options.dist != "diagonal" &&
+      options.dist != "mixed_fat") {
+    throw std::runtime_error("--dist must be uniform, diagonal, or mixed_fat");
   }
   if (options.output_file.empty()) {
     throw std::runtime_error("--output_file is required");
@@ -118,12 +142,23 @@ Options parse_args(int argc, char* argv[]) {
       options.min_height <= 0.0 || options.max_height < options.min_height) {
     throw std::runtime_error("Invalid rectangle width/height range");
   }
+  if (options.fat_fraction < 0.0 || options.fat_fraction > 1.0) {
+    throw std::runtime_error("--fat_fraction must be in [0, 1]");
+  }
+  if (options.fat_min_width <= 0.0 ||
+      options.fat_max_width < options.fat_min_width ||
+      options.fat_min_height <= 0.0 ||
+      options.fat_max_height < options.fat_min_height) {
+    throw std::runtime_error("Invalid fat rectangle width/height range");
+  }
   if (options.diagonal_noise < 0.0) {
     throw std::runtime_error("--diagonal_noise must be non-negative");
   }
   if (options.avoid_clamp &&
-      (options.max_width >= options.xmax - options.xmin ||
-       options.max_height >= options.ymax - options.ymin)) {
+      (std::max(options.max_width, options.fat_max_width) >=
+           options.xmax - options.xmin ||
+       std::max(options.max_height, options.fat_max_height) >=
+           options.ymax - options.ymin)) {
     throw std::runtime_error("--avoid_clamp requires max width/height smaller than the coordinate range");
   }
   return options;
@@ -159,15 +194,25 @@ int main(int argc, char* argv[]) {
     std::uniform_real_distribution<double> ydist(options.ymin, options.ymax);
     std::uniform_real_distribution<double> wdist(options.min_width, options.max_width);
     std::uniform_real_distribution<double> hdist(options.min_height, options.max_height);
+    std::uniform_real_distribution<double> fat_wdist(options.fat_min_width,
+                                                     options.fat_max_width);
+    std::uniform_real_distribution<double> fat_hdist(options.fat_min_height,
+                                                     options.fat_max_height);
     std::normal_distribution<double> noise(0.0, options.diagonal_noise);
 
     const double xrange = options.xmax - options.xmin;
     const double yrange = options.ymax - options.ymin;
 
     output << std::setprecision(17);
+    std::size_t fat_count = 0;
     for (std::size_t i = 0; i < options.num; ++i) {
-      const double width = wdist(generator);
-      const double height = hdist(generator);
+      const bool is_fat =
+          options.dist == "mixed_fat" && unit(generator) < options.fat_fraction;
+      if (is_fat) {
+        ++fat_count;
+      }
+      const double width = is_fat ? fat_wdist(generator) : wdist(generator);
+      const double height = is_fat ? fat_hdist(generator) : hdist(generator);
 
       const double center_xmin =
           options.avoid_clamp ? options.xmin + width / 2.0 : options.xmin;
@@ -182,7 +227,7 @@ int main(int argc, char* argv[]) {
 
       double cx = 0.0;
       double cy = 0.0;
-      if (options.dist == "uniform") {
+      if (options.dist == "uniform" || options.dist == "mixed_fat") {
         if (options.avoid_clamp) {
           cx = center_xmin + unit(generator) * center_xrange;
           cy = center_ymin + unit(generator) * center_yrange;
@@ -221,6 +266,10 @@ int main(int argc, char* argv[]) {
               << options.xmax << "," << options.ymax << "]"
               << " width=[" << options.min_width << "," << options.max_width << "]"
               << " height=[" << options.min_height << "," << options.max_height << "]"
+              << " fat_fraction=" << options.fat_fraction
+              << " fat_count=" << fat_count
+              << " fat_width=[" << options.fat_min_width << "," << options.fat_max_width << "]"
+              << " fat_height=[" << options.fat_min_height << "," << options.fat_max_height << "]"
               << " avoid_clamp=" << (options.avoid_clamp ? "true" : "false")
               << " seed=" << options.seed << "\n";
   } catch (const std::exception& ex) {
