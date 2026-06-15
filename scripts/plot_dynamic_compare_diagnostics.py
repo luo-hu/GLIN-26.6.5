@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 INDEX_ORDER = [
     "DELI_DYNAMIC_SINGLE",
     "DELI_ALEX",
+    "DELI_ALEX_HYBRID",
     "GLIN_PIECEWISE",
     "Boost_Rtree",
     "GEOS_Quadtree",
@@ -23,6 +24,7 @@ INDEX_ORDER = [
 COLORS = {
     "DELI_DYNAMIC_SINGLE": "#2F6F73",
     "DELI_ALEX": "#3C8DBC",
+    "DELI_ALEX_HYBRID": "#1F9E89",
     "GLIN_PIECEWISE": "#6D8F3F",
     "Boost_Rtree": "#B86442",
     "GEOS_Quadtree": "#7C5FB3",
@@ -30,6 +32,7 @@ COLORS = {
 LABELS = {
     "DELI_DYNAMIC_SINGLE": "DELI-Dynamic",
     "DELI_ALEX": "DELI-ALEX",
+    "DELI_ALEX_HYBRID": "DELI-ALEX-Hybrid",
     "GLIN_PIECEWISE": "GLIN-piece",
     "Boost_Rtree": "Boost R-tree",
     "GEOS_Quadtree": "GEOS Quadtree",

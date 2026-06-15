@@ -1606,6 +1606,521 @@ class DeliAlexIndex {
   long long summary_rebuild_ns_ = 0;
 };
 
+struct CompactOverlayBlock {
+  std::uint64_t block_id = 0;
+  std::vector<ObjectId> ids;
+  double min_zmin = std::numeric_limits<double>::infinity();
+  double max_zmin = -std::numeric_limits<double>::infinity();
+  double max_zmax = -std::numeric_limits<double>::infinity();
+  geos::geom::Envelope mbr;
+  std::size_t live_count = 0;
+  std::size_t dead_count = 0;
+  bool stale = false;
+};
+
+class CompactQueryOverlay {
+ public:
+  CompactQueryOverlay(const Options& options,
+                      const std::vector<GeometryPtr>& geometries,
+                      const std::vector<GeometryMeta>& metadata)
+      : options_(options), geometries_(geometries), metadata_(metadata) {
+    live_.assign(geometries.size(), 0);
+    object_to_block_.assign(geometries.size(), nullptr);
+  }
+
+  void bulk_load(const std::vector<ObjectId>& object_ids) {
+    std::vector<ObjectId> ids;
+    ids.reserve(object_ids.size());
+    for (ObjectId oid : object_ids) {
+      if (oid >= geometries_.size()) {
+        continue;
+      }
+      ids.push_back(oid);
+      live_[oid] = 1;
+    }
+    std::sort(ids.begin(), ids.end(), ObjectIdLess(metadata_));
+
+    for (std::size_t begin = 0; begin < ids.size();
+         begin += options_.block_size) {
+      std::size_t end = std::min(begin + options_.block_size, ids.size());
+      std::unique_ptr<CompactOverlayBlock> block(new CompactOverlayBlock());
+      block->block_id = next_block_id_++;
+      block->ids.assign(ids.begin() + begin, ids.begin() + end);
+      CompactOverlayBlock* block_ptr = block.get();
+      owned_blocks_.push_back(std::move(block));
+      directory_.push_back(block_ptr);
+      for (ObjectId oid : block_ptr->ids) {
+        object_to_block_[oid] = block_ptr;
+      }
+      rebuild_block_summary(block_ptr, false);
+    }
+  }
+
+  bool insert(ObjectId oid) {
+    if (oid >= geometries_.size() || live_[oid]) {
+      return false;
+    }
+    CompactOverlayBlock* block = find_block_for_zmin(metadata_[oid].zmin);
+    if (block == nullptr) {
+      block = create_empty_block();
+    }
+    auto pos = std::lower_bound(block->ids.begin(), block->ids.end(), oid,
+                                ObjectIdLess(metadata_));
+    block->ids.insert(pos, oid);
+    live_[oid] = 1;
+    object_to_block_[oid] = block;
+    expand_summary_on_insert(block, metadata_[oid]);
+    if (block->ids.size() > 2 * options_.block_size) {
+      split_block(block);
+    }
+    return true;
+  }
+
+  bool erase(ObjectId oid) {
+    if (oid >= geometries_.size() || !live_[oid]) {
+      return false;
+    }
+    CompactOverlayBlock* block = object_to_block_[oid];
+    live_[oid] = 0;
+    object_to_block_[oid] = nullptr;
+    if (block != nullptr) {
+      if (block->live_count > 0) {
+        --block->live_count;
+      }
+      ++block->dead_count;
+      block->stale = true;
+      if (should_rebuild(*block)) {
+        rebuild_block_summary_and_compact(block);
+      }
+    }
+    return true;
+  }
+
+  SimpleQueryResult query(const QueryCase& query_case) const {
+    auto start = std::chrono::high_resolution_clock::now();
+    SimpleQueryResult result;
+
+    double query_zmin = 0.0;
+    double query_zmax = 0.0;
+    curve_shape_projection(query_case.geometry, "z", options_.cell_xmin,
+                           options_.cell_ymin, options_.cell_size,
+                           options_.cell_size, query_zmin, query_zmax);
+    const geos::geom::Envelope query_envelope =
+        *query_case.geometry->getEnvelopeInternal();
+
+    for (const CompactOverlayBlock* block : directory_) {
+      if (block->live_count == 0) {
+        continue;
+      }
+      if (block->min_zmin > query_zmax) {
+        break;
+      }
+      if (block->max_zmax < query_zmin) {
+        continue;
+      }
+      if (!envelopes_intersect(block->mbr, query_envelope)) {
+        continue;
+      }
+      for (ObjectId oid : block->ids) {
+        if (oid >= metadata_.size()) {
+          continue;
+        }
+        const GeometryMeta& meta = metadata_[oid];
+        if (meta.zmin > query_zmax) {
+          break;
+        }
+        if (!live_[oid]) {
+          continue;
+        }
+        if (meta.zmax < query_zmin) {
+          continue;
+        }
+        if (!envelopes_intersect(meta.envelope, query_envelope)) {
+          continue;
+        }
+        ++result.candidates;
+        ++result.exact_calls;
+        if (query_case.geometry->intersects(geometries_[oid].get())) {
+          result.answers.insert(oid);
+        }
+      }
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    result.query_ns = ns_count(end - start);
+    return result;
+  }
+
+  bool validate_index(std::string* message = nullptr) const {
+    auto fail = [&](const std::string& reason) {
+      if (message != nullptr) {
+        *message = reason;
+      }
+      return false;
+    };
+
+    std::size_t seen_live = 0;
+    bool have_previous_live_block = false;
+    double previous_live_min_zmin = -std::numeric_limits<double>::infinity();
+    for (const CompactOverlayBlock* block : directory_) {
+      for (std::size_t i = 1; i < block->ids.size(); ++i) {
+        if (ObjectIdLess(metadata_)(block->ids[i], block->ids[i - 1])) {
+          return fail("compact overlay block ids are not sorted by zmin");
+        }
+      }
+
+      bool has_live = false;
+      std::size_t true_live = 0;
+      double true_min_zmin = std::numeric_limits<double>::infinity();
+      double true_max_zmax = -std::numeric_limits<double>::infinity();
+      geos::geom::Envelope true_mbr;
+      for (ObjectId oid : block->ids) {
+        if (oid >= live_.size()) {
+          return fail("compact overlay block references out-of-range object id");
+        }
+        if (!live_[oid]) {
+          continue;
+        }
+        if (object_to_block_[oid] != block) {
+          return fail("compact overlay object points to a different block");
+        }
+        const GeometryMeta& meta = metadata_[oid];
+        ++true_live;
+        ++seen_live;
+        true_min_zmin = std::min(true_min_zmin, meta.zmin);
+        true_max_zmax = std::max(true_max_zmax, meta.zmax);
+        if (!has_live) {
+          true_mbr = meta.envelope;
+          has_live = true;
+        } else {
+          true_mbr.expandToInclude(&meta.envelope);
+        }
+      }
+
+      if (block->live_count != true_live) {
+        return fail("compact overlay block live_count mismatch");
+      }
+      if (true_live == 0) {
+        continue;
+      }
+      if (have_previous_live_block &&
+          block->min_zmin + 1e-9 < previous_live_min_zmin) {
+        return fail("compact overlay directory is not sorted by min_zmin");
+      }
+      previous_live_min_zmin = block->min_zmin;
+      have_previous_live_block = true;
+      const double eps = 1e-9;
+      if (block->max_zmax + eps < true_max_zmax) {
+        return fail("compact overlay max_zmax is smaller than true max_zmax");
+      }
+      if (block->min_zmin - eps > true_min_zmin) {
+        return fail("compact overlay min_zmin is larger than true min_zmin");
+      }
+      if (!envelope_contains(block->mbr, true_mbr)) {
+        return fail("compact overlay MBR does not contain true MBR");
+      }
+    }
+
+    if (seen_live != live_count()) {
+      return fail("compact overlay live object count mismatch");
+    }
+    return true;
+  }
+
+  std::size_t live_count() const {
+    return static_cast<std::size_t>(
+        std::count(live_.begin(), live_.end(), static_cast<char>(1)));
+  }
+  std::size_t total_records() const { return live_.size(); }
+  std::size_t block_count() const { return directory_.size(); }
+  std::size_t summary_rebuild_count() const { return summary_rebuild_count_; }
+  long long summary_rebuild_ns() const { return summary_rebuild_ns_; }
+  std::size_t block_split_count() const { return block_split_count_; }
+
+  std::size_t stale_block_count() const {
+    std::size_t count = 0;
+    for (const CompactOverlayBlock* block : directory_) {
+      if (block->stale) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  std::size_t index_bytes_estimate() const {
+    std::size_t bytes = live_.size() * sizeof(char);
+    bytes += object_to_block_.size() * sizeof(CompactOverlayBlock*);
+    bytes += directory_.size() * sizeof(CompactOverlayBlock*);
+    bytes += owned_blocks_.size() * sizeof(CompactOverlayBlock);
+    for (const auto& block : owned_blocks_) {
+      bytes += block->ids.capacity() * sizeof(ObjectId);
+    }
+    return bytes;
+  }
+
+ private:
+  struct ObjectIdLess {
+    explicit ObjectIdLess(const std::vector<GeometryMeta>& metadata)
+        : metadata(metadata) {}
+
+    bool operator()(ObjectId lhs, ObjectId rhs) const {
+      const GeometryMeta& a = metadata[lhs];
+      const GeometryMeta& b = metadata[rhs];
+      if (a.zmin != b.zmin) {
+        return a.zmin < b.zmin;
+      }
+      return lhs < rhs;
+    }
+
+    const std::vector<GeometryMeta>& metadata;
+  };
+
+  CompactOverlayBlock* create_empty_block() {
+    std::unique_ptr<CompactOverlayBlock> block(new CompactOverlayBlock());
+    block->block_id = next_block_id_++;
+    CompactOverlayBlock* block_ptr = block.get();
+    owned_blocks_.push_back(std::move(block));
+    directory_.push_back(block_ptr);
+    return block_ptr;
+  }
+
+  CompactOverlayBlock* find_block_for_zmin(double zmin) const {
+    if (directory_.empty()) {
+      return nullptr;
+    }
+    auto it = std::lower_bound(
+        directory_.begin(), directory_.end(), zmin,
+        [](const CompactOverlayBlock* block, double value) {
+          return block->max_zmin < value;
+        });
+    if (it == directory_.end()) {
+      return directory_.back();
+    }
+    return *it;
+  }
+
+  void expand_summary_on_insert(CompactOverlayBlock* block,
+                                const GeometryMeta& meta) {
+    if (block->live_count == 0) {
+      block->min_zmin = meta.zmin;
+      block->max_zmin = meta.zmin;
+      block->max_zmax = meta.zmax;
+      block->mbr = meta.envelope;
+    } else {
+      block->min_zmin = std::min(block->min_zmin, meta.zmin);
+      block->max_zmin = std::max(block->max_zmin, meta.zmin);
+      block->max_zmax = std::max(block->max_zmax, meta.zmax);
+      block->mbr.expandToInclude(&meta.envelope);
+    }
+    ++block->live_count;
+  }
+
+  std::size_t stale_threshold_count() const {
+    if (options_.stale_threshold_fraction <= 0.0) {
+      return 0;
+    }
+    return std::max<std::size_t>(
+        1, static_cast<std::size_t>(
+               std::ceil(options_.stale_threshold_fraction *
+                         static_cast<double>(options_.block_size))));
+  }
+
+  bool should_rebuild(const CompactOverlayBlock& block) const {
+    std::size_t threshold = stale_threshold_count();
+    if (threshold == 0) {
+      return true;
+    }
+    return block.dead_count >= threshold;
+  }
+
+  void rebuild_block_summary(CompactOverlayBlock* block, bool compact_dead) {
+    bool has_live = false;
+    std::size_t live_count = 0;
+    std::vector<ObjectId> live_ids;
+    if (compact_dead) {
+      live_ids.reserve(block->ids.size());
+    }
+
+    double min_zmin = std::numeric_limits<double>::infinity();
+    double max_zmin = -std::numeric_limits<double>::infinity();
+    double max_zmax = -std::numeric_limits<double>::infinity();
+    geos::geom::Envelope mbr;
+
+    for (ObjectId oid : block->ids) {
+      if (oid >= live_.size() || !live_[oid]) {
+        continue;
+      }
+      if (compact_dead) {
+        live_ids.push_back(oid);
+      }
+      object_to_block_[oid] = block;
+      const GeometryMeta& meta = metadata_[oid];
+      ++live_count;
+      min_zmin = std::min(min_zmin, meta.zmin);
+      max_zmin = std::max(max_zmin, meta.zmin);
+      max_zmax = std::max(max_zmax, meta.zmax);
+      if (!has_live) {
+        mbr = meta.envelope;
+        has_live = true;
+      } else {
+        mbr.expandToInclude(&meta.envelope);
+      }
+    }
+
+    if (compact_dead) {
+      block->ids.swap(live_ids);
+    }
+    block->live_count = live_count;
+    block->dead_count = 0;
+    block->stale = false;
+    if (has_live) {
+      block->min_zmin = min_zmin;
+      block->max_zmin = max_zmin;
+      block->max_zmax = max_zmax;
+      block->mbr = mbr;
+    } else {
+      block->min_zmin = std::numeric_limits<double>::infinity();
+      block->max_zmin = -std::numeric_limits<double>::infinity();
+      block->max_zmax = -std::numeric_limits<double>::infinity();
+      block->mbr = geos::geom::Envelope();
+    }
+  }
+
+  void rebuild_block_summary_and_compact(CompactOverlayBlock* block) {
+    auto start = std::chrono::high_resolution_clock::now();
+    rebuild_block_summary(block, true);
+    auto end = std::chrono::high_resolution_clock::now();
+    ++summary_rebuild_count_;
+    summary_rebuild_ns_ += ns_count(end - start);
+  }
+
+  void split_block(CompactOverlayBlock* block) {
+    std::sort(block->ids.begin(), block->ids.end(), ObjectIdLess(metadata_));
+    std::size_t mid = block->ids.size() / 2;
+    std::unique_ptr<CompactOverlayBlock> right(new CompactOverlayBlock());
+    right->block_id = next_block_id_++;
+    right->ids.assign(block->ids.begin() + mid, block->ids.end());
+    block->ids.erase(block->ids.begin() + mid, block->ids.end());
+
+    CompactOverlayBlock* right_ptr = right.get();
+    owned_blocks_.push_back(std::move(right));
+
+    rebuild_block_summary(block, true);
+    rebuild_block_summary(right_ptr, true);
+
+    auto it = std::find(directory_.begin(), directory_.end(), block);
+    if (it == directory_.end()) {
+      directory_.push_back(right_ptr);
+    } else {
+      directory_.insert(it + 1, right_ptr);
+    }
+    ++block_split_count_;
+  }
+
+  const Options& options_;
+  const std::vector<GeometryPtr>& geometries_;
+  const std::vector<GeometryMeta>& metadata_;
+  std::vector<char> live_;
+  std::vector<CompactOverlayBlock*> object_to_block_;
+  std::vector<std::unique_ptr<CompactOverlayBlock>> owned_blocks_;
+  std::vector<CompactOverlayBlock*> directory_;
+  std::uint64_t next_block_id_ = 0;
+  std::size_t summary_rebuild_count_ = 0;
+  long long summary_rebuild_ns_ = 0;
+  std::size_t block_split_count_ = 0;
+};
+
+class DeliAlexHybridIndex {
+ public:
+  using BaseAlex = alex::Alex<double, Geometry*>;
+  using GlinIndex = alex::Glin<double, Geometry*>;
+
+  DeliAlexHybridIndex(const Options& options,
+                      const std::vector<GeometryPtr>& geometries,
+                      const std::vector<GeometryMeta>& metadata)
+      : options_(options),
+        geometries_(geometries),
+        metadata_(metadata),
+        overlay_(options, geometries, metadata) {}
+
+  void bulk_load(const std::vector<ObjectId>& ids) {
+    std::vector<std::pair<double, Geometry*>> values;
+    values.reserve(ids.size());
+    for (ObjectId oid : ids) {
+      if (oid >= geometries_.size()) {
+        continue;
+      }
+      values.emplace_back(metadata_[oid].zmin, geometries_[oid].get());
+    }
+    std::sort(values.begin(), values.end(),
+              [](const auto& lhs, const auto& rhs) {
+                if (lhs.first != rhs.first) {
+                  return lhs.first < rhs.first;
+                }
+                return lhs.second < rhs.second;
+              });
+    base().bulk_load(values.data(), static_cast<int>(values.size()));
+    overlay_.bulk_load(ids);
+  }
+
+  bool insert(ObjectId oid) {
+    if (oid >= geometries_.size()) {
+      return false;
+    }
+    auto result = base().insert(metadata_[oid].zmin, geometries_[oid].get());
+    if (!result.second) {
+      return false;
+    }
+    return overlay_.insert(oid);
+  }
+
+  bool erase(ObjectId oid) {
+    if (oid >= geometries_.size()) {
+      return false;
+    }
+    int erased = base().erase_geo(metadata_[oid].zmin, geometries_[oid].get());
+    if (erased <= 0) {
+      return false;
+    }
+    return overlay_.erase(oid);
+  }
+
+  SimpleQueryResult query(const QueryCase& query_case) const {
+    return overlay_.query(query_case);
+  }
+
+  bool validate_index(std::string* message = nullptr) const {
+    return overlay_.validate_index(message);
+  }
+
+  std::size_t live_count() const { return overlay_.live_count(); }
+  std::size_t block_count() const { return overlay_.block_count(); }
+  std::size_t stale_block_count() const { return overlay_.stale_block_count(); }
+  std::size_t summary_rebuild_count() const {
+    return overlay_.summary_rebuild_count();
+  }
+  long long summary_rebuild_ns() const { return overlay_.summary_rebuild_ns(); }
+  std::size_t block_split_count() const { return overlay_.block_split_count(); }
+  std::size_t leaf_count() const {
+    return static_cast<std::size_t>(std::max(0, base().num_leaves()));
+  }
+  std::size_t index_bytes_estimate() const {
+    return static_cast<std::size_t>(
+               std::max<long long>(0, base().data_size() + base().model_size())) +
+           overlay_.index_bytes_estimate();
+  }
+
+ private:
+  BaseAlex& base() { return static_cast<BaseAlex&>(index_); }
+  const BaseAlex& base() const { return static_cast<const BaseAlex&>(index_); }
+
+  const Options& options_;
+  const std::vector<GeometryPtr>& geometries_;
+  const std::vector<GeometryMeta>& metadata_;
+  GlinIndex index_;
+  CompactQueryOverlay overlay_;
+};
+
 std::unordered_map<Geometry*, ObjectId> build_geometry_to_oid(
     const std::vector<GeometryPtr>& geometries) {
   std::unordered_map<Geometry*, ObjectId> map;
@@ -2514,6 +3029,131 @@ int main(int argc, char* argv[]) {
     rows.back().index_bytes_estimate = deli_alex.index_bytes_estimate();
     rows.back().note =
         "DELI-ALEX uses existing ALEX leaves plus IntervalOverlap-style leaf-group summaries.";
+    print_compare_summary(rows.back());
+
+    // DELI-ALEX-Hybrid: ALEX handles dynamic writes; a compact object-id
+    // block overlay handles exact-query pruning and cache-friendly scans.
+    DeliAlexHybridIndex deli_alex_hybrid(options, geometries,
+                                         geometry_metadata);
+    auto hybrid_build_start = std::chrono::high_resolution_clock::now();
+    deli_alex_hybrid.bulk_load(initial_ids);
+    auto hybrid_build_end = std::chrono::high_resolution_clock::now();
+    long long hybrid_build_ns = ns_count(hybrid_build_end - hybrid_build_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX_HYBRID", "after_bulkload", 0, geometries, queries,
+        live_after_bulkload, live_bulkload, initial_count, 0, 0,
+        hybrid_build_ns, 0, 0,
+        [&](const QueryCase& query_case) {
+          return deli_alex_hybrid.query(query_case);
+        }));
+    rows.back().block_count = deli_alex_hybrid.block_count();
+    rows.back().tree_nodes = deli_alex_hybrid.leaf_count();
+    rows.back().stale_block_count = deli_alex_hybrid.stale_block_count();
+    rows.back().summary_rebuild_count =
+        deli_alex_hybrid.summary_rebuild_count();
+    rows.back().summary_rebuild_ns = deli_alex_hybrid.summary_rebuild_ns();
+    rows.back().block_split_count = deli_alex_hybrid.block_split_count();
+    rows.back().index_bytes_estimate = deli_alex_hybrid.index_bytes_estimate();
+    {
+      std::string validation_message;
+      rows.back().validate_ok =
+          deli_alex_hybrid.validate_index(&validation_message) ? 1 : 0;
+      if (!rows.back().validate_ok) {
+        std::cerr << "DELI_ALEX_HYBRID validate_index failed at "
+                  << rows.back().checkpoint << ": " << validation_message
+                  << "\n";
+      }
+    }
+    rows.back().note =
+        "DELI-ALEX-Hybrid uses ALEX for writes plus a compact IntervalOverlap-style object-id overlay for queries.";
+    print_compare_summary(rows.back());
+
+    auto hybrid_insert_start = std::chrono::high_resolution_clock::now();
+    std::size_t hybrid_insert_success = 0;
+    std::size_t hybrid_insert_failed = 0;
+    for (ObjectId oid : insert_ids) {
+      if (deli_alex_hybrid.insert(oid)) {
+        ++hybrid_insert_success;
+      } else {
+        ++hybrid_insert_failed;
+      }
+    }
+    auto hybrid_insert_end = std::chrono::high_resolution_clock::now();
+    long long hybrid_insert_ns =
+        ns_count(hybrid_insert_end - hybrid_insert_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX_HYBRID", "after_insert", 1, geometries, queries,
+        live_after_insert, live_insert, initial_count, insert_count, 0,
+        hybrid_build_ns, hybrid_insert_ns, 0,
+        [&](const QueryCase& query_case) {
+          return deli_alex_hybrid.query(query_case);
+        }));
+    rows.back().success_count = hybrid_insert_success;
+    rows.back().failed_count = hybrid_insert_failed;
+    rows.back().block_count = deli_alex_hybrid.block_count();
+    rows.back().tree_nodes = deli_alex_hybrid.leaf_count();
+    rows.back().stale_block_count = deli_alex_hybrid.stale_block_count();
+    rows.back().summary_rebuild_count =
+        deli_alex_hybrid.summary_rebuild_count();
+    rows.back().summary_rebuild_ns = deli_alex_hybrid.summary_rebuild_ns();
+    rows.back().block_split_count = deli_alex_hybrid.block_split_count();
+    rows.back().index_bytes_estimate = deli_alex_hybrid.index_bytes_estimate();
+    {
+      std::string validation_message;
+      rows.back().validate_ok =
+          deli_alex_hybrid.validate_index(&validation_message) ? 1 : 0;
+      if (!rows.back().validate_ok) {
+        std::cerr << "DELI_ALEX_HYBRID validate_index failed at "
+                  << rows.back().checkpoint << ": " << validation_message
+                  << "\n";
+      }
+    }
+    rows.back().note =
+        "DELI-ALEX-Hybrid uses ALEX for writes plus a compact IntervalOverlap-style object-id overlay for queries.";
+    print_compare_summary(rows.back());
+
+    auto hybrid_delete_start = std::chrono::high_resolution_clock::now();
+    std::size_t hybrid_delete_success = 0;
+    std::size_t hybrid_delete_failed = 0;
+    for (ObjectId oid : delete_ids) {
+      if (deli_alex_hybrid.erase(oid)) {
+        ++hybrid_delete_success;
+      } else {
+        ++hybrid_delete_failed;
+      }
+    }
+    auto hybrid_delete_end = std::chrono::high_resolution_clock::now();
+    long long hybrid_delete_ns =
+        ns_count(hybrid_delete_end - hybrid_delete_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX_HYBRID", "after_delete", 2, geometries, queries,
+        live_after_delete, live_delete, initial_count, insert_count,
+        delete_count, hybrid_build_ns, hybrid_insert_ns, hybrid_delete_ns,
+        [&](const QueryCase& query_case) {
+          return deli_alex_hybrid.query(query_case);
+        }));
+    rows.back().success_count = hybrid_delete_success;
+    rows.back().failed_count = hybrid_delete_failed;
+    rows.back().block_count = deli_alex_hybrid.block_count();
+    rows.back().tree_nodes = deli_alex_hybrid.leaf_count();
+    rows.back().stale_block_count = deli_alex_hybrid.stale_block_count();
+    rows.back().summary_rebuild_count =
+        deli_alex_hybrid.summary_rebuild_count();
+    rows.back().summary_rebuild_ns = deli_alex_hybrid.summary_rebuild_ns();
+    rows.back().block_split_count = deli_alex_hybrid.block_split_count();
+    rows.back().index_bytes_estimate = deli_alex_hybrid.index_bytes_estimate();
+    {
+      std::string validation_message;
+      rows.back().validate_ok =
+          deli_alex_hybrid.validate_index(&validation_message) ? 1 : 0;
+      if (!rows.back().validate_ok) {
+        std::cerr << "DELI_ALEX_HYBRID validate_index failed at "
+                  << rows.back().checkpoint << ": " << validation_message
+                  << "\n";
+      }
+    }
+    rows.back().note =
+        "DELI-ALEX-Hybrid uses ALEX for writes plus a compact IntervalOverlap-style object-id overlay for queries.";
     print_compare_summary(rows.back());
 
     // Boost R-tree.
