@@ -1199,6 +1199,7 @@ class DeliAlexIndex {
               });
     base().bulk_load(values.data(), static_cast<int>(values.size()));
     rebuild_all_summaries();
+    mark_directory_dirty();
   }
 
   bool insert(ObjectId oid) {
@@ -1216,6 +1217,7 @@ class DeliAlexIndex {
     } else {
       expand_summary_on_insert(result.first.cur_leaf_, meta);
     }
+    mark_directory_dirty();
     return result.second;
   }
 
@@ -1237,6 +1239,7 @@ class DeliAlexIndex {
     } else {
       mark_summary_stale(touched_leaf);
     }
+    mark_directory_dirty();
     return true;
   }
 
@@ -1252,49 +1255,78 @@ class DeliAlexIndex {
     const geos::geom::Envelope query_envelope =
         *query_case.geometry->getEnvelopeInternal();
 
-    for (const Leaf* leaf = first_leaf(); leaf != nullptr;
-         leaf = leaf->next_leaf_) {
-      auto summary_it = summaries_.find(leaf);
-      if (summary_it != summaries_.end()) {
-        const LeafSummary& summary = summary_it->second;
-        if (!summary.has_live) {
-          continue;
-        }
-        if (summary.min_zmin > query_zmax) {
-          break;
-        }
-        if (summary.max_zmax < query_zmin) {
-          continue;
-        }
-        if (!envelopes_intersect(summary.mbr, query_envelope)) {
-          continue;
-        }
+    ensure_group_directory();
+    for (const LeafGroupSummary& group : group_directory_) {
+      if (!group.has_live) {
+        continue;
+      }
+      if (group.min_zmin > query_zmax) {
+        break;
+      }
+      if (group.max_zmax < query_zmin) {
+        continue;
+      }
+      if (!envelopes_intersect(group.mbr, query_envelope)) {
+        continue;
       }
 
-      for (int pos = 0; pos < leaf->data_capacity_; ++pos) {
-        if (!leaf->check_exists(pos)) {
-          continue;
+      for (const Leaf* leaf = group.first_leaf; leaf != nullptr;
+           leaf = leaf->next_leaf_) {
+        auto summary_it = summaries_.find(leaf);
+        if (summary_it != summaries_.end()) {
+          const LeafSummary& summary = summary_it->second;
+          if (!summary.has_live) {
+            if (leaf == group.last_leaf) {
+              break;
+            }
+            continue;
+          }
+          if (summary.min_zmin > query_zmax) {
+            break;
+          }
+          if (summary.max_zmax < query_zmin) {
+            if (leaf == group.last_leaf) {
+              break;
+            }
+            continue;
+          }
+          if (!envelopes_intersect(summary.mbr, query_envelope)) {
+            if (leaf == group.last_leaf) {
+              break;
+            }
+            continue;
+          }
         }
-        double zmin = leaf->get_key(pos);
-        if (zmin > query_zmax) {
+
+        for (int pos = 0; pos < leaf->data_capacity_; ++pos) {
+          if (!leaf->check_exists(pos)) {
+            continue;
+          }
+          double zmin = leaf->get_key(pos);
+          if (zmin > query_zmax) {
+            break;
+          }
+          Geometry* geometry = leaf->get_payload(pos);
+          const GeometryMeta* meta = find_meta(geometry);
+          if (meta == nullptr || meta->object_id >= live_.size() ||
+              !live_[meta->object_id]) {
+            continue;
+          }
+          if (meta->zmax < query_zmin) {
+            continue;
+          }
+          if (!envelopes_intersect(meta->envelope, query_envelope)) {
+            continue;
+          }
+          ++result.candidates;
+          ++result.exact_calls;
+          if (query_case.geometry->intersects(geometry)) {
+            result.answers.insert(meta->object_id);
+          }
+        }
+
+        if (leaf == group.last_leaf) {
           break;
-        }
-        Geometry* geometry = leaf->get_payload(pos);
-        const GeometryMeta* meta = find_meta(geometry);
-        if (meta == nullptr || meta->object_id >= live_.size() ||
-            !live_[meta->object_id]) {
-          continue;
-        }
-        if (meta->zmax < query_zmin) {
-          continue;
-        }
-        if (!envelopes_intersect(meta->envelope, query_envelope)) {
-          continue;
-        }
-        ++result.candidates;
-        ++result.exact_calls;
-        if (query_case.geometry->intersects(geometry)) {
-          result.answers.insert(meta->object_id);
         }
       }
     }
@@ -1306,6 +1338,11 @@ class DeliAlexIndex {
 
   std::size_t leaf_count() const {
     return static_cast<std::size_t>(std::max(0, base().num_leaves()));
+  }
+
+  std::size_t group_count() const {
+    ensure_group_directory();
+    return group_directory_.size();
   }
 
   std::size_t stale_leaf_count() const {
@@ -1320,11 +1357,19 @@ class DeliAlexIndex {
 
   std::size_t summary_rebuild_count() const { return summary_rebuild_count_; }
   long long summary_rebuild_ns() const { return summary_rebuild_ns_; }
+  std::size_t group_directory_rebuild_count() const {
+    return group_directory_rebuild_count_;
+  }
+  long long group_directory_rebuild_ns() const {
+    return group_directory_rebuild_ns_;
+  }
 
   std::size_t index_bytes_estimate() const {
+    ensure_group_directory();
     return static_cast<std::size_t>(
         std::max<long long>(0, base().data_size() + base().model_size())) +
            summaries_.size() * sizeof(LeafSummary) +
+           group_directory_.size() * sizeof(LeafGroupSummary) +
            live_.size() * sizeof(char) +
            geometry_to_meta_.size() *
                (sizeof(Geometry*) + sizeof(const GeometryMeta*));
@@ -1338,6 +1383,19 @@ class DeliAlexIndex {
     double max_zmax = -std::numeric_limits<double>::infinity();
     geos::geom::Envelope mbr;
     std::size_t live_count = 0;
+    bool stale = false;
+  };
+
+  struct LeafGroupSummary {
+    const Leaf* first_leaf = nullptr;
+    const Leaf* last_leaf = nullptr;
+    bool has_live = false;
+    double min_zmin = std::numeric_limits<double>::infinity();
+    double max_zmin = -std::numeric_limits<double>::infinity();
+    double max_zmax = -std::numeric_limits<double>::infinity();
+    geos::geom::Envelope mbr;
+    std::size_t live_count = 0;
+    std::size_t leaf_count = 0;
     bool stale = false;
   };
 
@@ -1468,6 +1526,71 @@ class DeliAlexIndex {
     }
   }
 
+  void mark_directory_dirty() const { group_directory_dirty_ = true; }
+
+  void ensure_group_directory() const {
+    if (!group_directory_dirty_) {
+      return;
+    }
+    rebuild_group_directory();
+  }
+
+  void add_leaf_to_group(LeafGroupSummary& group, const Leaf* leaf,
+                         const LeafSummary& summary) const {
+    if (group.first_leaf == nullptr) {
+      group.first_leaf = leaf;
+    }
+    group.last_leaf = leaf;
+    ++group.leaf_count;
+    group.stale = group.stale || summary.stale;
+    if (!summary.has_live) {
+      return;
+    }
+    if (!group.has_live) {
+      group.has_live = true;
+      group.min_zmin = summary.min_zmin;
+      group.max_zmin = summary.max_zmin;
+      group.max_zmax = summary.max_zmax;
+      group.mbr = summary.mbr;
+      group.live_count = summary.live_count;
+      return;
+    }
+    group.min_zmin = std::min(group.min_zmin, summary.min_zmin);
+    group.max_zmin = std::max(group.max_zmin, summary.max_zmin);
+    group.max_zmax = std::max(group.max_zmax, summary.max_zmax);
+    group.mbr.expandToInclude(&summary.mbr);
+    group.live_count += summary.live_count;
+  }
+
+  void rebuild_group_directory() const {
+    auto start = std::chrono::high_resolution_clock::now();
+    group_directory_.clear();
+    const std::size_t target_records =
+        std::max<std::size_t>(1, options_.block_size);
+
+    LeafGroupSummary current;
+    for (const Leaf* leaf = first_leaf(); leaf != nullptr;
+         leaf = leaf->next_leaf_) {
+      auto it = summaries_.find(leaf);
+      if (it == summaries_.end()) {
+        continue;
+      }
+      add_leaf_to_group(current, leaf, it->second);
+      if (current.live_count >= target_records) {
+        group_directory_.push_back(current);
+        current = LeafGroupSummary();
+      }
+    }
+    if (current.first_leaf != nullptr) {
+      group_directory_.push_back(current);
+    }
+
+    group_directory_dirty_ = false;
+    auto end = std::chrono::high_resolution_clock::now();
+    ++group_directory_rebuild_count_;
+    group_directory_rebuild_ns_ += ns_count(end - start);
+  }
+
   const Options& options_;
   const std::vector<GeometryPtr>& geometries_;
   const std::vector<GeometryMeta>& metadata_;
@@ -1475,6 +1598,10 @@ class DeliAlexIndex {
   std::vector<char> live_;
   std::unordered_map<Geometry*, const GeometryMeta*> geometry_to_meta_;
   std::unordered_map<const Leaf*, LeafSummary> summaries_;
+  mutable std::vector<LeafGroupSummary> group_directory_;
+  mutable bool group_directory_dirty_ = true;
+  mutable std::size_t group_directory_rebuild_count_ = 0;
+  mutable long long group_directory_rebuild_ns_ = 0;
   std::size_t summary_rebuild_count_ = 0;
   long long summary_rebuild_ns_ = 0;
 };
@@ -2305,13 +2432,17 @@ int main(int argc, char* argv[]) {
         [&](const QueryCase& query_case) {
           return deli_alex.query(query_case);
         }));
-    rows.back().block_count = deli_alex.leaf_count();
+    rows.back().block_count = deli_alex.group_count();
+    rows.back().tree_nodes = deli_alex.leaf_count();
     rows.back().stale_block_count = deli_alex.stale_leaf_count();
-    rows.back().summary_rebuild_count = deli_alex.summary_rebuild_count();
-    rows.back().summary_rebuild_ns = deli_alex.summary_rebuild_ns();
+    rows.back().summary_rebuild_count =
+        deli_alex.summary_rebuild_count() +
+        deli_alex.group_directory_rebuild_count();
+    rows.back().summary_rebuild_ns =
+        deli_alex.summary_rebuild_ns() + deli_alex.group_directory_rebuild_ns();
     rows.back().index_bytes_estimate = deli_alex.index_bytes_estimate();
     rows.back().note =
-        "DELI-ALEX uses existing ALEX leaves plus external DELI leaf summaries.";
+        "DELI-ALEX uses existing ALEX leaves plus IntervalOverlap-style leaf-group summaries.";
     print_compare_summary(rows.back());
 
     auto deli_alex_insert_start = std::chrono::high_resolution_clock::now();
@@ -2336,13 +2467,17 @@ int main(int argc, char* argv[]) {
         }));
     rows.back().success_count = deli_alex_insert_success;
     rows.back().failed_count = deli_alex_insert_failed;
-    rows.back().block_count = deli_alex.leaf_count();
+    rows.back().block_count = deli_alex.group_count();
+    rows.back().tree_nodes = deli_alex.leaf_count();
     rows.back().stale_block_count = deli_alex.stale_leaf_count();
-    rows.back().summary_rebuild_count = deli_alex.summary_rebuild_count();
-    rows.back().summary_rebuild_ns = deli_alex.summary_rebuild_ns();
+    rows.back().summary_rebuild_count =
+        deli_alex.summary_rebuild_count() +
+        deli_alex.group_directory_rebuild_count();
+    rows.back().summary_rebuild_ns =
+        deli_alex.summary_rebuild_ns() + deli_alex.group_directory_rebuild_ns();
     rows.back().index_bytes_estimate = deli_alex.index_bytes_estimate();
     rows.back().note =
-        "DELI-ALEX uses existing ALEX leaves plus external DELI leaf summaries.";
+        "DELI-ALEX uses existing ALEX leaves plus IntervalOverlap-style leaf-group summaries.";
     print_compare_summary(rows.back());
 
     auto deli_alex_delete_start = std::chrono::high_resolution_clock::now();
@@ -2368,13 +2503,17 @@ int main(int argc, char* argv[]) {
         }));
     rows.back().success_count = deli_alex_delete_success;
     rows.back().failed_count = deli_alex_delete_failed;
-    rows.back().block_count = deli_alex.leaf_count();
+    rows.back().block_count = deli_alex.group_count();
+    rows.back().tree_nodes = deli_alex.leaf_count();
     rows.back().stale_block_count = deli_alex.stale_leaf_count();
-    rows.back().summary_rebuild_count = deli_alex.summary_rebuild_count();
-    rows.back().summary_rebuild_ns = deli_alex.summary_rebuild_ns();
+    rows.back().summary_rebuild_count =
+        deli_alex.summary_rebuild_count() +
+        deli_alex.group_directory_rebuild_count();
+    rows.back().summary_rebuild_ns =
+        deli_alex.summary_rebuild_ns() + deli_alex.group_directory_rebuild_ns();
     rows.back().index_bytes_estimate = deli_alex.index_bytes_estimate();
     rows.back().note =
-        "DELI-ALEX uses existing ALEX leaves plus external DELI leaf summaries.";
+        "DELI-ALEX uses existing ALEX leaves plus IntervalOverlap-style leaf-group summaries.";
     print_compare_summary(rows.back());
 
     // Boost R-tree.

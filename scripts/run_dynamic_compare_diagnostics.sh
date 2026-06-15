@@ -44,7 +44,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 
 常用参数：
   DATASETS
-    默认 ZGAP_MIXED。可选：AW LW ROADS PARKS UNIF_S DIAG_S ZGAP_MIXED。
+    默认 ZGAP_MIXED。可选：AW LW ROADS PARKS UNIF_S DIAG_S ZGAP_WIDE ZGAP_MIXED。
 
   LIMIT
     每个数据集最多加载多少条 geometry。默认 1000000。
@@ -61,6 +61,11 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   INITIAL_FRACTION / INSERT_FRACTION / DELETE_FRACTION
     默认 0.5 / 0.2 / 0.1。
 
+  AUTO_GENERATE_QUERIES
+    0：缺 query 文件就报错。
+    1：缺 query 文件时调用 JTS STRtree KNN query generator 自动生成。
+    默认：0。
+
 输出：
   RESULT_DIR/dynamic_compare_summary.csv
   FIGURE_DIR/dynamic_compare_*.png
@@ -72,6 +77,8 @@ LIMIT="${LIMIT:-1000000}"
 QUERY_LIMIT="${QUERY_LIMIT:-$LIMIT}"
 DATASETS="${DATASETS:-ZGAP_MIXED}"
 DATA_ROOT="${DATA_ROOT:-/mnt/hgfs}"
+ZGAP_WORK_DIR="${ZGAP_WORK_DIR:-data/synthetic/zrange_gap}"
+ZGAP_MIXED_WORK_DIR="${ZGAP_MIXED_WORK_DIR:-data/synthetic/zrange_gap_mixed_${LIMIT}}"
 QUERY_ROOT="${QUERY_ROOT:-queries/dynamic_compare_${QUERY_LIMIT}}"
 RESULT_DIR="${RESULT_DIR:-results/dynamic_compare_${LIMIT}}"
 FIGURE_DIR="${FIGURE_DIR:-figures/dynamic_compare_${LIMIT}}"
@@ -95,6 +102,8 @@ RESET_RESULTS="${RESET_RESULTS:-1}"
 OVERWRITE="${OVERWRITE:-0}"
 PLOT_RESULTS="${PLOT_RESULTS:-1}"
 EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-}"
+AUTO_GENERATE_QUERIES="${AUTO_GENERATE_QUERIES:-0}"
+REGENERATE_QUERIES="${REGENERATE_QUERIES:-0}"
 
 if [[ "$RUN_BENCHMARKS" == "0" && "$RESET_RESULTS" == "1" ]]; then
   echo "Error: RUN_BENCHMARKS=0 时不能使用 RESET_RESULTS=1，否则会删掉已有结果。" >&2
@@ -117,7 +126,8 @@ declare -A DATA_FILES=(
   [PARKS]="$DATA_ROOT/parks"
   [UNIF_S]="data/synthetic/rectangles/UNIF_S.wkt"
   [DIAG_S]="data/synthetic/rectangles/DIAG_S.wkt"
-  [ZGAP_MIXED]="data/synthetic/zrange_gap_mixed_${LIMIT}/ZGAP_MIXED.wkt"
+  [ZGAP_WIDE]="$ZGAP_WORK_DIR/ZGAP_WIDE.wkt"
+  [ZGAP_MIXED]="$ZGAP_MIXED_WORK_DIR/ZGAP_MIXED.wkt"
 )
 
 data_file_for_dataset() {
@@ -146,6 +156,48 @@ should_run_file() {
   [[ "$OVERWRITE" == "1" || ! -s "$path" ]]
 }
 
+generate_queries_if_needed() {
+  local dataset="$1"
+  local data_file="$2"
+  local needs_generation="$REGENERATE_QUERIES"
+  local reason=""
+
+  if [[ "$REGENERATE_QUERIES" == "1" ]]; then
+    reason="REGENERATE_QUERIES=1"
+  fi
+
+  for tag in $SELECTIVITY_TAGS; do
+    local query_file
+    query_file="$(query_file_for_dataset "$dataset" "$tag")"
+    if [[ ! -s "$query_file" ]]; then
+      needs_generation=1
+      reason="missing query file: $query_file"
+    fi
+  done
+
+  if [[ "$needs_generation" != "1" ]]; then
+    return
+  fi
+
+  if [[ "$AUTO_GENERATE_QUERIES" != "1" && "$REGENERATE_QUERIES" != "1" ]]; then
+    echo "Error: query file for $dataset under $QUERY_ROOT needs generation." >&2
+    echo "Reason: $reason" >&2
+    echo "请先用 run_interval_overlap_diagnostics.sh 生成 query，设置正确 QUERY_ROOT，或加 AUTO_GENERATE_QUERIES=1。" >&2
+    exit 1
+  fi
+
+  if [[ -n "$reason" ]]; then
+    echo "Generating queries for $dataset: $reason"
+  fi
+  mkdir -p "$QUERY_ROOT"
+  scripts/generate_jts_strtree_knn_queries.sh \
+    "$(realpath "$data_file")" \
+    "$QUERY_ROOT/${dataset}_jts_strtree_knn" \
+    "$QUERY_LIMIT" \
+    "$QUERY_COUNT" \
+    "$SEED"
+}
+
 if [[ "$RUN_BENCHMARKS" == "1" ]]; then
   for dataset in $DATASETS; do
     data_file="$(data_file_for_dataset "$dataset")"
@@ -153,6 +205,7 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
       echo "Error: data file not found: $data_file" >&2
       exit 1
     fi
+    generate_queries_if_needed "$dataset" "$data_file"
 
     for tag in $SELECTIVITY_TAGS; do
       query_file="$(query_file_for_dataset "$dataset" "$tag")"
