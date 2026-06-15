@@ -2125,8 +2125,12 @@ class BufferedCompactQueryOverlay {
  public:
   BufferedCompactQueryOverlay(const Options& options,
                               const std::vector<GeometryPtr>& geometries,
-                              const std::vector<GeometryMeta>& metadata)
-      : options_(options), geometries_(geometries), metadata_(metadata) {
+                              const std::vector<GeometryMeta>& metadata,
+                              bool bounded_delta = false)
+      : options_(options),
+        geometries_(geometries),
+        metadata_(metadata),
+        bounded_delta_(bounded_delta) {
     live_.assign(geometries.size(), 0);
     open_block_.block_id = next_block_id_++;
   }
@@ -2152,6 +2156,7 @@ class BufferedCompactQueryOverlay {
       rebuild_block_summary(block.get());
       main_blocks_.push_back(std::move(block));
     }
+    adaptive_delta_record_bound_ = estimate_adaptive_delta_record_bound();
   }
 
   bool insert(ObjectId oid) {
@@ -2160,9 +2165,14 @@ class BufferedCompactQueryOverlay {
     }
     live_[oid] = 1;
     open_block_.ids.push_back(oid);
+    ++delta_record_count_;
     expand_summary_on_insert(open_block_, metadata_[oid]);
     if (open_block_.ids.size() >= options_.block_size) {
       seal_open_block();
+    }
+    if (bounded_delta_ &&
+        delta_record_count_ >= adaptive_delta_record_bound_) {
+      promote_delta_blocks_to_main();
     }
     return true;
   }
@@ -2252,7 +2262,12 @@ class BufferedCompactQueryOverlay {
   }
   std::size_t summary_rebuild_count() const { return summary_rebuild_count_; }
   long long summary_rebuild_ns() const { return summary_rebuild_ns_; }
-  std::size_t block_split_count() const { return delta_blocks_.size(); }
+  std::size_t block_split_count() const {
+    return bounded_delta_ ? compaction_count_ : delta_blocks_.size();
+  }
+  std::size_t adaptive_delta_record_bound() const {
+    return adaptive_delta_record_bound_;
+  }
 
   std::size_t index_bytes_estimate() const {
     std::size_t bytes = live_.size() * sizeof(char);
@@ -2355,6 +2370,132 @@ class BufferedCompactQueryOverlay {
 
     open_block_ = CompactOverlayBlock();
     open_block_.block_id = next_block_id_++;
+  }
+
+  std::size_t estimate_adaptive_delta_record_bound() const {
+    if (main_blocks_.empty()) {
+      return std::max<std::size_t>(options_.block_size, 1);
+    }
+
+    const double block_count = static_cast<double>(main_blocks_.size());
+    double target_blocks = std::max(std::sqrt(block_count), block_count * 0.08);
+
+    geos::geom::Envelope dataset_mbr;
+    bool has_mbr = false;
+    std::vector<double> z_spans;
+    z_spans.reserve(main_blocks_.size());
+    double total_block_area = 0.0;
+    std::size_t area_blocks = 0;
+    for (const auto& block : main_blocks_) {
+      if (block->live_count == 0) {
+        continue;
+      }
+      if (!has_mbr) {
+        dataset_mbr = block->mbr;
+        has_mbr = true;
+      } else {
+        dataset_mbr.expandToInclude(&block->mbr);
+      }
+      const double width = std::max(0.0, block->mbr.getMaxX() - block->mbr.getMinX());
+      const double height = std::max(0.0, block->mbr.getMaxY() - block->mbr.getMinY());
+      total_block_area += width * height;
+      ++area_blocks;
+      z_spans.push_back(std::max(0.0, block->max_zmin - block->min_zmin));
+    }
+
+    double distribution_factor = 1.0;
+    if (has_mbr && area_blocks > 0) {
+      const double dataset_width =
+          std::max(0.0, dataset_mbr.getMaxX() - dataset_mbr.getMinX());
+      const double dataset_height =
+          std::max(0.0, dataset_mbr.getMaxY() - dataset_mbr.getMinY());
+      const double dataset_area = dataset_width * dataset_height;
+      if (dataset_area > 0.0) {
+        const double avg_area_ratio =
+            (total_block_area / static_cast<double>(area_blocks)) / dataset_area;
+        if (avg_area_ratio > 0.02) {
+          distribution_factor *= 0.60;
+        } else if (avg_area_ratio < 0.002) {
+          distribution_factor *= 1.25;
+        }
+      }
+    }
+
+    if (z_spans.size() > 1) {
+      const double mean =
+          std::accumulate(z_spans.begin(), z_spans.end(), 0.0) /
+          static_cast<double>(z_spans.size());
+      if (mean > 0.0) {
+        double variance = 0.0;
+        for (double span : z_spans) {
+          const double diff = span - mean;
+          variance += diff * diff;
+        }
+        variance /= static_cast<double>(z_spans.size());
+        const double cv = std::sqrt(variance) / mean;
+        if (cv > 2.0) {
+          distribution_factor *= 0.70;
+        } else if (cv < 0.75) {
+          distribution_factor *= 1.15;
+        }
+      }
+    }
+
+    target_blocks *= distribution_factor;
+    const std::size_t min_blocks = 16;
+    const std::size_t max_blocks = 256;
+    std::size_t bounded_blocks = static_cast<std::size_t>(std::ceil(target_blocks));
+    bounded_blocks = std::max(min_blocks, std::min(max_blocks, bounded_blocks));
+    return std::max<std::size_t>(options_.block_size,
+                                 bounded_blocks * options_.block_size);
+  }
+
+  void promote_delta_blocks_to_main() {
+    if (!open_block_.ids.empty()) {
+      seal_open_block();
+    }
+    if (delta_blocks_.empty()) {
+      delta_record_count_ = 0;
+      return;
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+    std::vector<ObjectId> ids;
+    ids.reserve(live_count());
+    for (const auto& block : main_blocks_) {
+      for (ObjectId oid : block->ids) {
+        if (oid < live_.size() && live_[oid]) {
+          ids.push_back(oid);
+        }
+      }
+    }
+    for (const auto& block : delta_blocks_) {
+      for (ObjectId oid : block->ids) {
+        if (oid < live_.size() && live_[oid]) {
+          ids.push_back(oid);
+        }
+      }
+    }
+    std::sort(ids.begin(), ids.end(), ObjectIdLess(metadata_));
+
+    main_blocks_.clear();
+    delta_blocks_.clear();
+    main_blocks_.reserve((ids.size() + options_.block_size - 1) /
+                         options_.block_size);
+    for (std::size_t begin = 0; begin < ids.size();
+         begin += options_.block_size) {
+      std::size_t end = std::min(begin + options_.block_size, ids.size());
+      std::unique_ptr<CompactOverlayBlock> block(new CompactOverlayBlock());
+      block->block_id = next_block_id_++;
+      block->ids.assign(ids.begin() + begin, ids.begin() + end);
+      rebuild_block_summary(block.get());
+      main_blocks_.push_back(std::move(block));
+    }
+    delta_record_count_ = 0;
+    ++compaction_count_;
+    auto end = std::chrono::high_resolution_clock::now();
+    ++summary_rebuild_count_;
+    summary_rebuild_ns_ += ns_count(end - start);
   }
 
   void query_sorted_block(const CompactOverlayBlock& block,
@@ -2493,12 +2634,16 @@ class BufferedCompactQueryOverlay {
   const Options& options_;
   const std::vector<GeometryPtr>& geometries_;
   const std::vector<GeometryMeta>& metadata_;
+  bool bounded_delta_ = false;
   std::vector<char> live_;
   std::vector<std::unique_ptr<CompactOverlayBlock>> main_blocks_;
   std::vector<std::unique_ptr<CompactOverlayBlock>> delta_blocks_;
   CompactOverlayBlock open_block_;
   std::uint64_t next_block_id_ = 0;
   std::size_t dead_count_ = 0;
+  std::size_t delta_record_count_ = 0;
+  std::size_t adaptive_delta_record_bound_ = 0;
+  std::size_t compaction_count_ = 0;
   mutable std::size_t summary_rebuild_count_ = 0;
   mutable long long summary_rebuild_ns_ = 0;
 };
@@ -2510,11 +2655,12 @@ class DeliAlexHybridBufferedIndex {
 
   DeliAlexHybridBufferedIndex(const Options& options,
                               const std::vector<GeometryPtr>& geometries,
-                              const std::vector<GeometryMeta>& metadata)
+                              const std::vector<GeometryMeta>& metadata,
+                              bool bounded_delta = false)
       : options_(options),
         geometries_(geometries),
         metadata_(metadata),
-        overlay_(options, geometries, metadata) {}
+        overlay_(options, geometries, metadata, bounded_delta) {}
 
   void bulk_load(const std::vector<ObjectId>& ids) {
     std::vector<std::pair<double, Geometry*>> values;
@@ -2573,6 +2719,9 @@ class DeliAlexHybridBufferedIndex {
   }
   long long summary_rebuild_ns() const { return overlay_.summary_rebuild_ns(); }
   std::size_t block_split_count() const { return overlay_.block_split_count(); }
+  std::size_t adaptive_delta_record_bound() const {
+    return overlay_.adaptive_delta_record_bound();
+  }
   std::size_t leaf_count() const {
     return static_cast<std::size_t>(std::max(0, base().num_leaves()));
   }
@@ -3759,6 +3908,150 @@ int main(int argc, char* argv[]) {
     }
     rows.back().note =
         "DELI-ALEX-Hybrid-Buf appends inserts into compact delta blocks to reduce foreground overlay maintenance.";
+    print_compare_summary(rows.back());
+
+    // DELI-ALEX-Hybrid-Bounded: keep delta writes cheap, but periodically
+    // promote bounded delta blocks into the ordered query directory.
+    DeliAlexHybridBufferedIndex deli_alex_hybrid_bounded(
+        options, geometries, geometry_metadata, true);
+    auto hybrid_bounded_build_start = std::chrono::high_resolution_clock::now();
+    deli_alex_hybrid_bounded.bulk_load(initial_ids);
+    auto hybrid_bounded_build_end = std::chrono::high_resolution_clock::now();
+    long long hybrid_bounded_build_ns =
+        ns_count(hybrid_bounded_build_end - hybrid_bounded_build_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX_HYBRID_BOUNDED", "after_bulkload", 0, geometries,
+        queries, live_after_bulkload, live_bulkload, initial_count, 0, 0,
+        hybrid_bounded_build_ns, 0, 0,
+        [&](const QueryCase& query_case) {
+          return deli_alex_hybrid_bounded.query(query_case);
+        }));
+    rows.back().block_count = deli_alex_hybrid_bounded.block_count();
+    rows.back().tree_nodes = deli_alex_hybrid_bounded.leaf_count();
+    rows.back().stale_block_count =
+        deli_alex_hybrid_bounded.stale_block_count();
+    rows.back().summary_rebuild_count =
+        deli_alex_hybrid_bounded.summary_rebuild_count();
+    rows.back().summary_rebuild_ns =
+        deli_alex_hybrid_bounded.summary_rebuild_ns();
+    rows.back().block_split_count =
+        deli_alex_hybrid_bounded.block_split_count();
+    rows.back().index_bytes_estimate =
+        deli_alex_hybrid_bounded.index_bytes_estimate();
+    {
+      std::string validation_message;
+      rows.back().validate_ok =
+          deli_alex_hybrid_bounded.validate_index(&validation_message) ? 1 : 0;
+      if (!rows.back().validate_ok) {
+        std::cerr << "DELI_ALEX_HYBRID_BOUNDED validate_index failed at "
+                  << rows.back().checkpoint << ": " << validation_message
+                  << "\n";
+      }
+    }
+    rows.back().note =
+        "DELI-ALEX-Hybrid-Bounded uses adaptive delta promotion; adaptive_bound_records=" +
+        std::to_string(deli_alex_hybrid_bounded.adaptive_delta_record_bound());
+    print_compare_summary(rows.back());
+
+    auto hybrid_bounded_insert_start =
+        std::chrono::high_resolution_clock::now();
+    std::size_t hybrid_bounded_insert_success = 0;
+    std::size_t hybrid_bounded_insert_failed = 0;
+    for (ObjectId oid : insert_ids) {
+      if (deli_alex_hybrid_bounded.insert(oid)) {
+        ++hybrid_bounded_insert_success;
+      } else {
+        ++hybrid_bounded_insert_failed;
+      }
+    }
+    auto hybrid_bounded_insert_end = std::chrono::high_resolution_clock::now();
+    long long hybrid_bounded_insert_ns =
+        ns_count(hybrid_bounded_insert_end - hybrid_bounded_insert_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX_HYBRID_BOUNDED", "after_insert", 1, geometries,
+        queries, live_after_insert, live_insert, initial_count, insert_count, 0,
+        hybrid_bounded_build_ns, hybrid_bounded_insert_ns, 0,
+        [&](const QueryCase& query_case) {
+          return deli_alex_hybrid_bounded.query(query_case);
+        }));
+    rows.back().success_count = hybrid_bounded_insert_success;
+    rows.back().failed_count = hybrid_bounded_insert_failed;
+    rows.back().block_count = deli_alex_hybrid_bounded.block_count();
+    rows.back().tree_nodes = deli_alex_hybrid_bounded.leaf_count();
+    rows.back().stale_block_count =
+        deli_alex_hybrid_bounded.stale_block_count();
+    rows.back().summary_rebuild_count =
+        deli_alex_hybrid_bounded.summary_rebuild_count();
+    rows.back().summary_rebuild_ns =
+        deli_alex_hybrid_bounded.summary_rebuild_ns();
+    rows.back().block_split_count =
+        deli_alex_hybrid_bounded.block_split_count();
+    rows.back().index_bytes_estimate =
+        deli_alex_hybrid_bounded.index_bytes_estimate();
+    {
+      std::string validation_message;
+      rows.back().validate_ok =
+          deli_alex_hybrid_bounded.validate_index(&validation_message) ? 1 : 0;
+      if (!rows.back().validate_ok) {
+        std::cerr << "DELI_ALEX_HYBRID_BOUNDED validate_index failed at "
+                  << rows.back().checkpoint << ": " << validation_message
+                  << "\n";
+      }
+    }
+    rows.back().note =
+        "DELI-ALEX-Hybrid-Bounded uses adaptive delta promotion; adaptive_bound_records=" +
+        std::to_string(deli_alex_hybrid_bounded.adaptive_delta_record_bound());
+    print_compare_summary(rows.back());
+
+    auto hybrid_bounded_delete_start =
+        std::chrono::high_resolution_clock::now();
+    std::size_t hybrid_bounded_delete_success = 0;
+    std::size_t hybrid_bounded_delete_failed = 0;
+    for (ObjectId oid : delete_ids) {
+      if (deli_alex_hybrid_bounded.erase(oid)) {
+        ++hybrid_bounded_delete_success;
+      } else {
+        ++hybrid_bounded_delete_failed;
+      }
+    }
+    auto hybrid_bounded_delete_end = std::chrono::high_resolution_clock::now();
+    long long hybrid_bounded_delete_ns =
+        ns_count(hybrid_bounded_delete_end - hybrid_bounded_delete_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX_HYBRID_BOUNDED", "after_delete", 2, geometries,
+        queries, live_after_delete, live_delete, initial_count, insert_count,
+        delete_count, hybrid_bounded_build_ns, hybrid_bounded_insert_ns,
+        hybrid_bounded_delete_ns,
+        [&](const QueryCase& query_case) {
+          return deli_alex_hybrid_bounded.query(query_case);
+        }));
+    rows.back().success_count = hybrid_bounded_delete_success;
+    rows.back().failed_count = hybrid_bounded_delete_failed;
+    rows.back().block_count = deli_alex_hybrid_bounded.block_count();
+    rows.back().tree_nodes = deli_alex_hybrid_bounded.leaf_count();
+    rows.back().stale_block_count =
+        deli_alex_hybrid_bounded.stale_block_count();
+    rows.back().summary_rebuild_count =
+        deli_alex_hybrid_bounded.summary_rebuild_count();
+    rows.back().summary_rebuild_ns =
+        deli_alex_hybrid_bounded.summary_rebuild_ns();
+    rows.back().block_split_count =
+        deli_alex_hybrid_bounded.block_split_count();
+    rows.back().index_bytes_estimate =
+        deli_alex_hybrid_bounded.index_bytes_estimate();
+    {
+      std::string validation_message;
+      rows.back().validate_ok =
+          deli_alex_hybrid_bounded.validate_index(&validation_message) ? 1 : 0;
+      if (!rows.back().validate_ok) {
+        std::cerr << "DELI_ALEX_HYBRID_BOUNDED validate_index failed at "
+                  << rows.back().checkpoint << ": " << validation_message
+                  << "\n";
+      }
+    }
+    rows.back().note =
+        "DELI-ALEX-Hybrid-Bounded uses adaptive delta promotion; adaptive_bound_records=" +
+        std::to_string(deli_alex_hybrid_bounded.adaptive_delta_record_bound());
     print_compare_summary(rows.back());
 
     // Boost R-tree.
