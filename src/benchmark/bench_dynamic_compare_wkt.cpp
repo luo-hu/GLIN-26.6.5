@@ -133,6 +133,13 @@ struct QueryResult {
   std::unordered_set<ObjectId> answers;
 };
 
+struct GeometryMeta {
+  ObjectId object_id = 0;
+  double zmin = 0.0;
+  double zmax = 0.0;
+  geos::geom::Envelope envelope;
+};
+
 struct QueryAggregate {
   std::vector<long long> latencies_ns;
   std::size_t prefix_blocks = 0;
@@ -1153,6 +1160,325 @@ void add_simple_query_result(SimpleQueryAggregate& aggregate,
   }
 }
 
+class DeliAlexIndex {
+ public:
+  using BaseAlex = alex::Alex<double, Geometry*>;
+  using GlinIndex = alex::Glin<double, Geometry*>;
+  using Leaf = typename BaseAlex::data_node_type;
+  using ModelNode = typename BaseAlex::model_node_type;
+
+  DeliAlexIndex(const Options& options,
+                const std::vector<GeometryPtr>& geometries,
+                const std::vector<GeometryMeta>& metadata)
+      : options_(options), geometries_(geometries), metadata_(metadata) {
+    live_.assign(geometries.size(), 0);
+    geometry_to_meta_.reserve(geometries.size());
+    for (const GeometryMeta& meta : metadata_) {
+      if (meta.object_id < geometries_.size()) {
+        geometry_to_meta_[geometries_[meta.object_id].get()] = &meta;
+      }
+    }
+  }
+
+  void bulk_load(const std::vector<ObjectId>& ids) {
+    std::vector<std::pair<double, Geometry*>> values;
+    values.reserve(ids.size());
+    for (ObjectId oid : ids) {
+      if (oid >= geometries_.size()) {
+        continue;
+      }
+      values.emplace_back(metadata_[oid].zmin, geometries_[oid].get());
+      live_[oid] = 1;
+    }
+    std::sort(values.begin(), values.end(),
+              [](const auto& lhs, const auto& rhs) {
+                if (lhs.first != rhs.first) {
+                  return lhs.first < rhs.first;
+                }
+                return lhs.second < rhs.second;
+              });
+    base().bulk_load(values.data(), static_cast<int>(values.size()));
+    rebuild_all_summaries();
+  }
+
+  bool insert(ObjectId oid) {
+    if (oid >= geometries_.size()) {
+      return false;
+    }
+    const GeometryMeta& meta = metadata_[oid];
+    const int leaves_before = base().num_leaves();
+    auto result = base().insert(meta.zmin, geometries_[oid].get());
+    live_[oid] = result.second ? 1 : live_[oid];
+    const int leaves_after = base().num_leaves();
+    if (leaves_after != leaves_before || result.first.cur_leaf_ == nullptr ||
+        summaries_.find(result.first.cur_leaf_) == summaries_.end()) {
+      refresh_local_summaries(meta.zmin);
+    } else {
+      expand_summary_on_insert(result.first.cur_leaf_, meta);
+    }
+    return result.second;
+  }
+
+  bool erase(ObjectId oid) {
+    if (oid >= geometries_.size() || !live_[oid]) {
+      return false;
+    }
+    const GeometryMeta& meta = metadata_[oid];
+    const int leaves_before = base().num_leaves();
+    const Leaf* touched_leaf = base().get_leaf(meta.zmin);
+    int erased = base().erase_geo(meta.zmin, geometries_[oid].get());
+    if (erased <= 0) {
+      return false;
+    }
+    live_[oid] = 0;
+    const int leaves_after = base().num_leaves();
+    if (leaves_after != leaves_before) {
+      summaries_.erase(touched_leaf);
+    } else {
+      mark_summary_stale(touched_leaf);
+    }
+    return true;
+  }
+
+  SimpleQueryResult query(const QueryCase& query_case) const {
+    auto start = std::chrono::high_resolution_clock::now();
+    SimpleQueryResult result;
+
+    double query_zmin = 0.0;
+    double query_zmax = 0.0;
+    curve_shape_projection(query_case.geometry, "z", options_.cell_xmin,
+                           options_.cell_ymin, options_.cell_size,
+                           options_.cell_size, query_zmin, query_zmax);
+    const geos::geom::Envelope query_envelope =
+        *query_case.geometry->getEnvelopeInternal();
+
+    for (const Leaf* leaf = first_leaf(); leaf != nullptr;
+         leaf = leaf->next_leaf_) {
+      auto summary_it = summaries_.find(leaf);
+      if (summary_it != summaries_.end()) {
+        const LeafSummary& summary = summary_it->second;
+        if (!summary.has_live) {
+          continue;
+        }
+        if (summary.min_zmin > query_zmax) {
+          break;
+        }
+        if (summary.max_zmax < query_zmin) {
+          continue;
+        }
+        if (!envelopes_intersect(summary.mbr, query_envelope)) {
+          continue;
+        }
+      }
+
+      for (int pos = 0; pos < leaf->data_capacity_; ++pos) {
+        if (!leaf->check_exists(pos)) {
+          continue;
+        }
+        double zmin = leaf->get_key(pos);
+        if (zmin > query_zmax) {
+          break;
+        }
+        Geometry* geometry = leaf->get_payload(pos);
+        const GeometryMeta* meta = find_meta(geometry);
+        if (meta == nullptr || meta->object_id >= live_.size() ||
+            !live_[meta->object_id]) {
+          continue;
+        }
+        if (meta->zmax < query_zmin) {
+          continue;
+        }
+        if (!envelopes_intersect(meta->envelope, query_envelope)) {
+          continue;
+        }
+        ++result.candidates;
+        ++result.exact_calls;
+        if (query_case.geometry->intersects(geometry)) {
+          result.answers.insert(meta->object_id);
+        }
+      }
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    result.query_ns = ns_count(end - start);
+    return result;
+  }
+
+  std::size_t leaf_count() const {
+    return static_cast<std::size_t>(std::max(0, base().num_leaves()));
+  }
+
+  std::size_t stale_leaf_count() const {
+    std::size_t count = 0;
+    for (const auto& item : summaries_) {
+      if (item.second.stale) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  std::size_t summary_rebuild_count() const { return summary_rebuild_count_; }
+  long long summary_rebuild_ns() const { return summary_rebuild_ns_; }
+
+  std::size_t index_bytes_estimate() const {
+    return static_cast<std::size_t>(
+        std::max<long long>(0, base().data_size() + base().model_size())) +
+           summaries_.size() * sizeof(LeafSummary) +
+           live_.size() * sizeof(char) +
+           geometry_to_meta_.size() *
+               (sizeof(Geometry*) + sizeof(const GeometryMeta*));
+  }
+
+ private:
+  struct LeafSummary {
+    bool has_live = false;
+    double min_zmin = std::numeric_limits<double>::infinity();
+    double max_zmin = -std::numeric_limits<double>::infinity();
+    double max_zmax = -std::numeric_limits<double>::infinity();
+    geos::geom::Envelope mbr;
+    std::size_t live_count = 0;
+    bool stale = false;
+  };
+
+  BaseAlex& base() { return static_cast<BaseAlex&>(index_); }
+  const BaseAlex& base() const { return static_cast<const BaseAlex&>(index_); }
+
+  Leaf* first_leaf() {
+    alex::AlexNode<double, Geometry*>* node = base().root_node_;
+    if (node == nullptr) {
+      return nullptr;
+    }
+    while (!node->is_leaf_) {
+      node = static_cast<ModelNode*>(node)->children_[0];
+    }
+    return static_cast<Leaf*>(node);
+  }
+
+  const Leaf* first_leaf() const {
+    alex::AlexNode<double, Geometry*>* node = base().root_node_;
+    if (node == nullptr) {
+      return nullptr;
+    }
+    while (!node->is_leaf_) {
+      node = static_cast<ModelNode*>(node)->children_[0];
+    }
+    return static_cast<const Leaf*>(node);
+  }
+
+  const GeometryMeta* find_meta(Geometry* geometry) const {
+    auto it = geometry_to_meta_.find(geometry);
+    if (it == geometry_to_meta_.end()) {
+      return nullptr;
+    }
+    return it->second;
+  }
+
+  LeafSummary recompute_leaf_summary(const Leaf* leaf) const {
+    LeafSummary summary;
+    for (int pos = 0; pos < leaf->data_capacity_; ++pos) {
+      if (!leaf->check_exists(pos)) {
+        continue;
+      }
+      Geometry* geometry = leaf->get_payload(pos);
+      const GeometryMeta* meta = find_meta(geometry);
+      if (meta == nullptr || meta->object_id >= live_.size() ||
+          !live_[meta->object_id]) {
+        continue;
+      }
+      summary.has_live = true;
+      ++summary.live_count;
+      summary.min_zmin = std::min(summary.min_zmin, meta->zmin);
+      summary.max_zmin = std::max(summary.max_zmin, meta->zmin);
+      summary.max_zmax = std::max(summary.max_zmax, meta->zmax);
+      if (summary.live_count == 1) {
+        summary.mbr = meta->envelope;
+      } else {
+        summary.mbr.expandToInclude(&meta->envelope);
+      }
+    }
+    return summary;
+  }
+
+  void rebuild_all_summaries() {
+    auto start = std::chrono::high_resolution_clock::now();
+    summaries_.clear();
+    for (Leaf* leaf = first_leaf(); leaf != nullptr; leaf = leaf->next_leaf_) {
+      summaries_[leaf] = recompute_leaf_summary(leaf);
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    ++summary_rebuild_count_;
+    summary_rebuild_ns_ += ns_count(end - start);
+  }
+
+  void refresh_local_summaries(double zmin) {
+    auto start = std::chrono::high_resolution_clock::now();
+    Leaf* center = base().get_leaf(zmin);
+    if (center == nullptr) {
+      auto end = std::chrono::high_resolution_clock::now();
+      ++summary_rebuild_count_;
+      summary_rebuild_ns_ += ns_count(end - start);
+      return;
+    }
+
+    Leaf* begin = center;
+    for (int i = 0; i < 2 && begin->prev_leaf_ != nullptr; ++i) {
+      begin = begin->prev_leaf_;
+    }
+    Leaf* end_leaf = center;
+    for (int i = 0; i < 2 && end_leaf->next_leaf_ != nullptr; ++i) {
+      end_leaf = end_leaf->next_leaf_;
+    }
+
+    for (Leaf* leaf = begin; leaf != nullptr; leaf = leaf->next_leaf_) {
+      summaries_[leaf] = recompute_leaf_summary(leaf);
+      if (leaf == end_leaf) {
+        break;
+      }
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    ++summary_rebuild_count_;
+    summary_rebuild_ns_ += ns_count(end - start);
+  }
+
+  void expand_summary_on_insert(const Leaf* leaf, const GeometryMeta& meta) {
+    LeafSummary& summary = summaries_[leaf];
+    if (!summary.has_live) {
+      summary.has_live = true;
+      summary.min_zmin = meta.zmin;
+      summary.max_zmin = meta.zmin;
+      summary.max_zmax = meta.zmax;
+      summary.mbr = meta.envelope;
+      summary.live_count = 1;
+      summary.stale = false;
+      return;
+    }
+    summary.min_zmin = std::min(summary.min_zmin, meta.zmin);
+    summary.max_zmin = std::max(summary.max_zmin, meta.zmin);
+    summary.max_zmax = std::max(summary.max_zmax, meta.zmax);
+    summary.mbr.expandToInclude(&meta.envelope);
+    ++summary.live_count;
+  }
+
+  void mark_summary_stale(const Leaf* leaf) {
+    auto it = summaries_.find(leaf);
+    if (it != summaries_.end()) {
+      it->second.stale = true;
+    }
+  }
+
+  const Options& options_;
+  const std::vector<GeometryPtr>& geometries_;
+  const std::vector<GeometryMeta>& metadata_;
+  GlinIndex index_;
+  std::vector<char> live_;
+  std::unordered_map<Geometry*, const GeometryMeta*> geometry_to_meta_;
+  std::unordered_map<const Leaf*, LeafSummary> summaries_;
+  std::size_t summary_rebuild_count_ = 0;
+  long long summary_rebuild_ns_ = 0;
+};
+
 std::unordered_map<Geometry*, ObjectId> build_geometry_to_oid(
     const std::vector<GeometryPtr>& geometries) {
   std::unordered_map<Geometry*, ObjectId> map;
@@ -1161,6 +1487,22 @@ std::unordered_map<Geometry*, ObjectId> build_geometry_to_oid(
     map[geometries[oid].get()] = oid;
   }
   return map;
+}
+
+std::vector<GeometryMeta> build_geometry_metadata(
+    const std::vector<GeometryPtr>& geometries, const Options& options) {
+  std::vector<GeometryMeta> metadata;
+  metadata.reserve(geometries.size());
+  for (ObjectId oid = 0; oid < geometries.size(); ++oid) {
+    GeometryMeta meta;
+    meta.object_id = oid;
+    meta.envelope = *geometries[oid]->getEnvelopeInternal();
+    curve_shape_projection(geometries[oid].get(), "z", options.cell_xmin,
+                           options.cell_ymin, options.cell_size,
+                           options.cell_size, meta.zmin, meta.zmax);
+    metadata.push_back(meta);
+  }
+  return metadata;
 }
 
 RTree build_rtree_for_ids(const std::vector<GeometryPtr>& geometries,
@@ -1863,6 +2205,8 @@ int main(int argc, char* argv[]) {
 
     std::unordered_map<Geometry*, ObjectId> geometry_to_oid =
         build_geometry_to_oid(geometries);
+    std::vector<GeometryMeta> geometry_metadata =
+        build_geometry_metadata(geometries, options);
 
     std::cout << "dataset=" << options.dataset_name
               << " benchmark=dynamic_compare"
@@ -1945,6 +2289,92 @@ int main(int argc, char* argv[]) {
                        delete_ns);
     rows.push_back(convert_deli_summary(
         deli_delete, options, build_ns, estimate_deli_bytes(index)));
+    print_compare_summary(rows.back());
+
+    // DELI-ALEX: existing ALEX leaf layout + DELI leaf summaries.
+    DeliAlexIndex deli_alex(options, geometries, geometry_metadata);
+    auto deli_alex_build_start = std::chrono::high_resolution_clock::now();
+    deli_alex.bulk_load(initial_ids);
+    auto deli_alex_build_end = std::chrono::high_resolution_clock::now();
+    long long deli_alex_build_ns =
+        ns_count(deli_alex_build_end - deli_alex_build_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX", "after_bulkload", 0, geometries, queries,
+        live_after_bulkload, live_bulkload, initial_count, 0, 0,
+        deli_alex_build_ns, 0, 0,
+        [&](const QueryCase& query_case) {
+          return deli_alex.query(query_case);
+        }));
+    rows.back().block_count = deli_alex.leaf_count();
+    rows.back().stale_block_count = deli_alex.stale_leaf_count();
+    rows.back().summary_rebuild_count = deli_alex.summary_rebuild_count();
+    rows.back().summary_rebuild_ns = deli_alex.summary_rebuild_ns();
+    rows.back().index_bytes_estimate = deli_alex.index_bytes_estimate();
+    rows.back().note =
+        "DELI-ALEX uses existing ALEX leaves plus external DELI leaf summaries.";
+    print_compare_summary(rows.back());
+
+    auto deli_alex_insert_start = std::chrono::high_resolution_clock::now();
+    std::size_t deli_alex_insert_success = 0;
+    std::size_t deli_alex_insert_failed = 0;
+    for (ObjectId oid : insert_ids) {
+      if (deli_alex.insert(oid)) {
+        ++deli_alex_insert_success;
+      } else {
+        ++deli_alex_insert_failed;
+      }
+    }
+    auto deli_alex_insert_end = std::chrono::high_resolution_clock::now();
+    long long deli_alex_insert_ns =
+        ns_count(deli_alex_insert_end - deli_alex_insert_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX", "after_insert", 1, geometries, queries,
+        live_after_insert, live_insert, initial_count, insert_count, 0,
+        deli_alex_build_ns, deli_alex_insert_ns, 0,
+        [&](const QueryCase& query_case) {
+          return deli_alex.query(query_case);
+        }));
+    rows.back().success_count = deli_alex_insert_success;
+    rows.back().failed_count = deli_alex_insert_failed;
+    rows.back().block_count = deli_alex.leaf_count();
+    rows.back().stale_block_count = deli_alex.stale_leaf_count();
+    rows.back().summary_rebuild_count = deli_alex.summary_rebuild_count();
+    rows.back().summary_rebuild_ns = deli_alex.summary_rebuild_ns();
+    rows.back().index_bytes_estimate = deli_alex.index_bytes_estimate();
+    rows.back().note =
+        "DELI-ALEX uses existing ALEX leaves plus external DELI leaf summaries.";
+    print_compare_summary(rows.back());
+
+    auto deli_alex_delete_start = std::chrono::high_resolution_clock::now();
+    std::size_t deli_alex_delete_success = 0;
+    std::size_t deli_alex_delete_failed = 0;
+    for (ObjectId oid : delete_ids) {
+      if (deli_alex.erase(oid)) {
+        ++deli_alex_delete_success;
+      } else {
+        ++deli_alex_delete_failed;
+      }
+    }
+    auto deli_alex_delete_end = std::chrono::high_resolution_clock::now();
+    long long deli_alex_delete_ns =
+        ns_count(deli_alex_delete_end - deli_alex_delete_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX", "after_delete", 2, geometries, queries,
+        live_after_delete, live_delete, initial_count, insert_count,
+        delete_count, deli_alex_build_ns, deli_alex_insert_ns,
+        deli_alex_delete_ns,
+        [&](const QueryCase& query_case) {
+          return deli_alex.query(query_case);
+        }));
+    rows.back().success_count = deli_alex_delete_success;
+    rows.back().failed_count = deli_alex_delete_failed;
+    rows.back().block_count = deli_alex.leaf_count();
+    rows.back().stale_block_count = deli_alex.stale_leaf_count();
+    rows.back().summary_rebuild_count = deli_alex.summary_rebuild_count();
+    rows.back().summary_rebuild_ns = deli_alex.summary_rebuild_ns();
+    rows.back().index_bytes_estimate = deli_alex.index_bytes_estimate();
+    rows.back().note =
+        "DELI-ALEX uses existing ALEX leaves plus external DELI leaf summaries.";
     print_compare_summary(rows.back());
 
     // Boost R-tree.

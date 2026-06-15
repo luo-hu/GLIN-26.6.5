@@ -13,15 +13,23 @@ os.environ.setdefault("MPLCONFIGDIR", "figures/.matplotlib_cache")
 import matplotlib.pyplot as plt
 
 
-INDEX_ORDER = ["DELI_DYNAMIC_SINGLE", "GLIN_PIECEWISE", "Boost_Rtree", "GEOS_Quadtree"]
+INDEX_ORDER = [
+    "DELI_DYNAMIC_SINGLE",
+    "DELI_ALEX",
+    "GLIN_PIECEWISE",
+    "Boost_Rtree",
+    "GEOS_Quadtree",
+]
 COLORS = {
     "DELI_DYNAMIC_SINGLE": "#2F6F73",
+    "DELI_ALEX": "#3C8DBC",
     "GLIN_PIECEWISE": "#6D8F3F",
     "Boost_Rtree": "#B86442",
     "GEOS_Quadtree": "#7C5FB3",
 }
 LABELS = {
     "DELI_DYNAMIC_SINGLE": "DELI-Dynamic",
+    "DELI_ALEX": "DELI-ALEX",
     "GLIN_PIECEWISE": "GLIN-piece",
     "Boost_Rtree": "Boost R-tree",
     "GEOS_Quadtree": "GEOS Quadtree",
@@ -97,7 +105,7 @@ def write_notes(rows, output_dir, prefix):
     path = output_dir / f"{prefix}_diagnostics.txt"
     with path.open("w") as handle:
         handle.write("统一动态对比说明\n\n")
-        handle.write("四个方法使用同一套 bulk-load / insert / delete / query workload。\n")
+        handle.write("所有方法使用同一套 bulk-load / insert / delete / query workload。\n")
         handle.write("answers_match_boost=1 表示该方法在该 checkpoint 的答案集合与 Boost exact oracle 一致。\n")
         handle.write("index_mb_estimate 是粗略估算，不等价于精确内存 profiler；用于先判断数量级。\n\n")
         for checkpoint in ["after_bulkload", "after_insert", "after_delete"]:
