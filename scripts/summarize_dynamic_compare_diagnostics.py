@@ -86,6 +86,23 @@ def field_order(rows):
         "build_ms",
         "insert_ms",
         "delete_ms",
+        "local_delta_bound",
+        "max_local_delta_size",
+        "blocks_with_delta",
+        "summary_rebuild_count",
+        "summary_rebuild_ns",
+        "summary_rebuild_count_total",
+        "summary_rebuild_ns_total",
+        "summary_rebuild_count_stage",
+        "summary_rebuild_ns_stage",
+        "local_compaction_count",
+        "local_compaction_ns",
+        "local_compaction_count_total",
+        "local_compaction_ns_total",
+        "local_compaction_count_stage",
+        "local_compaction_ns_stage",
+        "avg_local_compaction_us_stage",
+        "block_split_count",
     ]
     all_fields = set()
     for row in rows:

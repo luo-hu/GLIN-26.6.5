@@ -69,6 +69,7 @@ struct Options {
   double delete_fraction = 0.1;
   std::size_t block_size = 512;
   double stale_threshold_fraction = 0.05;
+  std::size_t local_delta_bound = 0;
   double piece_limit = 10000.0;
   std::uint64_t seed = 42;
   double cell_xmin = -180.0;
@@ -218,6 +219,7 @@ void print_usage(const char* program) {
       << "  --delete_fraction F              Delete fraction of loaded data (default: 0.1)\n"
       << "  --block_size N                   Target live records per block (default: 512)\n"
       << "  --stale_threshold_fraction F     Dead-count rebuild threshold as block fraction (default: 0.05)\n"
+      << "  --local_delta_bound N            Max per-block delta records before local compaction; 0 uses max(64, block_size/4)\n"
       << "  --piece_limit N                  GLIN-piece records per piece (default: 10000)\n"
       << "  --seed N                         Random seed (default: 42)\n"
       << "  --cell_xmin X                    Z-order longitude origin (default: -180)\n"
@@ -264,6 +266,9 @@ Options parse_args(int argc, char* argv[]) {
           static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--stale_threshold_fraction") {
       options.stale_threshold_fraction = std::stod(require_value(key));
+    } else if (key == "--local_delta_bound") {
+      options.local_delta_bound =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--piece_limit") {
       options.piece_limit = std::stod(require_value(key));
     } else if (key == "--seed") {
@@ -1122,7 +1127,21 @@ struct CompareSummary {
   std::size_t stale_block_count = 0;
   std::size_t summary_rebuild_count = 0;
   long long summary_rebuild_ns = 0;
+  std::size_t summary_rebuild_count_total = 0;
+  long long summary_rebuild_ns_total = 0;
+  std::size_t summary_rebuild_count_stage = 0;
+  long long summary_rebuild_ns_stage = 0;
   std::size_t block_split_count = 0;
+  std::size_t local_compaction_count = 0;
+  long long local_compaction_ns = 0;
+  std::size_t local_compaction_count_total = 0;
+  long long local_compaction_ns_total = 0;
+  std::size_t local_compaction_count_stage = 0;
+  long long local_compaction_ns_stage = 0;
+  double avg_local_compaction_us_stage = 0.0;
+  std::size_t local_delta_bound = 0;
+  std::size_t max_local_delta_size = 0;
+  std::size_t blocks_with_delta = 0;
   std::size_t pieces = 0;
   std::size_t tree_size = 0;
   std::size_t tree_depth = 0;
@@ -2742,6 +2761,668 @@ class DeliAlexHybridBufferedIndex {
   BufferedCompactQueryOverlay overlay_;
 };
 
+struct LocalBoundedOverlayBlock {
+  std::uint64_t block_id = 0;
+  std::vector<ObjectId> compact_ids;
+  std::vector<ObjectId> delta_ids;
+  double min_zmin = std::numeric_limits<double>::infinity();
+  double max_zmin = -std::numeric_limits<double>::infinity();
+  double max_zmax = -std::numeric_limits<double>::infinity();
+  geos::geom::Envelope mbr;
+  std::size_t live_count = 0;
+  std::size_t live_delta_count = 0;
+  std::size_t dead_count = 0;
+  bool stale = false;
+};
+
+class LocalBoundedCompactQueryOverlay {
+ public:
+  LocalBoundedCompactQueryOverlay(const Options& options,
+                                  const std::vector<GeometryPtr>& geometries,
+                                  const std::vector<GeometryMeta>& metadata)
+      : options_(options), geometries_(geometries), metadata_(metadata) {
+    live_.assign(geometries.size(), 0);
+    in_delta_.assign(geometries.size(), 0);
+    object_to_block_.assign(geometries.size(), nullptr);
+    local_delta_bound_ = options_.local_delta_bound == 0
+                             ? std::max<std::size_t>(64, options_.block_size / 4)
+                             : options_.local_delta_bound;
+  }
+
+  void bulk_load(const std::vector<ObjectId>& object_ids) {
+    std::vector<ObjectId> ids;
+    ids.reserve(object_ids.size());
+    for (ObjectId oid : object_ids) {
+      if (oid >= geometries_.size()) {
+        continue;
+      }
+      ids.push_back(oid);
+      live_[oid] = 1;
+    }
+    std::sort(ids.begin(), ids.end(), ObjectIdLess(metadata_));
+
+    for (std::size_t begin = 0; begin < ids.size();
+         begin += options_.block_size) {
+      const std::size_t end = std::min(begin + options_.block_size, ids.size());
+      std::unique_ptr<LocalBoundedOverlayBlock> block(
+          new LocalBoundedOverlayBlock());
+      block->block_id = next_block_id_++;
+      block->compact_ids.assign(ids.begin() + begin, ids.begin() + end);
+      LocalBoundedOverlayBlock* block_ptr = block.get();
+      owned_blocks_.push_back(std::move(block));
+      directory_.push_back(block_ptr);
+      rebuild_block_summary(block_ptr, false);
+    }
+  }
+
+  bool insert(ObjectId oid) {
+    if (oid >= geometries_.size() || live_[oid]) {
+      return false;
+    }
+    LocalBoundedOverlayBlock* block = find_block_for_zmin(metadata_[oid].zmin);
+    if (block == nullptr) {
+      block = create_empty_block();
+    }
+    block->delta_ids.push_back(oid);
+    live_[oid] = 1;
+    in_delta_[oid] = 1;
+    object_to_block_[oid] = block;
+    expand_summary_on_insert(block, metadata_[oid]);
+    ++block->live_delta_count;
+    if (block->live_delta_count >= local_delta_bound_) {
+      compact_block(block);
+    }
+    return true;
+  }
+
+  bool erase(ObjectId oid) {
+    if (oid >= geometries_.size() || !live_[oid]) {
+      return false;
+    }
+    LocalBoundedOverlayBlock* block = object_to_block_[oid];
+    live_[oid] = 0;
+    object_to_block_[oid] = nullptr;
+    if (oid < in_delta_.size() && in_delta_[oid]) {
+      in_delta_[oid] = 0;
+      if (block != nullptr && block->live_delta_count > 0) {
+        --block->live_delta_count;
+      }
+    }
+    if (block != nullptr) {
+      if (block->live_count > 0) {
+        --block->live_count;
+      }
+      ++block->dead_count;
+      block->stale = true;
+      if (should_rebuild(*block)) {
+        compact_block(block);
+      }
+    }
+    return true;
+  }
+
+  SimpleQueryResult query(const QueryCase& query_case) const {
+    auto start = std::chrono::high_resolution_clock::now();
+    SimpleQueryResult result;
+
+    double query_zmin = 0.0;
+    double query_zmax = 0.0;
+    curve_shape_projection(query_case.geometry, "z", options_.cell_xmin,
+                           options_.cell_ymin, options_.cell_size,
+                           options_.cell_size, query_zmin, query_zmax);
+    const geos::geom::Envelope query_envelope =
+        *query_case.geometry->getEnvelopeInternal();
+
+    for (const LocalBoundedOverlayBlock* block : directory_) {
+      if (block->live_count == 0) {
+        continue;
+      }
+      if (block->min_zmin > query_zmax) {
+        break;
+      }
+      if (block->max_zmax < query_zmin) {
+        continue;
+      }
+      if (!envelopes_intersect(block->mbr, query_envelope)) {
+        continue;
+      }
+      query_compact_ids(*block, query_case, query_zmin, query_zmax,
+                        query_envelope, result);
+      query_delta_ids(*block, query_case, query_zmin, query_zmax,
+                      query_envelope, result);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    result.query_ns = ns_count(end - start);
+    return result;
+  }
+
+  bool validate_index(std::string* message = nullptr) const {
+    auto fail = [&](const std::string& reason) {
+      if (message != nullptr) {
+        *message = reason;
+      }
+      return false;
+    };
+
+    std::size_t seen_live = 0;
+    bool have_previous_live_block = false;
+    double previous_live_min_zmin = -std::numeric_limits<double>::infinity();
+    for (const LocalBoundedOverlayBlock* block : directory_) {
+      for (std::size_t i = 1; i < block->compact_ids.size(); ++i) {
+        if (ObjectIdLess(metadata_)(block->compact_ids[i],
+                                    block->compact_ids[i - 1])) {
+          return fail("local bounded compact ids are not sorted by zmin");
+        }
+      }
+
+      bool has_live = false;
+      std::size_t true_live = 0;
+      std::size_t true_delta_live = 0;
+      double true_min_zmin = std::numeric_limits<double>::infinity();
+      double true_max_zmax = -std::numeric_limits<double>::infinity();
+      geos::geom::Envelope true_mbr;
+
+      auto visit_id = [&](ObjectId oid, bool expect_delta) -> bool {
+        if (oid >= live_.size()) {
+          return fail("local bounded overlay object id out of range");
+        }
+        if (!live_[oid]) {
+          return true;
+        }
+        if (object_to_block_[oid] != block) {
+          return fail("local bounded object points to a different block");
+        }
+        if (expect_delta && !in_delta_[oid]) {
+          return fail("local bounded delta object is not marked as delta");
+        }
+        if (!expect_delta && in_delta_[oid]) {
+          return fail("local bounded compact object is marked as delta");
+        }
+        const GeometryMeta& meta = metadata_[oid];
+        ++true_live;
+        ++seen_live;
+        if (expect_delta) {
+          ++true_delta_live;
+        }
+        true_min_zmin = std::min(true_min_zmin, meta.zmin);
+        true_max_zmax = std::max(true_max_zmax, meta.zmax);
+        if (!has_live) {
+          true_mbr = meta.envelope;
+          has_live = true;
+        } else {
+          true_mbr.expandToInclude(&meta.envelope);
+        }
+        return true;
+      };
+
+      for (ObjectId oid : block->compact_ids) {
+        if (!visit_id(oid, false)) {
+          return false;
+        }
+      }
+      for (ObjectId oid : block->delta_ids) {
+        if (!visit_id(oid, true)) {
+          return false;
+        }
+      }
+
+      if (block->live_count != true_live) {
+        return fail("local bounded live_count mismatch");
+      }
+      if (block->live_delta_count != true_delta_live) {
+        return fail("local bounded live_delta_count mismatch");
+      }
+      if (true_live == 0) {
+        continue;
+      }
+      if (have_previous_live_block &&
+          block->min_zmin + 1e-9 < previous_live_min_zmin) {
+        return fail("local bounded directory is not sorted by min_zmin");
+      }
+      previous_live_min_zmin = block->min_zmin;
+      have_previous_live_block = true;
+      const double eps = 1e-9;
+      if (block->max_zmax + eps < true_max_zmax) {
+        return fail("local bounded max_zmax is not conservative");
+      }
+      if (block->min_zmin - eps > true_min_zmin) {
+        return fail("local bounded min_zmin is not conservative");
+      }
+      if (!envelope_contains(block->mbr, true_mbr)) {
+        return fail("local bounded MBR is not conservative");
+      }
+    }
+
+    if (seen_live != live_count()) {
+      return fail("local bounded overlay live object count mismatch");
+    }
+    return true;
+  }
+
+  std::size_t live_count() const {
+    return static_cast<std::size_t>(
+        std::count(live_.begin(), live_.end(), static_cast<char>(1)));
+  }
+  std::size_t block_count() const { return directory_.size(); }
+  std::size_t stale_block_count() const {
+    std::size_t count = 0;
+    for (const LocalBoundedOverlayBlock* block : directory_) {
+      if (block->stale || block->live_delta_count > 0) {
+        ++count;
+      }
+    }
+    return count;
+  }
+  std::size_t summary_rebuild_count() const { return summary_rebuild_count_; }
+  long long summary_rebuild_ns() const { return summary_rebuild_ns_; }
+  std::size_t block_split_count() const { return block_split_count_; }
+  std::size_t local_compaction_count() const { return local_compaction_count_; }
+  long long local_compaction_ns() const { return local_compaction_ns_; }
+  std::size_t local_delta_bound() const { return local_delta_bound_; }
+  std::size_t max_local_delta_size() const {
+    std::size_t value = 0;
+    for (const LocalBoundedOverlayBlock* block : directory_) {
+      value = std::max(value, block->live_delta_count);
+    }
+    return value;
+  }
+  std::size_t blocks_with_delta() const {
+    std::size_t count = 0;
+    for (const LocalBoundedOverlayBlock* block : directory_) {
+      if (block->live_delta_count > 0) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  std::size_t index_bytes_estimate() const {
+    std::size_t bytes = live_.size() * sizeof(char);
+    bytes += in_delta_.size() * sizeof(char);
+    bytes += object_to_block_.size() * sizeof(LocalBoundedOverlayBlock*);
+    bytes += directory_.size() * sizeof(LocalBoundedOverlayBlock*);
+    bytes += owned_blocks_.size() * sizeof(LocalBoundedOverlayBlock);
+    for (const auto& block : owned_blocks_) {
+      bytes += block->compact_ids.capacity() * sizeof(ObjectId);
+      bytes += block->delta_ids.capacity() * sizeof(ObjectId);
+    }
+    return bytes;
+  }
+
+ private:
+  struct ObjectIdLess {
+    explicit ObjectIdLess(const std::vector<GeometryMeta>& metadata)
+        : metadata(metadata) {}
+
+    bool operator()(ObjectId lhs, ObjectId rhs) const {
+      const GeometryMeta& a = metadata[lhs];
+      const GeometryMeta& b = metadata[rhs];
+      if (a.zmin != b.zmin) {
+        return a.zmin < b.zmin;
+      }
+      return lhs < rhs;
+    }
+
+    const std::vector<GeometryMeta>& metadata;
+  };
+
+  LocalBoundedOverlayBlock* create_empty_block() {
+    std::unique_ptr<LocalBoundedOverlayBlock> block(
+        new LocalBoundedOverlayBlock());
+    block->block_id = next_block_id_++;
+    LocalBoundedOverlayBlock* block_ptr = block.get();
+    owned_blocks_.push_back(std::move(block));
+    directory_.push_back(block_ptr);
+    return block_ptr;
+  }
+
+  LocalBoundedOverlayBlock* find_block_for_zmin(double zmin) const {
+    if (directory_.empty()) {
+      return nullptr;
+    }
+    auto it = std::lower_bound(
+        directory_.begin(), directory_.end(), zmin,
+        [](const LocalBoundedOverlayBlock* block, double value) {
+          return block->max_zmin < value;
+        });
+    if (it == directory_.end()) {
+      return directory_.back();
+    }
+    return *it;
+  }
+
+  void expand_summary_on_insert(LocalBoundedOverlayBlock* block,
+                                const GeometryMeta& meta) {
+    if (block->live_count == 0) {
+      block->min_zmin = meta.zmin;
+      block->max_zmin = meta.zmin;
+      block->max_zmax = meta.zmax;
+      block->mbr = meta.envelope;
+    } else {
+      block->min_zmin = std::min(block->min_zmin, meta.zmin);
+      block->max_zmin = std::max(block->max_zmin, meta.zmin);
+      block->max_zmax = std::max(block->max_zmax, meta.zmax);
+      block->mbr.expandToInclude(&meta.envelope);
+    }
+    ++block->live_count;
+  }
+
+  std::size_t stale_threshold_count() const {
+    if (options_.stale_threshold_fraction <= 0.0) {
+      return 0;
+    }
+    return std::max<std::size_t>(
+        1, static_cast<std::size_t>(
+               std::ceil(options_.stale_threshold_fraction *
+                         static_cast<double>(options_.block_size))));
+  }
+
+  bool should_rebuild(const LocalBoundedOverlayBlock& block) const {
+    const std::size_t threshold = stale_threshold_count();
+    if (threshold == 0) {
+      return true;
+    }
+    return block.dead_count >= threshold;
+  }
+
+  void rebuild_block_summary(LocalBoundedOverlayBlock* block,
+                             bool compact_dead) {
+    bool has_live = false;
+    std::size_t live_count = 0;
+    std::size_t live_delta_count = 0;
+    std::vector<ObjectId> live_compact_ids;
+    std::vector<ObjectId> live_delta_ids;
+    if (compact_dead) {
+      live_compact_ids.reserve(block->compact_ids.size());
+      live_delta_ids.reserve(block->delta_ids.size());
+    }
+
+    double min_zmin = std::numeric_limits<double>::infinity();
+    double max_zmin = -std::numeric_limits<double>::infinity();
+    double max_zmax = -std::numeric_limits<double>::infinity();
+    geos::geom::Envelope mbr;
+
+    auto visit = [&](ObjectId oid, bool is_delta) {
+      if (oid >= live_.size() || !live_[oid]) {
+        return;
+      }
+      if (compact_dead) {
+        if (is_delta) {
+          live_delta_ids.push_back(oid);
+        } else {
+          live_compact_ids.push_back(oid);
+        }
+      } else if (is_delta) {
+        ++live_delta_count;
+      }
+      object_to_block_[oid] = block;
+      const GeometryMeta& meta = metadata_[oid];
+      ++live_count;
+      min_zmin = std::min(min_zmin, meta.zmin);
+      max_zmin = std::max(max_zmin, meta.zmin);
+      max_zmax = std::max(max_zmax, meta.zmax);
+      if (!has_live) {
+        mbr = meta.envelope;
+        has_live = true;
+      } else {
+        mbr.expandToInclude(&meta.envelope);
+      }
+    };
+
+    for (ObjectId oid : block->compact_ids) {
+      visit(oid, false);
+    }
+    for (ObjectId oid : block->delta_ids) {
+      visit(oid, true);
+    }
+
+    if (compact_dead) {
+      ObjectIdLess less(metadata_);
+      std::sort(live_delta_ids.begin(), live_delta_ids.end(), less);
+      std::vector<ObjectId> merged_ids;
+      merged_ids.reserve(live_compact_ids.size() + live_delta_ids.size());
+      std::merge(live_compact_ids.begin(), live_compact_ids.end(),
+                 live_delta_ids.begin(), live_delta_ids.end(),
+                 std::back_inserter(merged_ids), less);
+      for (ObjectId oid : merged_ids) {
+        in_delta_[oid] = 0;
+        object_to_block_[oid] = block;
+      }
+      block->compact_ids.swap(merged_ids);
+      block->delta_ids.clear();
+      live_delta_count = 0;
+    }
+    block->live_count = live_count;
+    block->live_delta_count = live_delta_count;
+    block->dead_count = 0;
+    block->stale = false;
+    if (has_live) {
+      block->min_zmin = min_zmin;
+      block->max_zmin = max_zmin;
+      block->max_zmax = max_zmax;
+      block->mbr = mbr;
+    } else {
+      block->min_zmin = std::numeric_limits<double>::infinity();
+      block->max_zmin = -std::numeric_limits<double>::infinity();
+      block->max_zmax = -std::numeric_limits<double>::infinity();
+      block->mbr = geos::geom::Envelope();
+    }
+  }
+
+  void compact_block(LocalBoundedOverlayBlock* block) {
+    auto start = std::chrono::high_resolution_clock::now();
+    rebuild_block_summary(block, true);
+    if (block->compact_ids.size() > 2 * options_.block_size) {
+      split_block(block);
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    ++summary_rebuild_count_;
+    ++local_compaction_count_;
+    const long long elapsed_ns = ns_count(end - start);
+    summary_rebuild_ns_ += elapsed_ns;
+    local_compaction_ns_ += elapsed_ns;
+  }
+
+  void split_block(LocalBoundedOverlayBlock* block) {
+    std::sort(block->compact_ids.begin(), block->compact_ids.end(),
+              ObjectIdLess(metadata_));
+    const std::size_t mid = block->compact_ids.size() / 2;
+    std::unique_ptr<LocalBoundedOverlayBlock> right(
+        new LocalBoundedOverlayBlock());
+    right->block_id = next_block_id_++;
+    right->compact_ids.assign(block->compact_ids.begin() + mid,
+                              block->compact_ids.end());
+    block->compact_ids.erase(block->compact_ids.begin() + mid,
+                             block->compact_ids.end());
+
+    LocalBoundedOverlayBlock* right_ptr = right.get();
+    owned_blocks_.push_back(std::move(right));
+
+    rebuild_block_summary(block, false);
+    rebuild_block_summary(right_ptr, false);
+
+    auto it = std::find(directory_.begin(), directory_.end(), block);
+    if (it == directory_.end()) {
+      directory_.push_back(right_ptr);
+    } else {
+      directory_.insert(it + 1, right_ptr);
+    }
+    ++block_split_count_;
+  }
+
+  void query_compact_ids(const LocalBoundedOverlayBlock& block,
+                         const QueryCase& query_case, double query_zmin,
+                         double query_zmax,
+                         const geos::geom::Envelope& query_envelope,
+                         SimpleQueryResult& result) const {
+    for (ObjectId oid : block.compact_ids) {
+      if (oid >= metadata_.size()) {
+        continue;
+      }
+      const GeometryMeta& meta = metadata_[oid];
+      if (meta.zmin > query_zmax) {
+        break;
+      }
+      if (!live_[oid]) {
+        continue;
+      }
+      if (meta.zmax < query_zmin) {
+        continue;
+      }
+      if (!envelopes_intersect(meta.envelope, query_envelope)) {
+        continue;
+      }
+      ++result.candidates;
+      ++result.exact_calls;
+      if (query_case.geometry->intersects(geometries_[oid].get())) {
+        result.answers.insert(oid);
+      }
+    }
+  }
+
+  void query_delta_ids(const LocalBoundedOverlayBlock& block,
+                       const QueryCase& query_case, double query_zmin,
+                       double query_zmax,
+                       const geos::geom::Envelope& query_envelope,
+                       SimpleQueryResult& result) const {
+    for (ObjectId oid : block.delta_ids) {
+      if (oid >= metadata_.size() || !live_[oid]) {
+        continue;
+      }
+      const GeometryMeta& meta = metadata_[oid];
+      if (meta.zmin > query_zmax || meta.zmax < query_zmin) {
+        continue;
+      }
+      if (!envelopes_intersect(meta.envelope, query_envelope)) {
+        continue;
+      }
+      ++result.candidates;
+      ++result.exact_calls;
+      if (query_case.geometry->intersects(geometries_[oid].get())) {
+        result.answers.insert(oid);
+      }
+    }
+  }
+
+  const Options& options_;
+  const std::vector<GeometryPtr>& geometries_;
+  const std::vector<GeometryMeta>& metadata_;
+  std::vector<char> live_;
+  std::vector<char> in_delta_;
+  std::vector<LocalBoundedOverlayBlock*> object_to_block_;
+  std::vector<std::unique_ptr<LocalBoundedOverlayBlock>> owned_blocks_;
+  std::vector<LocalBoundedOverlayBlock*> directory_;
+  std::uint64_t next_block_id_ = 0;
+  std::size_t local_delta_bound_ = 0;
+  std::size_t summary_rebuild_count_ = 0;
+  long long summary_rebuild_ns_ = 0;
+  std::size_t local_compaction_count_ = 0;
+  long long local_compaction_ns_ = 0;
+  std::size_t block_split_count_ = 0;
+};
+
+class DeliAlexHybridLocalBoundedIndex {
+ public:
+  using BaseAlex = alex::Alex<double, Geometry*>;
+  using GlinIndex = alex::Glin<double, Geometry*>;
+
+  DeliAlexHybridLocalBoundedIndex(
+      const Options& options, const std::vector<GeometryPtr>& geometries,
+      const std::vector<GeometryMeta>& metadata)
+      : options_(options),
+        geometries_(geometries),
+        metadata_(metadata),
+        overlay_(options, geometries, metadata) {}
+
+  void bulk_load(const std::vector<ObjectId>& ids) {
+    std::vector<std::pair<double, Geometry*>> values;
+    values.reserve(ids.size());
+    for (ObjectId oid : ids) {
+      if (oid >= geometries_.size()) {
+        continue;
+      }
+      values.emplace_back(metadata_[oid].zmin, geometries_[oid].get());
+    }
+    std::sort(values.begin(), values.end(),
+              [](const auto& lhs, const auto& rhs) {
+                if (lhs.first != rhs.first) {
+                  return lhs.first < rhs.first;
+                }
+                return lhs.second < rhs.second;
+              });
+    base().bulk_load(values.data(), static_cast<int>(values.size()));
+    overlay_.bulk_load(ids);
+  }
+
+  bool insert(ObjectId oid) {
+    if (oid >= geometries_.size()) {
+      return false;
+    }
+    auto result = base().insert(metadata_[oid].zmin, geometries_[oid].get());
+    if (!result.second) {
+      return false;
+    }
+    return overlay_.insert(oid);
+  }
+
+  bool erase(ObjectId oid) {
+    if (oid >= geometries_.size()) {
+      return false;
+    }
+    int erased = base().erase_geo(metadata_[oid].zmin, geometries_[oid].get());
+    if (erased <= 0) {
+      return false;
+    }
+    return overlay_.erase(oid);
+  }
+
+  SimpleQueryResult query(const QueryCase& query_case) const {
+    return overlay_.query(query_case);
+  }
+
+  bool validate_index(std::string* message = nullptr) const {
+    return overlay_.validate_index(message);
+  }
+
+  std::size_t block_count() const { return overlay_.block_count(); }
+  std::size_t stale_block_count() const { return overlay_.stale_block_count(); }
+  std::size_t summary_rebuild_count() const {
+    return overlay_.summary_rebuild_count();
+  }
+  long long summary_rebuild_ns() const { return overlay_.summary_rebuild_ns(); }
+  std::size_t block_split_count() const { return overlay_.block_split_count(); }
+  std::size_t local_compaction_count() const {
+    return overlay_.local_compaction_count();
+  }
+  long long local_compaction_ns() const {
+    return overlay_.local_compaction_ns();
+  }
+  std::size_t local_delta_bound() const { return overlay_.local_delta_bound(); }
+  std::size_t max_local_delta_size() const {
+    return overlay_.max_local_delta_size();
+  }
+  std::size_t blocks_with_delta() const { return overlay_.blocks_with_delta(); }
+  std::size_t leaf_count() const {
+    return static_cast<std::size_t>(std::max(0, base().num_leaves()));
+  }
+  std::size_t index_bytes_estimate() const {
+    return static_cast<std::size_t>(
+               std::max<long long>(0, base().data_size() + base().model_size())) +
+           overlay_.index_bytes_estimate();
+  }
+
+ private:
+  BaseAlex& base() { return static_cast<BaseAlex&>(index_); }
+  const BaseAlex& base() const { return static_cast<const BaseAlex&>(index_); }
+
+  const Options& options_;
+  const std::vector<GeometryPtr>& geometries_;
+  const std::vector<GeometryMeta>& metadata_;
+  GlinIndex index_;
+  LocalBoundedCompactQueryOverlay overlay_;
+};
+
 std::unordered_map<Geometry*, ObjectId> build_geometry_to_oid(
     const std::vector<GeometryPtr>& geometries) {
   std::unordered_map<Geometry*, ObjectId> map;
@@ -3339,6 +4020,60 @@ void print_compare_summary(const CompareSummary& summary) {
             << "\n";
 }
 
+struct MaintenanceSnapshot {
+  std::size_t summary_rebuild_count = 0;
+  long long summary_rebuild_ns = 0;
+  std::size_t local_compaction_count = 0;
+  long long local_compaction_ns = 0;
+};
+
+void annotate_stage_maintenance(std::vector<CompareSummary>& rows) {
+  std::unordered_map<std::string, MaintenanceSnapshot> previous_by_index;
+  for (CompareSummary& row : rows) {
+    row.summary_rebuild_count_total = row.summary_rebuild_count;
+    row.summary_rebuild_ns_total = row.summary_rebuild_ns;
+    row.local_compaction_count_total = row.local_compaction_count;
+    row.local_compaction_ns_total = row.local_compaction_ns;
+
+    auto found = previous_by_index.find(row.index);
+    if (found == previous_by_index.end()) {
+      row.summary_rebuild_count_stage = row.summary_rebuild_count_total;
+      row.summary_rebuild_ns_stage = row.summary_rebuild_ns_total;
+      row.local_compaction_count_stage = row.local_compaction_count_total;
+      row.local_compaction_ns_stage = row.local_compaction_ns_total;
+    } else {
+      const MaintenanceSnapshot& previous = found->second;
+      row.summary_rebuild_count_stage =
+          row.summary_rebuild_count_total >= previous.summary_rebuild_count
+              ? row.summary_rebuild_count_total - previous.summary_rebuild_count
+              : row.summary_rebuild_count_total;
+      row.summary_rebuild_ns_stage =
+          row.summary_rebuild_ns_total >= previous.summary_rebuild_ns
+              ? row.summary_rebuild_ns_total - previous.summary_rebuild_ns
+              : row.summary_rebuild_ns_total;
+      row.local_compaction_count_stage =
+          row.local_compaction_count_total >= previous.local_compaction_count
+              ? row.local_compaction_count_total -
+                    previous.local_compaction_count
+              : row.local_compaction_count_total;
+      row.local_compaction_ns_stage =
+          row.local_compaction_ns_total >= previous.local_compaction_ns
+              ? row.local_compaction_ns_total - previous.local_compaction_ns
+              : row.local_compaction_ns_total;
+    }
+
+    if (row.local_compaction_count_stage > 0) {
+      row.avg_local_compaction_us_stage =
+          static_cast<double>(row.local_compaction_ns_stage) /
+          static_cast<double>(row.local_compaction_count_stage) / 1000.0;
+    }
+
+    previous_by_index[row.index] = MaintenanceSnapshot{
+        row.summary_rebuild_count_total, row.summary_rebuild_ns_total,
+        row.local_compaction_count_total, row.local_compaction_ns_total};
+  }
+}
+
 void write_compare_csv(const std::string& path,
                        const Options& options,
                        const LoadStats& stats,
@@ -3358,7 +4093,14 @@ void write_compare_csv(const std::string& path,
          "candidate_answer_ratio,zero_answer_queries,answers_match_boost,"
          "missing_count,extra_count,oracle_build_ns,oracle_query_ns,"
          "block_size,stale_threshold_fraction,block_count,stale_block_count,"
-         "summary_rebuild_count,summary_rebuild_ns,block_split_count,pieces,"
+         "summary_rebuild_count,summary_rebuild_ns,"
+         "summary_rebuild_count_total,summary_rebuild_ns_total,"
+         "summary_rebuild_count_stage,summary_rebuild_ns_stage,"
+         "block_split_count,local_compaction_count,local_compaction_ns,"
+         "local_compaction_count_total,local_compaction_ns_total,"
+         "local_compaction_count_stage,local_compaction_ns_stage,"
+         "avg_local_compaction_us_stage,local_delta_bound,"
+         "max_local_delta_size,blocks_with_delta,pieces,"
          "tree_size,tree_depth,tree_nodes,index_bytes_estimate,success_count,"
          "failed_count,validate_ok,seed,lines_seen,parse_errors,note\n";
   output << std::setprecision(17);
@@ -3380,7 +4122,19 @@ void write_compare_csv(const std::string& path,
            << row.block_size << "," << row.stale_threshold_fraction << ","
            << row.block_count << "," << row.stale_block_count << ","
            << row.summary_rebuild_count << "," << row.summary_rebuild_ns
-           << "," << row.block_split_count << "," << row.pieces << ","
+           << "," << row.summary_rebuild_count_total << ","
+           << row.summary_rebuild_ns_total << ","
+           << row.summary_rebuild_count_stage << ","
+           << row.summary_rebuild_ns_stage << "," << row.block_split_count
+           << "," << row.local_compaction_count << ","
+           << row.local_compaction_ns << ","
+           << row.local_compaction_count_total << ","
+           << row.local_compaction_ns_total << ","
+           << row.local_compaction_count_stage << ","
+           << row.local_compaction_ns_stage << ","
+           << row.avg_local_compaction_us_stage << ","
+           << row.local_delta_bound << "," << row.max_local_delta_size << ","
+           << row.blocks_with_delta << "," << row.pieces << ","
            << row.tree_size << "," << row.tree_depth << ","
            << row.tree_nodes << "," << row.index_bytes_estimate << ","
            << row.success_count << "," << row.failed_count << ","
@@ -3480,6 +4234,10 @@ int main(int argc, char* argv[]) {
               << " queries=" << queries.size()
               << " deli_block_size=" << options.block_size
               << " deli_stale=" << options.stale_threshold_fraction
+              << " local_delta_bound="
+              << (options.local_delta_bound == 0
+                      ? std::max<std::size_t>(64, options.block_size / 4)
+                      : options.local_delta_bound)
               << " load_ms=" << ns_count(load_end - load_start) / 1e6
               << "\n";
 
@@ -4054,6 +4812,186 @@ int main(int argc, char* argv[]) {
         std::to_string(deli_alex_hybrid_bounded.adaptive_delta_record_bound());
     print_compare_summary(rows.back());
 
+    // DELI-ALEX-Hybrid-LocalBounded: each compact query block owns a small
+    // local delta. Compaction only rebuilds the affected block.
+    DeliAlexHybridLocalBoundedIndex deli_alex_hybrid_local_bounded(
+        options, geometries, geometry_metadata);
+    auto hybrid_local_build_start = std::chrono::high_resolution_clock::now();
+    deli_alex_hybrid_local_bounded.bulk_load(initial_ids);
+    auto hybrid_local_build_end = std::chrono::high_resolution_clock::now();
+    long long hybrid_local_build_ns =
+        ns_count(hybrid_local_build_end - hybrid_local_build_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX_HYBRID_LOCAL_BOUNDED", "after_bulkload", 0,
+        geometries, queries, live_after_bulkload, live_bulkload, initial_count,
+        0, 0, hybrid_local_build_ns, 0, 0,
+        [&](const QueryCase& query_case) {
+          return deli_alex_hybrid_local_bounded.query(query_case);
+        }));
+    rows.back().block_count = deli_alex_hybrid_local_bounded.block_count();
+    rows.back().tree_nodes = deli_alex_hybrid_local_bounded.leaf_count();
+    rows.back().stale_block_count =
+        deli_alex_hybrid_local_bounded.stale_block_count();
+    rows.back().summary_rebuild_count =
+        deli_alex_hybrid_local_bounded.summary_rebuild_count();
+    rows.back().summary_rebuild_ns =
+        deli_alex_hybrid_local_bounded.summary_rebuild_ns();
+    rows.back().block_split_count =
+        deli_alex_hybrid_local_bounded.block_split_count();
+    rows.back().local_compaction_count =
+        deli_alex_hybrid_local_bounded.local_compaction_count();
+    rows.back().local_compaction_ns =
+        deli_alex_hybrid_local_bounded.local_compaction_ns();
+    rows.back().local_delta_bound =
+        deli_alex_hybrid_local_bounded.local_delta_bound();
+    rows.back().max_local_delta_size =
+        deli_alex_hybrid_local_bounded.max_local_delta_size();
+    rows.back().blocks_with_delta =
+        deli_alex_hybrid_local_bounded.blocks_with_delta();
+    rows.back().index_bytes_estimate =
+        deli_alex_hybrid_local_bounded.index_bytes_estimate();
+    {
+      std::string validation_message;
+      rows.back().validate_ok =
+          deli_alex_hybrid_local_bounded.validate_index(&validation_message)
+              ? 1
+              : 0;
+      if (!rows.back().validate_ok) {
+        std::cerr << "DELI_ALEX_HYBRID_LOCAL_BOUNDED validate_index failed at "
+                  << rows.back().checkpoint << ": " << validation_message
+                  << "\n";
+      }
+    }
+    rows.back().note =
+        "DELI-ALEX-Hybrid-LocalBounded uses per-block bounded delta and local compaction; local_delta_bound=" +
+        std::to_string(deli_alex_hybrid_local_bounded.local_delta_bound());
+    print_compare_summary(rows.back());
+
+    auto hybrid_local_insert_start =
+        std::chrono::high_resolution_clock::now();
+    std::size_t hybrid_local_insert_success = 0;
+    std::size_t hybrid_local_insert_failed = 0;
+    for (ObjectId oid : insert_ids) {
+      if (deli_alex_hybrid_local_bounded.insert(oid)) {
+        ++hybrid_local_insert_success;
+      } else {
+        ++hybrid_local_insert_failed;
+      }
+    }
+    auto hybrid_local_insert_end = std::chrono::high_resolution_clock::now();
+    long long hybrid_local_insert_ns =
+        ns_count(hybrid_local_insert_end - hybrid_local_insert_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX_HYBRID_LOCAL_BOUNDED", "after_insert", 1,
+        geometries, queries, live_after_insert, live_insert, initial_count,
+        insert_count, 0, hybrid_local_build_ns, hybrid_local_insert_ns, 0,
+        [&](const QueryCase& query_case) {
+          return deli_alex_hybrid_local_bounded.query(query_case);
+        }));
+    rows.back().success_count = hybrid_local_insert_success;
+    rows.back().failed_count = hybrid_local_insert_failed;
+    rows.back().block_count = deli_alex_hybrid_local_bounded.block_count();
+    rows.back().tree_nodes = deli_alex_hybrid_local_bounded.leaf_count();
+    rows.back().stale_block_count =
+        deli_alex_hybrid_local_bounded.stale_block_count();
+    rows.back().summary_rebuild_count =
+        deli_alex_hybrid_local_bounded.summary_rebuild_count();
+    rows.back().summary_rebuild_ns =
+        deli_alex_hybrid_local_bounded.summary_rebuild_ns();
+    rows.back().block_split_count =
+        deli_alex_hybrid_local_bounded.block_split_count();
+    rows.back().local_compaction_count =
+        deli_alex_hybrid_local_bounded.local_compaction_count();
+    rows.back().local_compaction_ns =
+        deli_alex_hybrid_local_bounded.local_compaction_ns();
+    rows.back().local_delta_bound =
+        deli_alex_hybrid_local_bounded.local_delta_bound();
+    rows.back().max_local_delta_size =
+        deli_alex_hybrid_local_bounded.max_local_delta_size();
+    rows.back().blocks_with_delta =
+        deli_alex_hybrid_local_bounded.blocks_with_delta();
+    rows.back().index_bytes_estimate =
+        deli_alex_hybrid_local_bounded.index_bytes_estimate();
+    {
+      std::string validation_message;
+      rows.back().validate_ok =
+          deli_alex_hybrid_local_bounded.validate_index(&validation_message)
+              ? 1
+              : 0;
+      if (!rows.back().validate_ok) {
+        std::cerr << "DELI_ALEX_HYBRID_LOCAL_BOUNDED validate_index failed at "
+                  << rows.back().checkpoint << ": " << validation_message
+                  << "\n";
+      }
+    }
+    rows.back().note =
+        "DELI-ALEX-Hybrid-LocalBounded uses per-block bounded delta and local compaction; local_delta_bound=" +
+        std::to_string(deli_alex_hybrid_local_bounded.local_delta_bound());
+    print_compare_summary(rows.back());
+
+    auto hybrid_local_delete_start =
+        std::chrono::high_resolution_clock::now();
+    std::size_t hybrid_local_delete_success = 0;
+    std::size_t hybrid_local_delete_failed = 0;
+    for (ObjectId oid : delete_ids) {
+      if (deli_alex_hybrid_local_bounded.erase(oid)) {
+        ++hybrid_local_delete_success;
+      } else {
+        ++hybrid_local_delete_failed;
+      }
+    }
+    auto hybrid_local_delete_end = std::chrono::high_resolution_clock::now();
+    long long hybrid_local_delete_ns =
+        ns_count(hybrid_local_delete_end - hybrid_local_delete_start);
+    rows.push_back(run_generic_checkpoint(
+        options, "DELI_ALEX_HYBRID_LOCAL_BOUNDED", "after_delete", 2,
+        geometries, queries, live_after_delete, live_delete, initial_count,
+        insert_count, delete_count, hybrid_local_build_ns,
+        hybrid_local_insert_ns, hybrid_local_delete_ns,
+        [&](const QueryCase& query_case) {
+          return deli_alex_hybrid_local_bounded.query(query_case);
+        }));
+    rows.back().success_count = hybrid_local_delete_success;
+    rows.back().failed_count = hybrid_local_delete_failed;
+    rows.back().block_count = deli_alex_hybrid_local_bounded.block_count();
+    rows.back().tree_nodes = deli_alex_hybrid_local_bounded.leaf_count();
+    rows.back().stale_block_count =
+        deli_alex_hybrid_local_bounded.stale_block_count();
+    rows.back().summary_rebuild_count =
+        deli_alex_hybrid_local_bounded.summary_rebuild_count();
+    rows.back().summary_rebuild_ns =
+        deli_alex_hybrid_local_bounded.summary_rebuild_ns();
+    rows.back().block_split_count =
+        deli_alex_hybrid_local_bounded.block_split_count();
+    rows.back().local_compaction_count =
+        deli_alex_hybrid_local_bounded.local_compaction_count();
+    rows.back().local_compaction_ns =
+        deli_alex_hybrid_local_bounded.local_compaction_ns();
+    rows.back().local_delta_bound =
+        deli_alex_hybrid_local_bounded.local_delta_bound();
+    rows.back().max_local_delta_size =
+        deli_alex_hybrid_local_bounded.max_local_delta_size();
+    rows.back().blocks_with_delta =
+        deli_alex_hybrid_local_bounded.blocks_with_delta();
+    rows.back().index_bytes_estimate =
+        deli_alex_hybrid_local_bounded.index_bytes_estimate();
+    {
+      std::string validation_message;
+      rows.back().validate_ok =
+          deli_alex_hybrid_local_bounded.validate_index(&validation_message)
+              ? 1
+              : 0;
+      if (!rows.back().validate_ok) {
+        std::cerr << "DELI_ALEX_HYBRID_LOCAL_BOUNDED validate_index failed at "
+                  << rows.back().checkpoint << ": " << validation_message
+                  << "\n";
+      }
+    }
+    rows.back().note =
+        "DELI-ALEX-Hybrid-LocalBounded uses per-block bounded delta and local compaction; local_delta_bound=" +
+        std::to_string(deli_alex_hybrid_local_bounded.local_delta_bound());
+    print_compare_summary(rows.back());
+
     // Boost R-tree.
     auto boost_build_start = std::chrono::high_resolution_clock::now();
     RTree boost_index =
@@ -4292,6 +5230,7 @@ int main(int argc, char* argv[]) {
     rows.back().note = "GLIN-piece bytes are rough payload/piece estimates.";
     print_compare_summary(rows.back());
 
+    annotate_stage_maintenance(rows);
     write_compare_csv(options.output_csv, options, stats, rows);
     if (!options.output_csv.empty()) {
       std::cout << "CSV: " << options.output_csv << "\n";

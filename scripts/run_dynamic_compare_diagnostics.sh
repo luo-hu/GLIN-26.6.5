@@ -11,11 +11,16 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 
 这个脚本用于跑统一动态对比：
   DELI-Dynamic-Single
+  DELI-ALEX
+  DELI-ALEX-Hybrid
+  DELI-ALEX-Hybrid-Buf
+  DELI-ALEX-Hybrid-Bounded
+  DELI-ALEX-Hybrid-LocalBounded
   Boost R-tree
   GEOS Quadtree
   GLIN-piece
 
-四个方法使用同一套 workload：
+所有方法使用同一套 workload：
   bulk-load 50% -> insert 20% -> query -> delete 10% -> query
 
 默认 DELI 参数固定为：
@@ -58,6 +63,10 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   STALE_THRESHOLD
     DELI stale_threshold_fraction。默认 0.05。
 
+  LOCAL_DELTA_BOUND
+    DELI-ALEX-Hybrid-LocalBounded 的每个 block 局部 delta 上限。
+    默认 0，表示自动使用 max(64, BLOCK_SIZE/4)，把每个 block 的额外扫描量控制在约 25%。
+
   INITIAL_FRACTION / INSERT_FRACTION / DELETE_FRACTION
     默认 0.5 / 0.2 / 0.1。
 
@@ -87,6 +96,7 @@ SELECTIVITY_TAGS="${SELECTIVITY_TAGS:-1pct}"
 # 这里故意固定为论文默认参数，避免每个数据集单独调参。
 BLOCK_SIZE="${BLOCK_SIZE:-512}"
 STALE_THRESHOLD="${STALE_THRESHOLD:-0.05}"
+LOCAL_DELTA_BOUND="${LOCAL_DELTA_BOUND:-0}"
 PIECE_LIMIT="${PIECE_LIMIT:-10000}"
 
 INITIAL_FRACTION="${INITIAL_FRACTION:-0.5}"
@@ -229,6 +239,7 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --delete_fraction "$DELETE_FRACTION" \
           --block_size "$BLOCK_SIZE" \
           --stale_threshold_fraction "$STALE_THRESHOLD" \
+          --local_delta_bound "$LOCAL_DELTA_BOUND" \
           --piece_limit "$PIECE_LIMIT" \
           --cell_size "$CELL_SIZE" \
           --seed "$SEED" \

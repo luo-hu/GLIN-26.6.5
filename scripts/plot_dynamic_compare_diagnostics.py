@@ -19,6 +19,7 @@ INDEX_ORDER = [
     "DELI_ALEX_HYBRID",
     "DELI_ALEX_HYBRID_BUF",
     "DELI_ALEX_HYBRID_BOUNDED",
+    "DELI_ALEX_HYBRID_LOCAL_BOUNDED",
     "GLIN_PIECEWISE",
     "Boost_Rtree",
     "GEOS_Quadtree",
@@ -29,6 +30,7 @@ COLORS = {
     "DELI_ALEX_HYBRID": "#1F9E89",
     "DELI_ALEX_HYBRID_BUF": "#8BAE3F",
     "DELI_ALEX_HYBRID_BOUNDED": "#D49A2A",
+    "DELI_ALEX_HYBRID_LOCAL_BOUNDED": "#E76F51",
     "GLIN_PIECEWISE": "#6D8F3F",
     "Boost_Rtree": "#B86442",
     "GEOS_Quadtree": "#7C5FB3",
@@ -39,6 +41,7 @@ LABELS = {
     "DELI_ALEX_HYBRID": "DELI-ALEX-Hybrid",
     "DELI_ALEX_HYBRID_BUF": "DELI-ALEX-Hybrid-Buf",
     "DELI_ALEX_HYBRID_BOUNDED": "DELI-ALEX-Hybrid-Bounded",
+    "DELI_ALEX_HYBRID_LOCAL_BOUNDED": "DELI-ALEX-Hybrid-LocalBounded",
     "GLIN_PIECEWISE": "GLIN-piece",
     "Boost_Rtree": "Boost R-tree",
     "GEOS_Quadtree": "GEOS Quadtree",
@@ -127,7 +130,13 @@ def write_notes(rows, output_dir, prefix):
                     f"insert_tps={as_float(row, 'insert_tps'):.2f}, "
                     f"delete_tps={as_float(row, 'delete_tps'):.2f}, "
                     f"match={row.get('answers_match_boost')}, "
-                    f"index_mb_est={as_float(row, 'index_mb_estimate'):.3f}\n"
+                    f"index_mb_est={as_float(row, 'index_mb_estimate'):.3f}, "
+                    f"local_delta_bound={as_float(row, 'local_delta_bound'):.0f}, "
+                    f"max_local_delta={as_float(row, 'max_local_delta_size'):.0f}, "
+                    f"blocks_with_delta={as_float(row, 'blocks_with_delta'):.0f}, "
+                    f"local_compactions_stage={as_float(row, 'local_compaction_count_stage'):.0f}, "
+                    f"local_compaction_ms_stage={as_float(row, 'local_compaction_ns_stage') / 1e6:.3f}, "
+                    f"avg_local_compaction_us={as_float(row, 'avg_local_compaction_us_stage'):.3f}\n"
                 )
             handle.write("\n")
     return path
