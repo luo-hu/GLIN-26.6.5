@@ -70,6 +70,7 @@ struct Options {
   std::size_t block_size = 512;
   double stale_threshold_fraction = 0.05;
   std::size_t local_delta_bound = 0;
+  double delete_compact_fraction = 0.25;
   double piece_limit = 10000.0;
   std::uint64_t seed = 42;
   double cell_xmin = -180.0;
@@ -220,6 +221,7 @@ void print_usage(const char* program) {
       << "  --block_size N                   Target live records per block (default: 512)\n"
       << "  --stale_threshold_fraction F     Dead-count rebuild threshold as block fraction (default: 0.05)\n"
       << "  --local_delta_bound N            Max per-block delta records before local compaction; 0 uses max(64, block_size/4)\n"
+      << "  --delete_compact_fraction F      LocalBounded tombstone fraction before physical compaction (default: 0.25)\n"
       << "  --piece_limit N                  GLIN-piece records per piece (default: 10000)\n"
       << "  --seed N                         Random seed (default: 42)\n"
       << "  --cell_xmin X                    Z-order longitude origin (default: -180)\n"
@@ -269,6 +271,8 @@ Options parse_args(int argc, char* argv[]) {
     } else if (key == "--local_delta_bound") {
       options.local_delta_bound =
           static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--delete_compact_fraction") {
+      options.delete_compact_fraction = std::stod(require_value(key));
     } else if (key == "--piece_limit") {
       options.piece_limit = std::stod(require_value(key));
     } else if (key == "--seed") {
@@ -317,6 +321,8 @@ Options parse_args(int argc, char* argv[]) {
   validate_fraction(options.initial_fraction, "--initial_fraction");
   validate_fraction(options.insert_fraction, "--insert_fraction");
   validate_fraction(options.delete_fraction, "--delete_fraction");
+  validate_fraction(options.delete_compact_fraction,
+                    "--delete_compact_fraction");
   if (options.initial_fraction <= 0.0) {
     throw std::runtime_error("--initial_fraction must be greater than 0");
   }
@@ -1123,6 +1129,7 @@ struct CompareSummary {
   long long oracle_query_ns = 0;
   std::size_t block_size = 0;
   double stale_threshold_fraction = 0.0;
+  double delete_compact_fraction = 0.0;
   std::size_t block_count = 0;
   std::size_t stale_block_count = 0;
   std::size_t summary_rebuild_count = 0;
@@ -1140,6 +1147,7 @@ struct CompareSummary {
   long long local_compaction_ns_stage = 0;
   double avg_local_compaction_us_stage = 0.0;
   std::size_t local_delta_bound = 0;
+  std::size_t delete_compact_bound = 0;
   std::size_t max_local_delta_size = 0;
   std::size_t blocks_with_delta = 0;
   std::size_t pieces = 0;
@@ -2840,6 +2848,9 @@ class LocalBoundedCompactQueryOverlay {
       return false;
     }
     LocalBoundedOverlayBlock* block = object_to_block_[oid];
+    const GeometryMeta& meta = metadata_[oid];
+    const bool summary_critical =
+        block != nullptr && is_summary_critical(*block, meta);
     live_[oid] = 0;
     object_to_block_[oid] = nullptr;
     if (oid < in_delta_.size() && in_delta_[oid]) {
@@ -2854,8 +2865,10 @@ class LocalBoundedCompactQueryOverlay {
       }
       ++block->dead_count;
       block->stale = true;
-      if (should_rebuild(*block)) {
+      if (should_compact_after_delete(*block)) {
         compact_block(block);
+      } else if (summary_critical) {
+        refresh_block_summary(block);
       }
     }
     return true;
@@ -3020,6 +3033,7 @@ class LocalBoundedCompactQueryOverlay {
   std::size_t local_compaction_count() const { return local_compaction_count_; }
   long long local_compaction_ns() const { return local_compaction_ns_; }
   std::size_t local_delta_bound() const { return local_delta_bound_; }
+  std::size_t delete_compact_bound() const { return delete_compact_bound_; }
   std::size_t max_local_delta_size() const {
     std::size_t value = 0;
     for (const LocalBoundedOverlayBlock* block : directory_) {
@@ -3108,22 +3122,39 @@ class LocalBoundedCompactQueryOverlay {
     ++block->live_count;
   }
 
-  std::size_t stale_threshold_count() const {
-    if (options_.stale_threshold_fraction <= 0.0) {
+  std::size_t delete_compact_threshold_count() const {
+    if (options_.delete_compact_fraction <= 0.0) {
       return 0;
     }
     return std::max<std::size_t>(
         1, static_cast<std::size_t>(
-               std::ceil(options_.stale_threshold_fraction *
+               std::ceil(options_.delete_compact_fraction *
                          static_cast<double>(options_.block_size))));
   }
 
-  bool should_rebuild(const LocalBoundedOverlayBlock& block) const {
-    const std::size_t threshold = stale_threshold_count();
+  bool should_compact_after_delete(const LocalBoundedOverlayBlock& block) const {
+    const std::size_t threshold = delete_compact_bound_;
     if (threshold == 0) {
       return true;
     }
     return block.dead_count >= threshold;
+  }
+
+  bool is_summary_critical(const LocalBoundedOverlayBlock& block,
+                           const GeometryMeta& meta) const {
+    if (block.live_count <= 1) {
+      return true;
+    }
+    const double eps = 1e-9;
+    if (meta.zmin <= block.min_zmin + eps ||
+        meta.zmin >= block.max_zmin - eps ||
+        meta.zmax >= block.max_zmax - eps) {
+      return true;
+    }
+    return meta.envelope.getMinX() <= block.mbr.getMinX() + eps ||
+           meta.envelope.getMaxX() >= block.mbr.getMaxX() - eps ||
+           meta.envelope.getMinY() <= block.mbr.getMinY() + eps ||
+           meta.envelope.getMaxY() >= block.mbr.getMaxY() - eps;
   }
 
   void rebuild_block_summary(LocalBoundedOverlayBlock* block,
@@ -3131,6 +3162,7 @@ class LocalBoundedCompactQueryOverlay {
     bool has_live = false;
     std::size_t live_count = 0;
     std::size_t live_delta_count = 0;
+    std::size_t dead_count = 0;
     std::vector<ObjectId> live_compact_ids;
     std::vector<ObjectId> live_delta_ids;
     if (compact_dead) {
@@ -3144,7 +3176,16 @@ class LocalBoundedCompactQueryOverlay {
     geos::geom::Envelope mbr;
 
     auto visit = [&](ObjectId oid, bool is_delta) {
-      if (oid >= live_.size() || !live_[oid]) {
+      if (oid >= live_.size()) {
+        if (!compact_dead) {
+          ++dead_count;
+        }
+        return;
+      }
+      if (!live_[oid]) {
+        if (!compact_dead) {
+          ++dead_count;
+        }
         return;
       }
       if (compact_dead) {
@@ -3195,8 +3236,8 @@ class LocalBoundedCompactQueryOverlay {
     }
     block->live_count = live_count;
     block->live_delta_count = live_delta_count;
-    block->dead_count = 0;
-    block->stale = false;
+    block->dead_count = compact_dead ? 0 : dead_count;
+    block->stale = block->dead_count > 0;
     if (has_live) {
       block->min_zmin = min_zmin;
       block->max_zmin = max_zmin;
@@ -3222,6 +3263,19 @@ class LocalBoundedCompactQueryOverlay {
     const long long elapsed_ns = ns_count(end - start);
     summary_rebuild_ns_ += elapsed_ns;
     local_compaction_ns_ += elapsed_ns;
+  }
+
+  void refresh_block_summary(LocalBoundedOverlayBlock* block) {
+    auto start = std::chrono::high_resolution_clock::now();
+    const double previous_min_zmin = block->min_zmin;
+    rebuild_block_summary(block, false);
+    if (block->live_count > 0 &&
+        previous_min_zmin != std::numeric_limits<double>::infinity()) {
+      block->min_zmin = std::min(block->min_zmin, previous_min_zmin);
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    ++summary_rebuild_count_;
+    summary_rebuild_ns_ += ns_count(end - start);
   }
 
   void split_block(LocalBoundedOverlayBlock* block) {
@@ -3315,6 +3369,7 @@ class LocalBoundedCompactQueryOverlay {
   std::vector<LocalBoundedOverlayBlock*> directory_;
   std::uint64_t next_block_id_ = 0;
   std::size_t local_delta_bound_ = 0;
+  std::size_t delete_compact_bound_ = delete_compact_threshold_count();
   std::size_t summary_rebuild_count_ = 0;
   long long summary_rebuild_ns_ = 0;
   std::size_t local_compaction_count_ = 0;
@@ -3399,6 +3454,9 @@ class DeliAlexHybridLocalBoundedIndex {
     return overlay_.local_compaction_ns();
   }
   std::size_t local_delta_bound() const { return overlay_.local_delta_bound(); }
+  std::size_t delete_compact_bound() const {
+    return overlay_.delete_compact_bound();
+  }
   std::size_t max_local_delta_size() const {
     return overlay_.max_local_delta_size();
   }
@@ -3628,6 +3686,7 @@ CompareSummary finalize_compare_summary(
   summary.oracle_query_ns = oracle_query_ns;
   summary.block_size = options.block_size;
   summary.stale_threshold_fraction = options.stale_threshold_fraction;
+  summary.delete_compact_fraction = options.delete_compact_fraction;
   return summary;
 }
 
@@ -3752,6 +3811,7 @@ CompareSummary convert_deli_summary(const CheckpointSummary& source,
   summary.oracle_query_ns = source.boost_query_ns;
   summary.block_size = options.block_size;
   summary.stale_threshold_fraction = options.stale_threshold_fraction;
+  summary.delete_compact_fraction = options.delete_compact_fraction;
   summary.block_count = source.block_count;
   summary.stale_block_count = source.stale_block_count;
   summary.summary_rebuild_count = source.summary_rebuild_count;
@@ -4092,7 +4152,8 @@ void write_compare_csv(const std::string& path,
          "p95_query_ns,p99_query_ns,candidates,exact_calls,answers,"
          "candidate_answer_ratio,zero_answer_queries,answers_match_boost,"
          "missing_count,extra_count,oracle_build_ns,oracle_query_ns,"
-         "block_size,stale_threshold_fraction,block_count,stale_block_count,"
+         "block_size,stale_threshold_fraction,delete_compact_fraction,"
+         "block_count,stale_block_count,"
          "summary_rebuild_count,summary_rebuild_ns,"
          "summary_rebuild_count_total,summary_rebuild_ns_total,"
          "summary_rebuild_count_stage,summary_rebuild_ns_stage,"
@@ -4100,7 +4161,7 @@ void write_compare_csv(const std::string& path,
          "local_compaction_count_total,local_compaction_ns_total,"
          "local_compaction_count_stage,local_compaction_ns_stage,"
          "avg_local_compaction_us_stage,local_delta_bound,"
-         "max_local_delta_size,blocks_with_delta,pieces,"
+         "delete_compact_bound,max_local_delta_size,blocks_with_delta,pieces,"
          "tree_size,tree_depth,tree_nodes,index_bytes_estimate,success_count,"
          "failed_count,validate_ok,seed,lines_seen,parse_errors,note\n";
   output << std::setprecision(17);
@@ -4120,7 +4181,8 @@ void write_compare_csv(const std::string& path,
            << "," << row.missing_count << "," << row.extra_count << ","
            << row.oracle_build_ns << "," << row.oracle_query_ns << ","
            << row.block_size << "," << row.stale_threshold_fraction << ","
-           << row.block_count << "," << row.stale_block_count << ","
+           << row.delete_compact_fraction << "," << row.block_count << ","
+           << row.stale_block_count << ","
            << row.summary_rebuild_count << "," << row.summary_rebuild_ns
            << "," << row.summary_rebuild_count_total << ","
            << row.summary_rebuild_ns_total << ","
@@ -4133,8 +4195,9 @@ void write_compare_csv(const std::string& path,
            << row.local_compaction_count_stage << ","
            << row.local_compaction_ns_stage << ","
            << row.avg_local_compaction_us_stage << ","
-           << row.local_delta_bound << "," << row.max_local_delta_size << ","
-           << row.blocks_with_delta << "," << row.pieces << ","
+           << row.local_delta_bound << "," << row.delete_compact_bound << ","
+           << row.max_local_delta_size << "," << row.blocks_with_delta << ","
+           << row.pieces << ","
            << row.tree_size << "," << row.tree_depth << ","
            << row.tree_nodes << "," << row.index_bytes_estimate << ","
            << row.success_count << "," << row.failed_count << ","
@@ -4238,6 +4301,16 @@ int main(int argc, char* argv[]) {
               << (options.local_delta_bound == 0
                       ? std::max<std::size_t>(64, options.block_size / 4)
                       : options.local_delta_bound)
+              << " delete_compact_fraction="
+              << options.delete_compact_fraction
+              << " delete_compact_bound="
+              << (options.delete_compact_fraction <= 0.0
+                      ? 0
+                      : std::max<std::size_t>(
+                            1, static_cast<std::size_t>(
+                                   std::ceil(options.delete_compact_fraction *
+                                             static_cast<double>(
+                                                 options.block_size)))))
               << " load_ms=" << ns_count(load_end - load_start) / 1e6
               << "\n";
 
@@ -4844,6 +4917,8 @@ int main(int argc, char* argv[]) {
         deli_alex_hybrid_local_bounded.local_compaction_ns();
     rows.back().local_delta_bound =
         deli_alex_hybrid_local_bounded.local_delta_bound();
+    rows.back().delete_compact_bound =
+        deli_alex_hybrid_local_bounded.delete_compact_bound();
     rows.back().max_local_delta_size =
         deli_alex_hybrid_local_bounded.max_local_delta_size();
     rows.back().blocks_with_delta =
@@ -4863,8 +4938,10 @@ int main(int argc, char* argv[]) {
       }
     }
     rows.back().note =
-        "DELI-ALEX-Hybrid-LocalBounded uses per-block bounded delta and local compaction; local_delta_bound=" +
-        std::to_string(deli_alex_hybrid_local_bounded.local_delta_bound());
+        "DELI-ALEX-Hybrid-LocalBounded uses per-block bounded delta and lazy tombstone compaction; local_delta_bound=" +
+        std::to_string(deli_alex_hybrid_local_bounded.local_delta_bound()) +
+        " delete_compact_bound=" +
+        std::to_string(deli_alex_hybrid_local_bounded.delete_compact_bound());
     print_compare_summary(rows.back());
 
     auto hybrid_local_insert_start =
@@ -4906,6 +4983,8 @@ int main(int argc, char* argv[]) {
         deli_alex_hybrid_local_bounded.local_compaction_ns();
     rows.back().local_delta_bound =
         deli_alex_hybrid_local_bounded.local_delta_bound();
+    rows.back().delete_compact_bound =
+        deli_alex_hybrid_local_bounded.delete_compact_bound();
     rows.back().max_local_delta_size =
         deli_alex_hybrid_local_bounded.max_local_delta_size();
     rows.back().blocks_with_delta =
@@ -4925,8 +5004,10 @@ int main(int argc, char* argv[]) {
       }
     }
     rows.back().note =
-        "DELI-ALEX-Hybrid-LocalBounded uses per-block bounded delta and local compaction; local_delta_bound=" +
-        std::to_string(deli_alex_hybrid_local_bounded.local_delta_bound());
+        "DELI-ALEX-Hybrid-LocalBounded uses per-block bounded delta and lazy tombstone compaction; local_delta_bound=" +
+        std::to_string(deli_alex_hybrid_local_bounded.local_delta_bound()) +
+        " delete_compact_bound=" +
+        std::to_string(deli_alex_hybrid_local_bounded.delete_compact_bound());
     print_compare_summary(rows.back());
 
     auto hybrid_local_delete_start =
@@ -4969,6 +5050,8 @@ int main(int argc, char* argv[]) {
         deli_alex_hybrid_local_bounded.local_compaction_ns();
     rows.back().local_delta_bound =
         deli_alex_hybrid_local_bounded.local_delta_bound();
+    rows.back().delete_compact_bound =
+        deli_alex_hybrid_local_bounded.delete_compact_bound();
     rows.back().max_local_delta_size =
         deli_alex_hybrid_local_bounded.max_local_delta_size();
     rows.back().blocks_with_delta =
@@ -4988,8 +5071,10 @@ int main(int argc, char* argv[]) {
       }
     }
     rows.back().note =
-        "DELI-ALEX-Hybrid-LocalBounded uses per-block bounded delta and local compaction; local_delta_bound=" +
-        std::to_string(deli_alex_hybrid_local_bounded.local_delta_bound());
+        "DELI-ALEX-Hybrid-LocalBounded uses per-block bounded delta and lazy tombstone compaction; local_delta_bound=" +
+        std::to_string(deli_alex_hybrid_local_bounded.local_delta_bound()) +
+        " delete_compact_bound=" +
+        std::to_string(deli_alex_hybrid_local_bounded.delete_compact_bound());
     print_compare_summary(rows.back());
 
     // Boost R-tree.

@@ -87,6 +87,8 @@ def field_order(rows):
         "insert_ms",
         "delete_ms",
         "local_delta_bound",
+        "delete_compact_fraction",
+        "delete_compact_bound",
         "max_local_delta_size",
         "blocks_with_delta",
         "summary_rebuild_count",

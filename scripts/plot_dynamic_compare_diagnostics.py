@@ -132,6 +132,8 @@ def write_notes(rows, output_dir, prefix):
                     f"match={row.get('answers_match_boost')}, "
                     f"index_mb_est={as_float(row, 'index_mb_estimate'):.3f}, "
                     f"local_delta_bound={as_float(row, 'local_delta_bound'):.0f}, "
+                    f"delete_compact_fraction={as_float(row, 'delete_compact_fraction'):.2f}, "
+                    f"delete_compact_bound={as_float(row, 'delete_compact_bound'):.0f}, "
                     f"max_local_delta={as_float(row, 'max_local_delta_size'):.0f}, "
                     f"blocks_with_delta={as_float(row, 'blocks_with_delta'):.0f}, "
                     f"local_compactions_stage={as_float(row, 'local_compaction_count_stage'):.0f}, "

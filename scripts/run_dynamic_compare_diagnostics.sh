@@ -67,6 +67,10 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     DELI-ALEX-Hybrid-LocalBounded 的每个 block 局部 delta 上限。
     默认 0，表示自动使用 max(64, BLOCK_SIZE/4)，把每个 block 的额外扫描量控制在约 25%。
 
+  DELETE_COMPACT_FRACTION
+    DELI-ALEX-Hybrid-LocalBounded 的删除物理压缩阈值。
+    默认 0.25，表示每个 block 最多容忍约 25% tombstone 后才做 physical compaction。
+
   INITIAL_FRACTION / INSERT_FRACTION / DELETE_FRACTION
     默认 0.5 / 0.2 / 0.1。
 
@@ -97,6 +101,7 @@ SELECTIVITY_TAGS="${SELECTIVITY_TAGS:-1pct}"
 BLOCK_SIZE="${BLOCK_SIZE:-512}"
 STALE_THRESHOLD="${STALE_THRESHOLD:-0.05}"
 LOCAL_DELTA_BOUND="${LOCAL_DELTA_BOUND:-0}"
+DELETE_COMPACT_FRACTION="${DELETE_COMPACT_FRACTION:-0.25}"
 PIECE_LIMIT="${PIECE_LIMIT:-10000}"
 
 INITIAL_FRACTION="${INITIAL_FRACTION:-0.5}"
@@ -240,6 +245,7 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --block_size "$BLOCK_SIZE" \
           --stale_threshold_fraction "$STALE_THRESHOLD" \
           --local_delta_bound "$LOCAL_DELTA_BOUND" \
+          --delete_compact_fraction "$DELETE_COMPACT_FRACTION" \
           --piece_limit "$PIECE_LIMIT" \
           --cell_size "$CELL_SIZE" \
           --seed "$SEED" \
