@@ -82,24 +82,130 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   INITIAL_FRACTION / INSERT_FRACTION / DELETE_FRACTION
     默认 0.5 / 0.2 / 0.1。
 
-  WORKLOAD_MODE
+  WORKLOAD_MODE  混合负载模式，区别于GLIN的stage负载模式，混合负载更能体现真实场景
     staged：默认，bulk-load -> insert -> query -> delete -> query。
-    mixed：单线程交错 mixed workload。
+    mixed：单线程交错 mixed workload。 查询和插入删除是依次交替执行的，也就是说，系统会先生成一条操作序列，例如：
+    query
+    query
+    insert
+    query
+    delete
+    query
+    query
+    insert
+    ...
+    然后所有方法都按照这条完全相同的序列一个操作一个操作地执行，所以它不是：
+    一个线程一直query
+    一个线程一直insrt
+    一个线程一直delete
+    而是：
+    同一个线程里query/insert/delete交错出现
+    这样做的好处是公平／容易复现，也不会引入多线程锁，一致性／后台维护这些复杂问题
 
-  MIXED_PROFILES
+    那么问题来了，混合负载是如何保证不同的索引，在查询和插入删除时的对象是相同的？并保证结果可重复？
+      因为 mixed workload 里有随机过程，例如：
+      插入对象的顺序
+      删除对象的选择
+      query/insert/delete 操作序列
+      这些随机过程不是用真正不可控的随机数，而是用伪随机数生成器：
+      std::mt19937_64 rng(options.seed);
+      只要：
+      seed 一样
+      数据集一样
+      QUERY_COUNT 一样
+      MIXED_OPERATIONS 一样
+      比例一样
+      代码一样
+    查询对象是一样是因为query文件是一致的，但是我不理解它是怎么保证不同方法的插入和删除的对象是一样的呢？
+      生成mixed workload 混合查询负载，这个会生成一个固定的操作序列，如：
+
+      1: query query[0]
+      2: query query[1]
+      3: insert object 812345
+      4: query query[2]
+      5: delete object 12345
+      6: query query[3]
+      ...
+      100000: delete object 456789
+
+
+      所有方法会复用这个操作序列，所以能保证
+      所以不同方法的：
+      第几步是 query
+      第几步是 insert
+      插入哪个 object_id
+      第几步是 delete
+      删除哪个 object_id
+      都是一样的。
+      为什么删除对象也能一样？因为生成操作序列时，代码内部维护了一个“模拟 live set”。
+      简单说：
+      初始 live set = bulk-load 的 50% 对象
+      insert 时：从未插入对象池里取一个 object_id，并加入 live set
+      delete 时：从当前 live set 里选一个 object_id，并从 live set 删除
+      这个过程只发生在生成 workload 时。生成完后，delete 的 object_id 已经固定了。后面每个方法只是照着执行：
+      delete object 12345
+      而不是自己再随机选要删谁。
+      所以公平性来自两层：
+      1. seed 固定 -> 生成出来的 operations 固定
+      2. operations 先生成好 -> 所有方法复用同一条操作序列
+
+
+  MIXED_PROFILES    profile可以理解成“负载模板或者是读写场景配置”
     WORKLOAD_MODE=mixed 时一次跑哪些 profile。
     默认：read_heavy balanced write_heavy。
 
-  MIXED_OPERATIONS
-    每个 mixed profile 的交错操作总数。默认 100000。
+  MIXED_OPERATIONS   总操作次数
+    每个 mixed profile 的交错操作总数即查询，插入和删除次数的总和。默认 100000。
+    总操作数是10万，它会按设置好的读写场景配置来分配次数，比如read_heavy：90%query，5%insert,5%delete,那么就是9万次query,5000次插入，5000次删除
+    
+
 
   MIXED_CHECKPOINT_INTERVAL
-    每隔多少个 mixed 操作输出 checkpoint。默认 10000。
+    每隔多少个 mixed 操作输出 checkpoint。默认 10000。  checkpoint就是“中途拍一次快照”，mixed workload是一边查询，一边插入，一边删除，如果只看最后的结果，就不会知道索引是不是中途越来越慢。
+    所以每隔一段操作，停下来记录一次当前状态，比如：
+    当前已经执行了多少操作
+    这一段 query 平均延迟是多少
+    P95/P99延迟是多少
+    insert/delete 吞吐量是多少
+    答案是否仍然正确
+    tombstone 有没有堆积
+
+    如果MIXED_OPERATIONS=100000，MIXED_CHECKPOINT_INTERVAL=10000,查询插入及删除的总操作数是10万，但是每执行一万次操作就会执行一次checkpoint快照，会输出10个checkpoint:
+    mixed_10000,mixed_20000,mixed_30000...,这个快照的频率越高，实验运行时间肯定越长
 
   AUTO_GENERATE_QUERIES
     0：缺 query 文件就报错。
     1：缺 query 文件时调用 JTS STRtree KNN query generator 自动生成。
     默认：0。
+
+  QUERY_COUNT 是“查询样本池大小”
+    因为mixed workload里有很多query操作，但是我们不想每次query都现场随机生成一个查询窗口，这样不稳定，也不方便和其它实验对齐所以脚本会先从query文件里读取固定数量的query，例如
+    QUERY_COUNT=200
+    表示读取200条query,形成一个query pool:
+    query[0]
+    query[1]
+    ...
+    query[199]
+    mixed workload运行时，每遇到一个query操作，就从这个pool里，取一个query用。
+    如果query操作超过200次，就循环使用：
+    第1次query用query[0]
+    第200次query用query[199]
+    第201次query又用query[0]
+    为什么要这样做？
+        1.保证公平：所有方法查询的是同一批query
+        2.保证复现：同一seed,同一query文件，结果可重复
+        3.控制实验规模，如果QUERY_COUNT太大，correctness检查会很慢
+        4.稳定统计：如果QUERY_COUNT太小，P95/P99容易被少数query偶然影响，因为不具有代表性，有的范围大，有的范围小
+
+
+  QUERY_COUNT的取值怎么确定呢？它和数据集的大小，查询选择性，工作负载有关系吗？其实是有的，但是没有一个固定的关系，只能说当查询选择性较低时，或者数据集的量比较小，QUERY_COUNT要取大一些比如500，1000
+
+  
+  query文件是用脚本生成的scripts/generate_jts_strtree_knn_queries.sh，它的核心思想是用JTS STRTree在数据集上找邻近对象，然后生成能达到目标selectivity的查询窗口，比如
+    0p1pct
+    1pct
+  分别表示希望query的答案规模大约对应数据集一定的比例。这样比随机生成随机框更稳定，因为不同数据集大小和空间分布不同。
+
 
 输出：
   RESULT_DIR/dynamic_compare_summary.csv
@@ -130,7 +236,7 @@ PIECE_LIMIT="${PIECE_LIMIT:-10000}"
 INITIAL_FRACTION="${INITIAL_FRACTION:-0.5}"
 INSERT_FRACTION="${INSERT_FRACTION:-0.2}"
 DELETE_FRACTION="${DELETE_FRACTION:-0.1}"
-QUERY_COUNT="${QUERY_COUNT:-100}"
+QUERY_COUNT="${QUERY_COUNT:-100}"          query_count不是操作总数，而是“查询样本池大小”
 CELL_SIZE="${CELL_SIZE:-0.0000005}"
 SEED="${SEED:-42}"
 WORKLOAD_MODE="${WORKLOAD_MODE:-staged}"

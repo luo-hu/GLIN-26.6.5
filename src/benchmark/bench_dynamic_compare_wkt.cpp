@@ -4359,6 +4359,39 @@ struct LiveReplayState {
     position[oid] = std::numeric_limits<std::size_t>::max();
   }
 };
+//生成mixed workload 混合查询负载，这个会生成一个固定的操作序列，如：
+
+/*
+1: query query[0]
+2: query query[1]
+3: insert object 812345
+4: query query[2]
+5: delete object 12345
+6: query query[3]
+...
+100000: delete object 456789
+*/
+
+/*所有方法会复用这个操作序列，所以能保证
+所以不同方法的：
+第几步是 query
+第几步是 insert
+插入哪个 object_id
+第几步是 delete
+删除哪个 object_id
+都是一样的。
+为什么删除对象也能一样？因为生成操作序列时，代码内部维护了一个“模拟 live set”。
+简单说：
+初始 live set = bulk-load 的 50% 对象
+insert 时：从未插入对象池里取一个 object_id，并加入 live set
+delete 时：从当前 live set 里选一个 object_id，并从 live set 删除
+这个过程只发生在生成 workload 时。生成完后，delete 的 object_id 已经固定了。后面每个方法只是照着执行：
+delete object 12345
+而不是自己再随机选要删谁。
+所以公平性来自两层：
+1. seed 固定 -> 生成出来的 operations 固定
+2. operations 先生成好 -> 所有方法复用同一条操作序列
+*/
 
 std::vector<MixedOperation> generate_mixed_operations(
     const Options& options,
