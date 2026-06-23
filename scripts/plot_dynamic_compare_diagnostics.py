@@ -83,6 +83,8 @@ def order_key(row):
 
 def plot_metric(rows, output_dir, prefix, checkpoint, metric, ylabel, filename, dpi, log_y=False):
     subset = [row for row in rows if row["checkpoint"] == checkpoint]
+    if metric == "answers_match_boost":
+        subset = [row for row in subset if row.get(metric) != "-1"]
     if not subset:
         return None
     groups = sorted({(row["dataset"], row.get("selectivity", "")) for row in subset})
@@ -168,6 +170,7 @@ def write_notes(rows, output_dir, prefix):
         handle.write("当 workload_mode=mixed 时，横轴 operation_count 表示单线程交错操作进度。\n")
         handle.write("mixed workload 的 avg/p95/p99 query latency 来自交错执行中真实发生的 query；correctness 在 checkpoint final state 上用固定 query set 与 Boost exact oracle 对齐。\n")
         handle.write("answers_match_boost=1 表示该方法在该 checkpoint 的答案集合与 Boost exact oracle 一致。\n")
+        handle.write("answers_match_boost=-1 表示本次 checkpoint 按 CHECK_CORRECTNESS/CORRECTNESS_EVERY_N 设置跳过了 oracle 检查，不代表答案错误。\n")
         handle.write("index_mb_estimate 是粗略估算，不等价于精确内存 profiler；用于先判断数量级。\n\n")
         for checkpoint in ["after_bulkload", "after_insert", "after_delete"]:
             handle.write(f"{checkpoint}\n")

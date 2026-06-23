@@ -79,6 +79,30 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     DELI-ALEX-Hybrid-LocalBounded 的删除物理压缩阈值。
     默认 0.25，表示每个 block 最多容忍约 25% tombstone 后才做 physical compaction。
 
+  INDEXES
+    只跑指定索引，避免每次都把所有方法重建一遍。默认 all。
+    例子：
+      INDEXES="DELI_ALEX_HYBRID_LOCAL_BOUNDED Boost_Rtree"
+    可用名字：
+      DELI_DYNAMIC_SINGLE 
+      DELI_ALEX 
+      DELI_ALEX_HYBRID
+      DELI_ALEX_HYBRID_BUF 
+      DELI_ALEX_HYBRID_BOUNDED
+      DELI_ALEX_HYBRID_LOCAL_BOUNDED 
+      Boost_Rtree
+      GEOS_Quadtree 
+      GLIN_PIECEWISE
+
+  CHECK_CORRECTNESS
+    是否在 checkpoint 上用 Boost R-tree oracle 检查答案正确性。默认 1。
+    设为 0 时跳过 oracle，answers_match_boost 会写成 -1，适合先快速看性能趋势。
+
+  CORRECTNESS_EVERY_N
+    每隔多少个 checkpoint 做一次正确性检查。默认 1，表示每次都查。
+    例子：CORRECTNESS_EVERY_N=5 表示只检查第 5、10、15... 个 checkpoint。
+    设为 0 等价于 CHECK_CORRECTNESS=0。
+
   INITIAL_FRACTION / INSERT_FRACTION / DELETE_FRACTION
     默认 0.5 / 0.2 / 0.1。
 
@@ -153,6 +177,11 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   MIXED_PROFILES    profile可以理解成“负载模板或者是读写场景配置”
     WORKLOAD_MODE=mixed 时一次跑哪些 profile。
     默认：read_heavy balanced write_heavy。
+
+  BATCH_MIXED_PROFILES
+    默认 1。mixed 模式下把 MIXED_PROFILES 合并到同一个 C++ 进程里跑，
+    这样同一个 dataset + selectivity 只加载一次 WKT，能明显减少重复加载成本。
+    设为 0 时恢复旧行为：每个 profile 单独启动一次 benchmark。
 
   MIXED_OPERATIONS   总操作次数
     每个 mixed profile 的交错操作总数即查询，插入和删除次数的总和。默认 100000。
@@ -236,11 +265,15 @@ PIECE_LIMIT="${PIECE_LIMIT:-10000}"
 INITIAL_FRACTION="${INITIAL_FRACTION:-0.5}"
 INSERT_FRACTION="${INSERT_FRACTION:-0.2}"
 DELETE_FRACTION="${DELETE_FRACTION:-0.1}"
-QUERY_COUNT="${QUERY_COUNT:-100}"          query_count不是操作总数，而是“查询样本池大小”
+QUERY_COUNT="${QUERY_COUNT:-100}"  # query_count 不是操作总数，而是“查询样本池大小”。
 CELL_SIZE="${CELL_SIZE:-0.0000005}"
 SEED="${SEED:-42}"
+INDEXES="${INDEXES:-all}"
+CHECK_CORRECTNESS="${CHECK_CORRECTNESS:-1}"
+CORRECTNESS_EVERY_N="${CORRECTNESS_EVERY_N:-1}"
 WORKLOAD_MODE="${WORKLOAD_MODE:-staged}"
 MIXED_PROFILES="${MIXED_PROFILES:-read_heavy balanced write_heavy}"
+BATCH_MIXED_PROFILES="${BATCH_MIXED_PROFILES:-1}"
 MIXED_OPERATIONS="${MIXED_OPERATIONS:-100000}"
 MIXED_CHECKPOINT_INTERVAL="${MIXED_CHECKPOINT_INTERVAL:-10000}"
 
@@ -321,6 +354,20 @@ mixed_profile_ratios() {
   esac
 }
 
+mixed_profile_specs() {
+  local specs=""
+  local profile
+  for profile in $MIXED_PROFILES; do
+    local q i d
+    read -r q i d <<<"$(mixed_profile_ratios "$profile")"
+    if [[ -n "$specs" ]]; then
+      specs+=","
+    fi
+    specs+="${profile}:${q}:${i}:${d}"
+  done
+  echo "$specs"
+}
+
 should_run_file() {
   local path="$1"
   [[ "$OVERWRITE" == "1" || ! -s "$path" ]]
@@ -387,17 +434,31 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
 
       profiles="staged"
       if [[ "$WORKLOAD_MODE" == "mixed" ]]; then
-        profiles="$MIXED_PROFILES"
+        if [[ "$BATCH_MIXED_PROFILES" == "1" ]]; then
+          profiles="__batched__"
+        else
+          profiles="$MIXED_PROFILES"
+        fi
       fi
 
       for profile in $profiles; do
         mixed_query_ratio="0"
         mixed_insert_ratio="0"
         mixed_delete_ratio="0"
+        mixed_profile_specs_arg=""
         raw_suffix="dynamic_compare"
         if [[ "$WORKLOAD_MODE" == "mixed" ]]; then
-          read -r mixed_query_ratio mixed_insert_ratio mixed_delete_ratio <<<"$(mixed_profile_ratios "$profile")"
-          raw_suffix="${profile}_dynamic_compare"
+          if [[ "$profile" == "__batched__" ]]; then
+            mixed_profile_specs_arg="$(mixed_profile_specs)"
+            mixed_query_ratio="1"
+            mixed_insert_ratio="0"
+            mixed_delete_ratio="0"
+            profile="batched"
+            raw_suffix="mixed_profiles_dynamic_compare"
+          else
+            read -r mixed_query_ratio mixed_insert_ratio mixed_delete_ratio <<<"$(mixed_profile_ratios "$profile")"
+            raw_suffix="${profile}_dynamic_compare"
+          fi
         fi
 
         raw_csv="$RESULT_DIR/${dataset}_${tag}_${raw_suffix}.csv"
@@ -411,6 +472,7 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --query_count "$QUERY_COUNT" \
           --workload_mode "$WORKLOAD_MODE" \
           --mixed_profile "$profile" \
+          --mixed_profile_specs "$mixed_profile_specs_arg" \
           --mixed_operations "$MIXED_OPERATIONS" \
           --mixed_checkpoint_interval "$MIXED_CHECKPOINT_INTERVAL" \
           --mixed_query_ratio "$mixed_query_ratio" \
@@ -419,6 +481,9 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --initial_fraction "$INITIAL_FRACTION" \
           --insert_fraction "$INSERT_FRACTION" \
           --delete_fraction "$DELETE_FRACTION" \
+          --indexes "$INDEXES" \
+          --check_correctness "$CHECK_CORRECTNESS" \
+          --correctness_every_n "$CORRECTNESS_EVERY_N" \
           --block_size "$BLOCK_SIZE" \
           --stale_threshold_fraction "$STALE_THRESHOLD" \
           --local_delta_bound "$LOCAL_DELTA_BOUND" \

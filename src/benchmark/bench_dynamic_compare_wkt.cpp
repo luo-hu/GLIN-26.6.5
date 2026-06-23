@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -65,6 +66,8 @@ struct Options {
   std::string output_csv;
   std::string workload_mode = "staged";
   std::string mixed_profile = "custom";
+  std::string mixed_profile_specs;
+  std::string indexes = "all";
   std::size_t limit = 10000;
   std::size_t query_count = 100;
   double initial_fraction = 0.5;
@@ -86,6 +89,7 @@ struct Options {
   double cell_size = 0.0000005;
   std::size_t validate_every = 0;
   bool check_correctness = true;
+  std::size_t correctness_every_n = 1;
   bool stop_on_mismatch = true;
 };
 
@@ -225,11 +229,13 @@ void print_usage(const char* program) {
       << "  --query_count N                  Max queries to run (default: 100)\n"
       << "  --workload_mode staged|mixed     Staged checkpoints or interleaved mixed workload (default: staged)\n"
       << "  --mixed_profile NAME             Mixed workload label in output CSV (default: custom)\n"
+      << "  --mixed_profile_specs LIST       Batched mixed profiles as name:q:i:d entries\n"
       << "  --mixed_operations N             Number of interleaved operations after bulk-load (default: 100000)\n"
       << "  --mixed_checkpoint_interval N    Emit a mixed checkpoint every N operations (default: 10000)\n"
       << "  --mixed_query_ratio F            Mixed query probability (default: 0.90)\n"
       << "  --mixed_insert_ratio F           Mixed insert probability (default: 0.05)\n"
       << "  --mixed_delete_ratio F           Mixed delete probability (default: 0.05)\n"
+      << "  --indexes LIST                   Space/comma separated indexes to run, or all (default: all)\n"
       << "  --initial_fraction F             Bulk-load fraction (default: 0.5)\n"
       << "  --insert_fraction F              Insert fraction of loaded data (default: 0.2)\n"
       << "  --delete_fraction F              Delete fraction of loaded data (default: 0.1)\n"
@@ -244,6 +250,7 @@ void print_usage(const char* program) {
       << "  --cell_size S                    Z-order cell size (default: 5e-7)\n"
       << "  --validate_every N               Validate every N updates; 0 disables (default: 0)\n"
       << "  --check_correctness 0|1          Compare each checkpoint with rebuilt Boost R-tree (default: 1)\n"
+      << "  --correctness_every_n N          Check every N-th checkpoint; 0 disables oracle checks (default: 1)\n"
       << "  --stop_on_mismatch 0|1           Stop if Boost answers differ (default: 1)\n"
       << "  --output_csv PATH                Write checkpoint summary CSV\n";
 }
@@ -276,6 +283,8 @@ Options parse_args(int argc, char* argv[]) {
       options.workload_mode = require_value(key);
     } else if (key == "--mixed_profile") {
       options.mixed_profile = require_value(key);
+    } else if (key == "--mixed_profile_specs") {
+      options.mixed_profile_specs = require_value(key);
     } else if (key == "--mixed_operations") {
       options.mixed_operations =
           static_cast<std::size_t>(std::stoull(require_value(key)));
@@ -288,6 +297,8 @@ Options parse_args(int argc, char* argv[]) {
       options.mixed_insert_ratio = std::stod(require_value(key));
     } else if (key == "--mixed_delete_ratio") {
       options.mixed_delete_ratio = std::stod(require_value(key));
+    } else if (key == "--indexes") {
+      options.indexes = require_value(key);
     } else if (key == "--initial_fraction") {
       options.initial_fraction = std::stod(require_value(key));
     } else if (key == "--insert_fraction") {
@@ -319,6 +330,9 @@ Options parse_args(int argc, char* argv[]) {
           static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--check_correctness") {
       options.check_correctness = std::stoi(require_value(key)) != 0;
+    } else if (key == "--correctness_every_n") {
+      options.correctness_every_n =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--stop_on_mismatch") {
       options.stop_on_mismatch = std::stoi(require_value(key)) != 0;
     } else if (key == "--help" || key == "-h") {
@@ -383,6 +397,9 @@ Options parse_args(int argc, char* argv[]) {
     options.mixed_query_ratio /= ratio_sum;
     options.mixed_insert_ratio /= ratio_sum;
     options.mixed_delete_ratio /= ratio_sum;
+  }
+  if (options.correctness_every_n == 0) {
+    options.check_correctness = false;
   }
   return options;
 }
@@ -3808,6 +3825,8 @@ std::vector<std::unordered_set<ObjectId>> compute_oracle_answers(
   return answers;
 }
 
+bool should_check_correctness(const Options& options, std::size_t checkpoint_id);
+
 template <typename QueryFn>
 CompareSummary run_generic_checkpoint(
     const Options& options,
@@ -3827,9 +3846,12 @@ CompareSummary run_generic_checkpoint(
     QueryFn query_fn) {
   long long oracle_build_ns = 0;
   long long oracle_query_ns = 0;
-  std::vector<std::unordered_set<ObjectId>> oracle_answers =
-      compute_oracle_answers(geometries, live_ids, live, queries,
-                             &oracle_build_ns, &oracle_query_ns);
+  const bool do_correctness = should_check_correctness(options, checkpoint_id);
+  std::vector<std::unordered_set<ObjectId>> oracle_answers;
+  if (do_correctness) {
+    oracle_answers = compute_oracle_answers(geometries, live_ids, live, queries,
+                                            &oracle_build_ns, &oracle_query_ns);
+  }
 
   SimpleQueryAggregate aggregate;
   std::size_t missing_total = 0;
@@ -3837,15 +3859,21 @@ CompareSummary run_generic_checkpoint(
   for (std::size_t i = 0; i < queries.size(); ++i) {
     SimpleQueryResult result = query_fn(queries[i]);
     add_simple_query_result(aggregate, result);
-    missing_total += count_missing(oracle_answers[i], result.answers, nullptr);
-    extra_total += count_missing(result.answers, oracle_answers[i], nullptr);
+    if (do_correctness) {
+      missing_total += count_missing(oracle_answers[i], result.answers, nullptr);
+      extra_total += count_missing(result.answers, oracle_answers[i], nullptr);
+    }
   }
 
-  return finalize_compare_summary(
+  CompareSummary summary = finalize_compare_summary(
       options, index_name, checkpoint, checkpoint_id, geometries.size(),
       initial_count, insert_count, delete_count, live_ids.size(), build_ns,
       insert_ns, delete_ns, aggregate, oracle_build_ns, oracle_query_ns,
       missing_total, extra_total);
+  if (!do_correctness) {
+    summary.answers_match_boost = -1;
+  }
+  return summary;
 }
 
 std::size_t estimate_deli_bytes(const DynamicExtentIndex& index) {
@@ -3979,7 +4007,8 @@ CheckpointSummary run_checkpoint(const Options& options,
 
   long long boost_rebuild_ns = 0;
   std::unique_ptr<RTree> rtree;
-  if (options.check_correctness) {
+  const bool do_correctness = should_check_correctness(options, checkpoint_id);
+  if (do_correctness) {
     rtree = std::make_unique<RTree>(build_live_rtree(index, &boost_rebuild_ns));
     summary.boost_rebuild_ns = boost_rebuild_ns;
   } else {
@@ -3997,7 +4026,7 @@ CheckpointSummary run_checkpoint(const Options& options,
     QueryResult result = index.query(query_case);
     add_query_result(aggregate, result);
 
-    if (options.check_correctness) {
+    if (do_correctness) {
       long long boost_query_ns = 0;
       std::unordered_set<ObjectId> boost_answers =
           query_boost_exact(*rtree, geometries, query_case, &boost_query_ns);
@@ -4040,14 +4069,14 @@ CheckpointSummary run_checkpoint(const Options& options,
       static_cast<double>(aggregate.exact_calls) /
       static_cast<double>(std::max<std::size_t>(aggregate.answers, 1));
   summary.zero_answer_queries = aggregate.zero_answer_queries;
-  if (options.check_correctness) {
+  if (do_correctness) {
     summary.answers_match_boost = (missing_total == 0 && extra_total == 0) ? 1 : 0;
   }
   summary.missing_count = missing_total;
   summary.extra_count = extra_total;
   summary.boost_query_ns = boost_query_total_ns;
 
-  if (!summary.answers_match_boost) {
+  if (do_correctness && !summary.answers_match_boost) {
     std::cerr << "Answer mismatch at " << checkpoint
               << ": missing=" << missing_total
               << " extra=" << extra_total;
@@ -4149,6 +4178,97 @@ void print_checkpoint_summary(const CheckpointSummary& summary) {
 std::size_t fraction_count(double fraction, std::size_t total) {
   return static_cast<std::size_t>(
       std::floor(fraction * static_cast<double>(total)));
+}
+
+std::vector<std::string> split_list(const std::string& value) {
+  std::vector<std::string> items;
+  std::string current;
+  for (char ch : value) {
+    if (ch == ',' || std::isspace(static_cast<unsigned char>(ch))) {
+      if (!current.empty()) {
+        items.push_back(current);
+        current.clear();
+      }
+    } else {
+      current.push_back(ch);
+    }
+  }
+  if (!current.empty()) {
+    items.push_back(current);
+  }
+  return items;
+}
+
+bool index_enabled(const Options& options, const std::string& index_name) {
+  if (options.indexes.empty() || options.indexes == "all" ||
+      options.indexes == "ALL") {
+    return true;
+  }
+  for (const std::string& item : split_list(options.indexes)) {
+    if (item == index_name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool should_check_correctness(const Options& options,
+                              std::size_t checkpoint_id) {
+  return options.check_correctness && options.correctness_every_n > 0 &&
+         ((checkpoint_id + 1) % options.correctness_every_n == 0);
+}
+
+std::vector<std::string> split_colon_fields(const std::string& value) {
+  std::vector<std::string> fields;
+  std::string current;
+  for (char ch : value) {
+    if (ch == ':') {
+      fields.push_back(current);
+      current.clear();
+    } else {
+      current.push_back(ch);
+    }
+  }
+  fields.push_back(current);
+  return fields;
+}
+
+void normalize_mixed_ratios(Options& options) {
+  const double ratio_sum = options.mixed_query_ratio +
+                           options.mixed_insert_ratio +
+                           options.mixed_delete_ratio;
+  if (ratio_sum <= 0.0) {
+    throw std::runtime_error("mixed workload ratios must sum to > 0");
+  }
+  options.mixed_query_ratio /= ratio_sum;
+  options.mixed_insert_ratio /= ratio_sum;
+  options.mixed_delete_ratio /= ratio_sum;
+}
+
+std::vector<Options> expand_mixed_profile_options(const Options& base) {
+  if (base.mixed_profile_specs.empty()) {
+    return {base};
+  }
+
+  std::vector<Options> runs;
+  for (const std::string& spec : split_list(base.mixed_profile_specs)) {
+    std::vector<std::string> fields = split_colon_fields(spec);
+    if (fields.size() != 4 || fields[0].empty()) {
+      throw std::runtime_error(
+          "--mixed_profile_specs entries must be name:query:insert:delete");
+    }
+    Options item = base;
+    item.mixed_profile = fields[0];
+    item.mixed_query_ratio = std::stod(fields[1]);
+    item.mixed_insert_ratio = std::stod(fields[2]);
+    item.mixed_delete_ratio = std::stod(fields[3]);
+    normalize_mixed_ratios(item);
+    runs.push_back(item);
+  }
+  if (runs.empty()) {
+    return {base};
+  }
+  return runs;
 }
 
 std::vector<Geometry*> raw_ptrs_for_ids(
@@ -4458,6 +4578,7 @@ void mixed_correctness_check(const Options& options,
                              const std::vector<GeometryPtr>& geometries,
                              const std::vector<QueryCase>& queries,
                              const LiveReplayState& state,
+                             std::size_t checkpoint_id,
                              QueryFn query_fn,
                              long long* oracle_build_ns,
                              long long* oracle_query_ns,
@@ -4467,7 +4588,7 @@ void mixed_correctness_check(const Options& options,
   *oracle_query_ns = 0;
   *missing_total = 0;
   *extra_total = 0;
-  if (!options.check_correctness) {
+  if (!should_check_correctness(options, checkpoint_id)) {
     return;
   }
 
@@ -4512,7 +4633,9 @@ void run_mixed_workload_for_index(
     long long oracle_query_ns = 0;
     std::size_t missing_total = 0;
     std::size_t extra_total = 0;
-    mixed_correctness_check(options, geometries, queries, state, query_fn,
+    const bool do_correctness = should_check_correctness(options, checkpoint_id);
+    mixed_correctness_check(options, geometries, queries, state, checkpoint_id,
+                            query_fn,
                             &oracle_build_ns, &oracle_query_ns,
                             &missing_total, &extra_total);
 
@@ -4529,7 +4652,7 @@ void run_mixed_workload_for_index(
     row.checkpoint_ops = completed_ops - interval_begin;
     row.success_count = interval_success;
     row.failed_count = interval_failed;
-    if (!options.check_correctness) {
+    if (!do_correctness) {
       row.answers_match_boost = -1;
     }
     annotate_fn(row);
@@ -4688,6 +4811,10 @@ int main(int argc, char* argv[]) {
     std::vector<CompareSummary> rows;
 
     if (options.workload_mode == "mixed") {
+      std::vector<Options> mixed_option_runs =
+          expand_mixed_profile_options(options);
+      for (const Options& active_options : mixed_option_runs) {
+        const Options& options = active_options;
       std::vector<MixedOperation> operations = generate_mixed_operations(
           options, geometries.size(), initial_count, queries.size());
 
@@ -4709,7 +4836,7 @@ int main(int argc, char* argv[]) {
         row.note = "Mixed workload; DELI-Dynamic-Single.";
       };
 
-      {
+      if (index_enabled(options, "DELI_DYNAMIC_SINGLE")) {
         DynamicExtentIndex mixed_index(options, geometries);
         auto start = std::chrono::high_resolution_clock::now();
         mixed_index.bulk_load(initial_ids);
@@ -4730,7 +4857,7 @@ int main(int argc, char* argv[]) {
             rows);
       }
 
-      {
+      if (index_enabled(options, "DELI_ALEX")) {
         DeliAlexIndex mixed_index(options, geometries, geometry_metadata);
         auto start = std::chrono::high_resolution_clock::now();
         mixed_index.bulk_load(initial_ids);
@@ -4786,14 +4913,14 @@ int main(int argc, char* argv[]) {
             rows);
       };
 
-      {
+      if (index_enabled(options, "DELI_ALEX_HYBRID")) {
         DeliAlexHybridIndex mixed_index(options, geometries, geometry_metadata);
         auto start = std::chrono::high_resolution_clock::now();
         mixed_index.bulk_load(initial_ids);
         auto end = std::chrono::high_resolution_clock::now();
         run_mixed_hybrid("DELI_ALEX_HYBRID", mixed_index, ns_count(end - start));
       }
-      {
+      if (index_enabled(options, "DELI_ALEX_HYBRID_BUF")) {
         DeliAlexHybridBufferedIndex mixed_index(options, geometries,
                                                 geometry_metadata, false);
         auto start = std::chrono::high_resolution_clock::now();
@@ -4802,7 +4929,7 @@ int main(int argc, char* argv[]) {
         run_mixed_hybrid("DELI_ALEX_HYBRID_BUF", mixed_index,
                          ns_count(end - start));
       }
-      {
+      if (index_enabled(options, "DELI_ALEX_HYBRID_BOUNDED")) {
         DeliAlexHybridBufferedIndex mixed_index(options, geometries,
                                                 geometry_metadata, true);
         auto start = std::chrono::high_resolution_clock::now();
@@ -4811,7 +4938,7 @@ int main(int argc, char* argv[]) {
         run_mixed_hybrid("DELI_ALEX_HYBRID_BOUNDED", mixed_index,
                          ns_count(end - start));
       }
-      {
+      if (index_enabled(options, "DELI_ALEX_HYBRID_LOCAL_BOUNDED")) {
         DeliAlexHybridLocalBoundedIndex mixed_index(options, geometries,
                                                     geometry_metadata);
         auto start = std::chrono::high_resolution_clock::now();
@@ -4852,7 +4979,7 @@ int main(int argc, char* argv[]) {
             rows);
       }
 
-      {
+      if (index_enabled(options, "Boost_Rtree")) {
         auto start = std::chrono::high_resolution_clock::now();
         RTree mixed_index =
             build_rtree_for_ids(geometries, initial_ids, live_bulkload, nullptr);
@@ -4885,7 +5012,7 @@ int main(int argc, char* argv[]) {
             rows);
       }
 
-      {
+      if (index_enabled(options, "GEOS_Quadtree")) {
         Quadtree mixed_index;
         auto start = std::chrono::high_resolution_clock::now();
         for (ObjectId oid : initial_ids) {
@@ -4920,7 +5047,7 @@ int main(int argc, char* argv[]) {
             rows);
       }
 
-      {
+      if (index_enabled(options, "GLIN_PIECEWISE")) {
         alex::Glin<double, Geometry*> mixed_index;
         std::vector<std::tuple<double, double, double, double>> mixed_pieces;
         std::vector<Geometry*> glin_initial =
@@ -4967,6 +5094,7 @@ int main(int argc, char* argv[]) {
             },
             rows);
       }
+      }
 
       annotate_stage_maintenance(rows);
       write_compare_csv(options.output_csv, options, stats, rows);
@@ -4977,6 +5105,7 @@ int main(int argc, char* argv[]) {
     }
 
     // DELI-Dynamic-Single.
+    if (index_enabled(options, "DELI_DYNAMIC_SINGLE")) {
     DynamicExtentIndex index(options, geometries);
     auto build_start = std::chrono::high_resolution_clock::now();
     index.bulk_load(initial_ids);
@@ -5044,8 +5173,10 @@ int main(int argc, char* argv[]) {
     rows.push_back(convert_deli_summary(
         deli_delete, options, build_ns, estimate_deli_bytes(index)));
     print_compare_summary(rows.back());
+    }
 
     // DELI-ALEX: existing ALEX leaf layout + DELI leaf summaries.
+    if (index_enabled(options, "DELI_ALEX")) {
     DeliAlexIndex deli_alex(options, geometries, geometry_metadata);
     auto deli_alex_build_start = std::chrono::high_resolution_clock::now();
     deli_alex.bulk_load(initial_ids);
@@ -5142,9 +5273,11 @@ int main(int argc, char* argv[]) {
     rows.back().note =
         "DELI-ALEX uses existing ALEX leaves plus IntervalOverlap-style leaf-group summaries.";
     print_compare_summary(rows.back());
+    }
 
     // DELI-ALEX-Hybrid: ALEX handles dynamic writes; a compact object-id
     // block overlay handles exact-query pruning and cache-friendly scans.
+    if (index_enabled(options, "DELI_ALEX_HYBRID")) {
     DeliAlexHybridIndex deli_alex_hybrid(options, geometries,
                                          geometry_metadata);
     auto hybrid_build_start = std::chrono::high_resolution_clock::now();
@@ -5267,9 +5400,11 @@ int main(int argc, char* argv[]) {
     rows.back().note =
         "DELI-ALEX-Hybrid uses ALEX for writes plus a compact IntervalOverlap-style object-id overlay for queries.";
     print_compare_summary(rows.back());
+    }
 
     // DELI-ALEX-Hybrid-Buffered: same query overlay idea, but new inserts are
     // appended into small delta blocks before being queried as sorted segments.
+    if (index_enabled(options, "DELI_ALEX_HYBRID_BUF")) {
     DeliAlexHybridBufferedIndex deli_alex_hybrid_buf(options, geometries,
                                                      geometry_metadata);
     auto hybrid_buf_build_start = std::chrono::high_resolution_clock::now();
@@ -5397,14 +5532,16 @@ int main(int argc, char* argv[]) {
                   << "\n";
       }
     }
-    rows.back().note =
-        "DELI-ALEX-Hybrid-Buf appends inserts into compact delta blocks to reduce foreground overlay maintenance.";
-    print_compare_summary(rows.back());
+      rows.back().note =
+          "DELI-ALEX-Hybrid-Buf appends inserts into compact delta blocks to reduce foreground overlay maintenance.";
+      print_compare_summary(rows.back());
+      }
 
-    // DELI-ALEX-Hybrid-Bounded: keep delta writes cheap, but periodically
-    // promote bounded delta blocks into the ordered query directory.
-    DeliAlexHybridBufferedIndex deli_alex_hybrid_bounded(
-        options, geometries, geometry_metadata, true);
+      // DELI-ALEX-Hybrid-Bounded: keep delta writes cheap, but periodically
+      // promote bounded delta blocks into the ordered query directory.
+      if (index_enabled(options, "DELI_ALEX_HYBRID_BOUNDED")) {
+      DeliAlexHybridBufferedIndex deli_alex_hybrid_bounded(
+          options, geometries, geometry_metadata, true);
     auto hybrid_bounded_build_start = std::chrono::high_resolution_clock::now();
     deli_alex_hybrid_bounded.bulk_load(initial_ids);
     auto hybrid_bounded_build_end = std::chrono::high_resolution_clock::now();
@@ -5540,15 +5677,17 @@ int main(int argc, char* argv[]) {
                   << "\n";
       }
     }
-    rows.back().note =
-        "DELI-ALEX-Hybrid-Bounded uses adaptive delta promotion; adaptive_bound_records=" +
-        std::to_string(deli_alex_hybrid_bounded.adaptive_delta_record_bound());
-    print_compare_summary(rows.back());
+      rows.back().note =
+          "DELI-ALEX-Hybrid-Bounded uses adaptive delta promotion; adaptive_bound_records=" +
+          std::to_string(deli_alex_hybrid_bounded.adaptive_delta_record_bound());
+      print_compare_summary(rows.back());
+      }
 
-    // DELI-ALEX-Hybrid-LocalBounded: each compact query block owns a small
-    // local delta. Compaction only rebuilds the affected block.
-    DeliAlexHybridLocalBoundedIndex deli_alex_hybrid_local_bounded(
-        options, geometries, geometry_metadata);
+      // DELI-ALEX-Hybrid-LocalBounded: each compact query block owns a small
+      // local delta. Compaction only rebuilds the affected block.
+      if (index_enabled(options, "DELI_ALEX_HYBRID_LOCAL_BOUNDED")) {
+      DeliAlexHybridLocalBoundedIndex deli_alex_hybrid_local_bounded(
+          options, geometries, geometry_metadata);
     auto hybrid_local_build_start = std::chrono::high_resolution_clock::now();
     deli_alex_hybrid_local_bounded.bulk_load(initial_ids);
     auto hybrid_local_build_end = std::chrono::high_resolution_clock::now();
@@ -5734,12 +5873,14 @@ int main(int argc, char* argv[]) {
         "DELI-ALEX-Hybrid-LocalBounded uses per-block bounded delta and lazy tombstone compaction; local_delta_bound=" +
         std::to_string(deli_alex_hybrid_local_bounded.local_delta_bound()) +
         " delete_compact_bound=" +
-        std::to_string(deli_alex_hybrid_local_bounded.delete_compact_bound());
-    print_compare_summary(rows.back());
+          std::to_string(deli_alex_hybrid_local_bounded.delete_compact_bound());
+      print_compare_summary(rows.back());
+      }
 
-    // Boost R-tree.
-    auto boost_build_start = std::chrono::high_resolution_clock::now();
-    RTree boost_index =
+      // Boost R-tree.
+      if (index_enabled(options, "Boost_Rtree")) {
+      auto boost_build_start = std::chrono::high_resolution_clock::now();
+      RTree boost_index =
         build_rtree_for_ids(geometries, initial_ids, live_bulkload, nullptr);
     auto boost_build_end = std::chrono::high_resolution_clock::now();
     long long boost_build_ns = ns_count(boost_build_end - boost_build_start);
@@ -5802,14 +5943,16 @@ int main(int argc, char* argv[]) {
         }));
     rows.back().success_count = boost_delete_success;
     rows.back().failed_count = boost_delete_failed;
-    rows.back().index_bytes_estimate =
-        estimate_boost_bytes(live_after_delete.size());
-    rows.back().note = "Boost bytes are rough entry/node estimates.";
-    print_compare_summary(rows.back());
+      rows.back().index_bytes_estimate =
+          estimate_boost_bytes(live_after_delete.size());
+      rows.back().note = "Boost bytes are rough entry/node estimates.";
+      print_compare_summary(rows.back());
+      }
 
-    // GEOS Quadtree.
-    Quadtree quadtree;
-    auto quad_build_start = std::chrono::high_resolution_clock::now();
+      // GEOS Quadtree.
+      if (index_enabled(options, "GEOS_Quadtree")) {
+      Quadtree quadtree;
+      auto quad_build_start = std::chrono::high_resolution_clock::now();
     for (ObjectId oid : initial_ids) {
       Geometry* geometry = geometries[oid].get();
       quadtree.insert(geometry->getEnvelopeInternal(), geometry);
@@ -5879,13 +6022,15 @@ int main(int argc, char* argv[]) {
     rows.back().tree_size = quadtree.size();
     rows.back().tree_depth = static_cast<std::size_t>(quadtree.depth());
     rows.back().tree_nodes = 0;
-    rows.back().index_bytes_estimate = estimate_quadtree_bytes(quadtree);
-    rows.back().note = "Quadtree bytes are rough node/item estimates.";
-    print_compare_summary(rows.back());
+      rows.back().index_bytes_estimate = estimate_quadtree_bytes(quadtree);
+      rows.back().note = "Quadtree bytes are rough node/item estimates.";
+      print_compare_summary(rows.back());
+      }
 
-    // GLIN-piece.
-    alex::Glin<double, Geometry*> glin_piece;
-    std::vector<std::tuple<double, double, double, double>> pieces;
+      // GLIN-piece.
+      if (index_enabled(options, "GLIN_PIECEWISE")) {
+      alex::Glin<double, Geometry*> glin_piece;
+      std::vector<std::tuple<double, double, double, double>> pieces;
     std::vector<Geometry*> glin_initial = raw_ptrs_for_ids(geometries, initial_ids);
     auto glin_build_start = std::chrono::high_resolution_clock::now();
     glin_piece.glin_bulk_load(glin_initial, options.piece_limit, "z",
@@ -5970,12 +6115,13 @@ int main(int argc, char* argv[]) {
     rows.back().success_count = glin_delete_success;
     rows.back().failed_count = glin_delete_failed;
     rows.back().pieces = pieces.size();
-    rows.back().index_bytes_estimate =
-        estimate_glin_piece_bytes(live_after_delete.size(), pieces.size());
-    rows.back().note = "GLIN-piece bytes are rough payload/piece estimates.";
-    print_compare_summary(rows.back());
+      rows.back().index_bytes_estimate =
+          estimate_glin_piece_bytes(live_after_delete.size(), pieces.size());
+      rows.back().note = "GLIN-piece bytes are rough payload/piece estimates.";
+      print_compare_summary(rows.back());
+      }
 
-    annotate_stage_maintenance(rows);
+      annotate_stage_maintenance(rows);
     write_compare_csv(options.output_csv, options, stats, rows);
     if (!options.output_csv.empty()) {
       std::cout << "CSV: " << options.output_csv << "\n";

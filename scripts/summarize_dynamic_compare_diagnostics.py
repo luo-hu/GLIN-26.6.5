@@ -144,7 +144,12 @@ def main():
         writer.writerows(rows)
 
     print(f"写出 summary: {output_csv}")
-    bad = [r for r in rows if r.get("answers_match_boost") != "1"]
+    skipped = [r for r in rows if r.get("answers_match_boost") == "-1"]
+    bad = [
+        r
+        for r in rows
+        if r.get("answers_match_boost") not in {"1", "-1"}
+    ]
     if bad:
         print("警告：存在 answers_match_boost != 1 的行：")
         for row in bad[:20]:
@@ -153,6 +158,11 @@ def main():
                 f"{row.get('index')} {row.get('checkpoint')} "
                 f"missing={row.get('missing_count')} extra={row.get('extra_count')}"
             )
+    elif skipped:
+        print(
+            "correctness: 未发现 mismatch；"
+            f"{len(skipped)} 行因 CHECK_CORRECTNESS=0 或 CORRECTNESS_EVERY_N 被跳过"
+        )
     else:
         print("correctness: 所有行 answers_match_boost=1")
 
