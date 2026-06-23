@@ -113,11 +113,60 @@ def plot_metric(rows, output_dir, prefix, checkpoint, metric, ylabel, filename, 
     return path
 
 
+def safe_name(value):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "unknown")
+
+
+def plot_mixed_metric(rows, output_dir, prefix, metric, ylabel, filename, dpi, log_y=False):
+    subset = [row for row in rows if row.get("workload_mode") == "mixed"]
+    if not subset:
+        return []
+    paths = []
+    groups = sorted({
+        (row.get("mixed_profile", "custom"), row["dataset"], row.get("selectivity", ""))
+        for row in subset
+    })
+    for profile, dataset, selectivity in groups:
+        group_rows = [
+            row for row in subset
+            if row.get("mixed_profile", "custom") == profile
+            and row["dataset"] == dataset
+            and row.get("selectivity", "") == selectivity
+        ]
+        indexes = sorted({row["index"] for row in group_rows}, key=lambda x: INDEX_ORDER.index(x) if x in INDEX_ORDER else 99)
+        fig, ax = plt.subplots(figsize=(7.6, 4.6))
+        for index in indexes:
+            series = [row for row in group_rows if row["index"] == index]
+            series.sort(key=lambda row: as_float(row, "operation_count"))
+            xs = [as_float(row, "operation_count") for row in series]
+            ys = [as_float(row, metric) for row in series]
+            ax.plot(xs, ys, marker="o", linewidth=1.5, markersize=3.5,
+                    color=COLORS.get(index), label=LABELS.get(index, index))
+        ax.set_xlabel("Operations")
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{profile} {dataset} {selectivity}: {ylabel}")
+        ax.grid(axis="both", linestyle="--", alpha=0.32)
+        if log_y:
+            ax.set_yscale("log")
+        ax.legend(frameon=False, ncol=2, fontsize=8)
+        fig.tight_layout()
+        path = output_dir / (
+            f"{prefix}_mixed_{safe_name(profile)}_{safe_name(dataset)}_"
+            f"{safe_name(selectivity)}_{filename}.png"
+        )
+        fig.savefig(path, dpi=dpi)
+        plt.close(fig)
+        paths.append(path)
+    return paths
+
+
 def write_notes(rows, output_dir, prefix):
     path = output_dir / f"{prefix}_diagnostics.txt"
     with path.open("w") as handle:
         handle.write("统一动态对比说明\n\n")
         handle.write("所有方法使用同一套 bulk-load / insert / delete / query workload。\n")
+        handle.write("当 workload_mode=mixed 时，横轴 operation_count 表示单线程交错操作进度。\n")
+        handle.write("mixed workload 的 avg/p95/p99 query latency 来自交错执行中真实发生的 query；correctness 在 checkpoint final state 上用固定 query set 与 Boost exact oracle 对齐。\n")
         handle.write("answers_match_boost=1 表示该方法在该 checkpoint 的答案集合与 Boost exact oracle 一致。\n")
         handle.write("index_mb_estimate 是粗略估算，不等价于精确内存 profiler；用于先判断数量级。\n\n")
         for checkpoint in ["after_bulkload", "after_insert", "after_delete"]:
@@ -163,6 +212,16 @@ def main():
     paths.append(plot_metric(rows, output_dir, args.figure_prefix, "after_delete", "p99_query_ms", "P99 query latency after delete (ms)", "p99_query_ms", args.dpi))
     paths.append(plot_metric(rows, output_dir, args.figure_prefix, "after_delete", "index_mb_estimate", "Estimated index size (MB)", "index_mb_estimate", args.dpi))
     paths.append(plot_metric(rows, output_dir, args.figure_prefix, "after_delete", "answers_match_boost", "Answers match Boost oracle", "correctness", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_query_ms", "Average query latency in mixed workload (ms)", "avg_query_ms", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p95_query_ms", "P95 query latency in mixed workload (ms)", "p95_query_ms", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p99_query_ms", "P99 query latency in mixed workload (ms)", "p99_query_ms", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "insert_tps", "Interval insert throughput (ops/s)", "insert_tps", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "delete_tps", "Interval delete throughput (ops/s)", "delete_tps", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "local_compaction_count_stage", "Local compactions per interval", "local_compaction_count_stage", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "local_compaction_ns_stage", "Local compaction time per interval (ns)", "local_compaction_ns_stage", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_local_delta_size", "Average local delta size", "avg_local_delta_size", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "max_local_delta_size", "Max local delta size", "max_local_delta_size", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "tombstone_ratio", "Tombstone ratio", "tombstone_ratio", args.dpi))
     paths.append(write_notes(rows, output_dir, args.figure_prefix))
     for path in paths:
         if path:

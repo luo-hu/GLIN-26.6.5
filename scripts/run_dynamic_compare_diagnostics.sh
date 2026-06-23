@@ -23,6 +23,14 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 所有方法使用同一套 workload：
   bulk-load 50% -> insert 20% -> query -> delete 10% -> query
 
+也可以跑单线程 mixed workload：
+  bulk-load 50%
+  然后按同一条操作序列 interleave query/insert/delete。
+  典型 profile：
+    read_heavy:  90% query + 5% insert + 5% delete
+    balanced:    70% query + 15% insert + 15% delete
+    write_heavy: 50% query + 25% insert + 25% delete
+
 默认 DELI 参数固定为：
   block_size=512
   stale_threshold_fraction=0.05
@@ -74,6 +82,20 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   INITIAL_FRACTION / INSERT_FRACTION / DELETE_FRACTION
     默认 0.5 / 0.2 / 0.1。
 
+  WORKLOAD_MODE
+    staged：默认，bulk-load -> insert -> query -> delete -> query。
+    mixed：单线程交错 mixed workload。
+
+  MIXED_PROFILES
+    WORKLOAD_MODE=mixed 时一次跑哪些 profile。
+    默认：read_heavy balanced write_heavy。
+
+  MIXED_OPERATIONS
+    每个 mixed profile 的交错操作总数。默认 100000。
+
+  MIXED_CHECKPOINT_INTERVAL
+    每隔多少个 mixed 操作输出 checkpoint。默认 10000。
+
   AUTO_GENERATE_QUERIES
     0：缺 query 文件就报错。
     1：缺 query 文件时调用 JTS STRtree KNN query generator 自动生成。
@@ -96,6 +118,7 @@ QUERY_ROOT="${QUERY_ROOT:-queries/dynamic_compare_${QUERY_LIMIT}}"
 RESULT_DIR="${RESULT_DIR:-results/dynamic_compare_${LIMIT}}"
 FIGURE_DIR="${FIGURE_DIR:-figures/dynamic_compare_${LIMIT}}"
 SELECTIVITY_TAGS="${SELECTIVITY_TAGS:-1pct}"
+BUILD_DIR="${BUILD_DIR:-build}"
 
 # 这里故意固定为论文默认参数，避免每个数据集单独调参。
 BLOCK_SIZE="${BLOCK_SIZE:-512}"
@@ -110,6 +133,10 @@ DELETE_FRACTION="${DELETE_FRACTION:-0.1}"
 QUERY_COUNT="${QUERY_COUNT:-100}"
 CELL_SIZE="${CELL_SIZE:-0.0000005}"
 SEED="${SEED:-42}"
+WORKLOAD_MODE="${WORKLOAD_MODE:-staged}"
+MIXED_PROFILES="${MIXED_PROFILES:-read_heavy balanced write_heavy}"
+MIXED_OPERATIONS="${MIXED_OPERATIONS:-100000}"
+MIXED_CHECKPOINT_INTERVAL="${MIXED_CHECKPOINT_INTERVAL:-10000}"
 
 AUTO_BUILD="${AUTO_BUILD:-1}"
 RUN_BENCHMARKS="${RUN_BENCHMARKS:-1}"
@@ -131,7 +158,7 @@ if [[ "$RESET_RESULTS" == "1" ]]; then
 fi
 
 if [[ "$AUTO_BUILD" == "1" && "$RUN_BENCHMARKS" == "1" ]]; then
-  cmake --build build --target bench_dynamic_compare_wkt -j2
+  cmake --build "$BUILD_DIR" --target bench_dynamic_compare_wkt -j2
 fi
 
 declare -A DATA_FILES=(
@@ -164,6 +191,28 @@ query_file_for_dataset() {
   local dataset="$1"
   local tag="$2"
   echo "$QUERY_ROOT/${dataset}_jts_strtree_knn_${tag}.csv"
+}
+
+mixed_profile_ratios() {
+  local profile="$1"
+  case "$profile" in
+    read_heavy)
+      echo "0.90 0.05 0.05"
+      ;;
+    balanced)
+      echo "0.70 0.15 0.15"
+      ;;
+    write_heavy)
+      echo "0.50 0.25 0.25"
+      ;;
+    custom)
+      echo "${MIXED_QUERY_RATIO:-0.90} ${MIXED_INSERT_RATIO:-0.05} ${MIXED_DELETE_RATIO:-0.05}"
+      ;;
+    *)
+      echo "Error: unknown MIXED_PROFILES item '$profile'. Use read_heavy balanced write_heavy custom." >&2
+      exit 1
+      ;;
+  esac
 }
 
 should_run_file() {
@@ -230,15 +279,37 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
         exit 1
       fi
 
-      raw_csv="$RESULT_DIR/${dataset}_${tag}_dynamic_compare.csv"
-      if should_run_file "$raw_csv"; then
-        echo "Running dynamic compare dataset=$dataset selectivity=$tag"
-        ./build/bench_dynamic_compare_wkt \
+      profiles="staged"
+      if [[ "$WORKLOAD_MODE" == "mixed" ]]; then
+        profiles="$MIXED_PROFILES"
+      fi
+
+      for profile in $profiles; do
+        mixed_query_ratio="0"
+        mixed_insert_ratio="0"
+        mixed_delete_ratio="0"
+        raw_suffix="dynamic_compare"
+        if [[ "$WORKLOAD_MODE" == "mixed" ]]; then
+          read -r mixed_query_ratio mixed_insert_ratio mixed_delete_ratio <<<"$(mixed_profile_ratios "$profile")"
+          raw_suffix="${profile}_dynamic_compare"
+        fi
+
+        raw_csv="$RESULT_DIR/${dataset}_${tag}_${raw_suffix}.csv"
+        if should_run_file "$raw_csv"; then
+          echo "Running dynamic compare dataset=$dataset selectivity=$tag workload=$WORKLOAD_MODE profile=$profile"
+          "$BUILD_DIR/bench_dynamic_compare_wkt" \
           --data_file "$data_file" \
           --query_file "$query_file" \
           --dataset_name "$dataset" \
           --limit "$LIMIT" \
           --query_count "$QUERY_COUNT" \
+          --workload_mode "$WORKLOAD_MODE" \
+          --mixed_profile "$profile" \
+          --mixed_operations "$MIXED_OPERATIONS" \
+          --mixed_checkpoint_interval "$MIXED_CHECKPOINT_INTERVAL" \
+          --mixed_query_ratio "$mixed_query_ratio" \
+          --mixed_insert_ratio "$mixed_insert_ratio" \
+          --mixed_delete_ratio "$mixed_delete_ratio" \
           --initial_fraction "$INITIAL_FRACTION" \
           --insert_fraction "$INSERT_FRACTION" \
           --delete_fraction "$DELETE_FRACTION" \
@@ -251,9 +322,10 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --seed "$SEED" \
           --stop_on_mismatch 0 \
           --output_csv "$raw_csv"
-      else
-        echo "Skip existing raw CSV: $raw_csv"
-      fi
+        else
+          echo "Skip existing raw CSV: $raw_csv"
+        fi
+      done
     done
   done
 else

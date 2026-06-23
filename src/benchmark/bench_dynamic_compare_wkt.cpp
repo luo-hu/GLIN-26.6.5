@@ -38,6 +38,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -62,11 +63,18 @@ struct Options {
   std::string dataset_name = "WKT";
   std::string query_file;
   std::string output_csv;
+  std::string workload_mode = "staged";
+  std::string mixed_profile = "custom";
   std::size_t limit = 10000;
   std::size_t query_count = 100;
   double initial_fraction = 0.5;
   double insert_fraction = 0.2;
   double delete_fraction = 0.1;
+  std::size_t mixed_operations = 100000;
+  std::size_t mixed_checkpoint_interval = 10000;
+  double mixed_query_ratio = 0.90;
+  double mixed_insert_ratio = 0.05;
+  double mixed_delete_ratio = 0.05;
   std::size_t block_size = 512;
   double stale_threshold_fraction = 0.05;
   std::size_t local_delta_bound = 0;
@@ -215,6 +223,13 @@ void print_usage(const char* program) {
       << "  --limit N                        Valid geometries to load (default: 10000)\n"
       << "  --query_file PATH                Query CSV file\n"
       << "  --query_count N                  Max queries to run (default: 100)\n"
+      << "  --workload_mode staged|mixed     Staged checkpoints or interleaved mixed workload (default: staged)\n"
+      << "  --mixed_profile NAME             Mixed workload label in output CSV (default: custom)\n"
+      << "  --mixed_operations N             Number of interleaved operations after bulk-load (default: 100000)\n"
+      << "  --mixed_checkpoint_interval N    Emit a mixed checkpoint every N operations (default: 10000)\n"
+      << "  --mixed_query_ratio F            Mixed query probability (default: 0.90)\n"
+      << "  --mixed_insert_ratio F           Mixed insert probability (default: 0.05)\n"
+      << "  --mixed_delete_ratio F           Mixed delete probability (default: 0.05)\n"
       << "  --initial_fraction F             Bulk-load fraction (default: 0.5)\n"
       << "  --insert_fraction F              Insert fraction of loaded data (default: 0.2)\n"
       << "  --delete_fraction F              Delete fraction of loaded data (default: 0.1)\n"
@@ -257,6 +272,22 @@ Options parse_args(int argc, char* argv[]) {
     } else if (key == "--query_count") {
       options.query_count =
           static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--workload_mode") {
+      options.workload_mode = require_value(key);
+    } else if (key == "--mixed_profile") {
+      options.mixed_profile = require_value(key);
+    } else if (key == "--mixed_operations") {
+      options.mixed_operations =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--mixed_checkpoint_interval") {
+      options.mixed_checkpoint_interval =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--mixed_query_ratio") {
+      options.mixed_query_ratio = std::stod(require_value(key));
+    } else if (key == "--mixed_insert_ratio") {
+      options.mixed_insert_ratio = std::stod(require_value(key));
+    } else if (key == "--mixed_delete_ratio") {
+      options.mixed_delete_ratio = std::stod(require_value(key));
     } else if (key == "--initial_fraction") {
       options.initial_fraction = std::stod(require_value(key));
     } else if (key == "--insert_fraction") {
@@ -321,6 +352,9 @@ Options parse_args(int argc, char* argv[]) {
   validate_fraction(options.initial_fraction, "--initial_fraction");
   validate_fraction(options.insert_fraction, "--insert_fraction");
   validate_fraction(options.delete_fraction, "--delete_fraction");
+  validate_fraction(options.mixed_query_ratio, "--mixed_query_ratio");
+  validate_fraction(options.mixed_insert_ratio, "--mixed_insert_ratio");
+  validate_fraction(options.mixed_delete_ratio, "--mixed_delete_ratio");
   validate_fraction(options.delete_compact_fraction,
                     "--delete_compact_fraction");
   if (options.initial_fraction <= 0.0) {
@@ -328,6 +362,27 @@ Options parse_args(int argc, char* argv[]) {
   }
   if (options.stale_threshold_fraction < 0.0) {
     throw std::runtime_error("--stale_threshold_fraction must be non-negative");
+  }
+  if (options.workload_mode != "staged" && options.workload_mode != "mixed") {
+    throw std::runtime_error("--workload_mode must be staged or mixed");
+  }
+  if (options.workload_mode == "mixed") {
+    if (options.mixed_operations == 0) {
+      throw std::runtime_error("--mixed_operations must be greater than 0");
+    }
+    if (options.mixed_checkpoint_interval == 0) {
+      throw std::runtime_error(
+          "--mixed_checkpoint_interval must be greater than 0");
+    }
+    const double ratio_sum = options.mixed_query_ratio +
+                             options.mixed_insert_ratio +
+                             options.mixed_delete_ratio;
+    if (ratio_sum <= 0.0) {
+      throw std::runtime_error("mixed workload ratios must sum to > 0");
+    }
+    options.mixed_query_ratio /= ratio_sum;
+    options.mixed_insert_ratio /= ratio_sum;
+    options.mixed_delete_ratio /= ratio_sum;
   }
   return options;
 }
@@ -1099,6 +1154,13 @@ std::size_t count_missing(const std::unordered_set<ObjectId>& expected,
 }
 
 struct CompareSummary {
+  std::string workload_mode = "staged";
+  std::string mixed_profile;
+  std::size_t operation_count = 0;
+  std::size_t checkpoint_ops = 0;
+  double mixed_query_ratio = 0.0;
+  double mixed_insert_ratio = 0.0;
+  double mixed_delete_ratio = 0.0;
   std::string index;
   std::string checkpoint;
   std::size_t checkpoint_id = 0;
@@ -1149,7 +1211,9 @@ struct CompareSummary {
   std::size_t local_delta_bound = 0;
   std::size_t delete_compact_bound = 0;
   std::size_t max_local_delta_size = 0;
+  double avg_local_delta_size = 0.0;
   std::size_t blocks_with_delta = 0;
+  double tombstone_ratio = 0.0;
   std::size_t pieces = 0;
   std::size_t tree_size = 0;
   std::size_t tree_depth = 0;
@@ -3041,6 +3105,17 @@ class LocalBoundedCompactQueryOverlay {
     }
     return value;
   }
+  double avg_local_delta_size() const {
+    if (directory_.empty()) {
+      return 0.0;
+    }
+    std::size_t total = 0;
+    for (const LocalBoundedOverlayBlock* block : directory_) {
+      total += block->live_delta_count;
+    }
+    return static_cast<double>(total) /
+           static_cast<double>(directory_.size());
+  }
   std::size_t blocks_with_delta() const {
     std::size_t count = 0;
     for (const LocalBoundedOverlayBlock* block : directory_) {
@@ -3049,6 +3124,17 @@ class LocalBoundedCompactQueryOverlay {
       }
     }
     return count;
+  }
+  double tombstone_ratio() const {
+    std::size_t live = 0;
+    std::size_t dead = 0;
+    for (const LocalBoundedOverlayBlock* block : directory_) {
+      live += block->live_count;
+      dead += block->dead_count;
+    }
+    const std::size_t denom = live + dead;
+    return denom == 0 ? 0.0 : static_cast<double>(dead) /
+                                static_cast<double>(denom);
   }
 
   std::size_t index_bytes_estimate() const {
@@ -3460,7 +3546,11 @@ class DeliAlexHybridLocalBoundedIndex {
   std::size_t max_local_delta_size() const {
     return overlay_.max_local_delta_size();
   }
+  double avg_local_delta_size() const {
+    return overlay_.avg_local_delta_size();
+  }
   std::size_t blocks_with_delta() const { return overlay_.blocks_with_delta(); }
+  double tombstone_ratio() const { return overlay_.tombstone_ratio(); }
   std::size_t leaf_count() const {
     return static_cast<std::size_t>(std::max(0, base().num_leaves()));
   }
@@ -3639,6 +3729,11 @@ CompareSummary finalize_compare_summary(
     std::size_t missing_count,
     std::size_t extra_count) {
   CompareSummary summary;
+  summary.workload_mode = options.workload_mode;
+  summary.mixed_profile = options.mixed_profile;
+  summary.mixed_query_ratio = options.mixed_query_ratio;
+  summary.mixed_insert_ratio = options.mixed_insert_ratio;
+  summary.mixed_delete_ratio = options.mixed_delete_ratio;
   summary.index = index_name;
   summary.checkpoint = checkpoint;
   summary.checkpoint_id = checkpoint_id;
@@ -3781,6 +3876,11 @@ CompareSummary convert_deli_summary(const CheckpointSummary& source,
                                     long long build_ns,
                                     std::size_t index_bytes_estimate) {
   CompareSummary summary;
+  summary.workload_mode = options.workload_mode;
+  summary.mixed_profile = options.mixed_profile;
+  summary.mixed_query_ratio = options.mixed_query_ratio;
+  summary.mixed_insert_ratio = options.mixed_insert_ratio;
+  summary.mixed_delete_ratio = options.mixed_delete_ratio;
   summary.index = "DELI_DYNAMIC_SINGLE";
   summary.checkpoint = source.checkpoint;
   summary.checkpoint_id = source.checkpoint_id;
@@ -4146,7 +4246,9 @@ void write_compare_csv(const std::string& path,
     throw std::runtime_error("Cannot open output CSV: " + path);
   }
   output
-      << "dataset,index,checkpoint,checkpoint_id,loaded_count,initial_count,"
+      << "dataset,workload_mode,mixed_profile,operation_count,checkpoint_ops,"
+         "mixed_query_ratio,mixed_insert_ratio,mixed_delete_ratio,"
+         "index,checkpoint,checkpoint_id,loaded_count,initial_count,"
          "insert_count,delete_count,live_count,query_count,build_ns,insert_ns,"
          "delete_ns,insert_tps,delete_tps,avg_query_ns,p50_query_ns,"
          "p95_query_ns,p99_query_ns,candidates,exact_calls,answers,"
@@ -4161,13 +4263,17 @@ void write_compare_csv(const std::string& path,
          "local_compaction_count_total,local_compaction_ns_total,"
          "local_compaction_count_stage,local_compaction_ns_stage,"
          "avg_local_compaction_us_stage,local_delta_bound,"
-         "delete_compact_bound,max_local_delta_size,blocks_with_delta,pieces,"
+         "delete_compact_bound,max_local_delta_size,avg_local_delta_size,"
+         "blocks_with_delta,tombstone_ratio,pieces,"
          "tree_size,tree_depth,tree_nodes,index_bytes_estimate,success_count,"
          "failed_count,validate_ok,seed,lines_seen,parse_errors,note\n";
   output << std::setprecision(17);
   for (const CompareSummary& row : rows) {
-    output << options.dataset_name << "," << row.index << ","
-           << row.checkpoint << "," << row.checkpoint_id << ","
+    output << options.dataset_name << "," << row.workload_mode << ","
+           << row.mixed_profile << "," << row.operation_count << ","
+           << row.checkpoint_ops << "," << row.mixed_query_ratio << ","
+           << row.mixed_insert_ratio << "," << row.mixed_delete_ratio << ","
+           << row.index << "," << row.checkpoint << "," << row.checkpoint_id << ","
            << row.loaded_count << "," << row.initial_count << ","
            << row.insert_count << "," << row.delete_count << ","
            << row.live_count << "," << row.query_count << ","
@@ -4196,14 +4302,246 @@ void write_compare_csv(const std::string& path,
            << row.local_compaction_ns_stage << ","
            << row.avg_local_compaction_us_stage << ","
            << row.local_delta_bound << "," << row.delete_compact_bound << ","
-           << row.max_local_delta_size << "," << row.blocks_with_delta << ","
-           << row.pieces << ","
+           << row.max_local_delta_size << "," << row.avg_local_delta_size
+           << "," << row.blocks_with_delta << "," << row.tombstone_ratio
+           << "," << row.pieces << ","
            << row.tree_size << "," << row.tree_depth << ","
            << row.tree_nodes << "," << row.index_bytes_estimate << ","
            << row.success_count << "," << row.failed_count << ","
            << row.validate_ok << "," << options.seed << ","
            << stats.lines_seen << "," << stats.parse_errors << ",\""
            << row.note << "\"\n";
+  }
+}
+
+struct MixedOperation {
+  char kind = 'q';  // q=query, i=insert, d=delete
+  ObjectId oid = 0;
+  std::size_t query_index = 0;
+};
+
+struct LiveReplayState {
+  std::vector<char> live;
+  std::vector<ObjectId> live_ids;
+  std::vector<std::size_t> position;
+
+  LiveReplayState(std::size_t object_count,
+                  const std::vector<ObjectId>& initial_ids)
+      : live(object_count, 0),
+        live_ids(initial_ids),
+        position(object_count, std::numeric_limits<std::size_t>::max()) {
+    for (std::size_t i = 0; i < live_ids.size(); ++i) {
+      ObjectId oid = live_ids[i];
+      live[oid] = 1;
+      position[oid] = i;
+    }
+  }
+
+  void insert(ObjectId oid) {
+    if (oid >= live.size() || live[oid]) {
+      return;
+    }
+    live[oid] = 1;
+    position[oid] = live_ids.size();
+    live_ids.push_back(oid);
+  }
+
+  void erase(ObjectId oid) {
+    if (oid >= live.size() || !live[oid]) {
+      return;
+    }
+    const std::size_t pos = position[oid];
+    const ObjectId last = live_ids.back();
+    live_ids[pos] = last;
+    position[last] = pos;
+    live_ids.pop_back();
+    live[oid] = 0;
+    position[oid] = std::numeric_limits<std::size_t>::max();
+  }
+};
+
+std::vector<MixedOperation> generate_mixed_operations(
+    const Options& options,
+    std::size_t object_count,
+    std::size_t initial_count,
+    std::size_t query_count) {
+  std::vector<ObjectId> insert_pool;
+  insert_pool.reserve(object_count > initial_count ? object_count - initial_count
+                                                   : 0);
+  for (ObjectId oid = static_cast<ObjectId>(initial_count);
+       oid < static_cast<ObjectId>(object_count); ++oid) {
+    insert_pool.push_back(oid);
+  }
+
+  std::mt19937_64 rng(options.seed ^ 0x9e3779b97f4a7c15ULL);
+  std::shuffle(insert_pool.begin(), insert_pool.end(), rng);
+  std::uniform_real_distribution<double> probability(0.0, 1.0);
+
+  std::vector<ObjectId> initial_ids(initial_count);
+  std::iota(initial_ids.begin(), initial_ids.end(), ObjectId{0});
+  LiveReplayState state(object_count, initial_ids);
+
+  std::vector<MixedOperation> operations;
+  operations.reserve(options.mixed_operations);
+  std::size_t insert_cursor = 0;
+
+  for (std::size_t op_id = 0; op_id < options.mixed_operations; ++op_id) {
+    const double r = probability(rng);
+    MixedOperation op;
+    if (r < options.mixed_query_ratio || query_count == 0) {
+      op.kind = 'q';
+      op.query_index = query_count == 0 ? 0 : op_id % query_count;
+    } else if (r < options.mixed_query_ratio + options.mixed_insert_ratio &&
+               insert_cursor < insert_pool.size()) {
+      op.kind = 'i';
+      op.oid = insert_pool[insert_cursor++];
+      state.insert(op.oid);
+    } else if (!state.live_ids.empty()) {
+      op.kind = 'd';
+      std::uniform_int_distribution<std::size_t> pick(
+          0, state.live_ids.size() - 1);
+      op.oid = state.live_ids[pick(rng)];
+      state.erase(op.oid);
+    } else {
+      op.kind = 'q';
+      op.query_index = query_count == 0 ? 0 : op_id % query_count;
+    }
+    operations.push_back(op);
+  }
+  return operations;
+}
+
+SimpleQueryResult simple_from_deli_query(const QueryResult& source) {
+  SimpleQueryResult result;
+  result.query_ns = source.query_ns;
+  result.candidates = source.exact_calls;
+  result.exact_calls = source.exact_calls;
+  result.answers = source.answers;
+  return result;
+}
+
+template <typename QueryFn>
+void mixed_correctness_check(const Options& options,
+                             const std::vector<GeometryPtr>& geometries,
+                             const std::vector<QueryCase>& queries,
+                             const LiveReplayState& state,
+                             QueryFn query_fn,
+                             long long* oracle_build_ns,
+                             long long* oracle_query_ns,
+                             std::size_t* missing_total,
+                             std::size_t* extra_total) {
+  *oracle_build_ns = 0;
+  *oracle_query_ns = 0;
+  *missing_total = 0;
+  *extra_total = 0;
+  if (!options.check_correctness) {
+    return;
+  }
+
+  std::vector<std::unordered_set<ObjectId>> oracle_answers =
+      compute_oracle_answers(geometries, state.live_ids, state.live, queries,
+                             oracle_build_ns, oracle_query_ns);
+  for (std::size_t i = 0; i < queries.size(); ++i) {
+    SimpleQueryResult result = query_fn(queries[i], state.live);
+    *missing_total += count_missing(oracle_answers[i], result.answers, nullptr);
+    *extra_total += count_missing(result.answers, oracle_answers[i], nullptr);
+  }
+}
+
+template <typename QueryFn, typename InsertFn, typename DeleteFn,
+          typename AnnotateFn>
+void run_mixed_workload_for_index(
+    const Options& options,
+    const std::string& index_name,
+    const std::vector<GeometryPtr>& geometries,
+    const std::vector<QueryCase>& queries,
+    const std::vector<ObjectId>& initial_ids,
+    const std::vector<MixedOperation>& operations,
+    long long build_ns,
+    QueryFn query_fn,
+    InsertFn insert_fn,
+    DeleteFn delete_fn,
+    AnnotateFn annotate_fn,
+    std::vector<CompareSummary>& rows) {
+  LiveReplayState state(geometries.size(), initial_ids);
+  SimpleQueryAggregate aggregate;
+  long long interval_insert_ns = 0;
+  long long interval_delete_ns = 0;
+  std::size_t interval_insert_count = 0;
+  std::size_t interval_delete_count = 0;
+  std::size_t interval_success = 0;
+  std::size_t interval_failed = 0;
+  std::size_t interval_begin = 0;
+  std::size_t checkpoint_id = 0;
+
+  auto emit_checkpoint = [&](std::size_t completed_ops) {
+    long long oracle_build_ns = 0;
+    long long oracle_query_ns = 0;
+    std::size_t missing_total = 0;
+    std::size_t extra_total = 0;
+    mixed_correctness_check(options, geometries, queries, state, query_fn,
+                            &oracle_build_ns, &oracle_query_ns,
+                            &missing_total, &extra_total);
+
+    CompareSummary row = finalize_compare_summary(
+        options, index_name,
+        "mixed_" + std::to_string(completed_ops), checkpoint_id,
+        geometries.size(), initial_ids.size(), interval_insert_count,
+        interval_delete_count, state.live_ids.size(), build_ns,
+        interval_insert_ns, interval_delete_ns, aggregate, oracle_build_ns,
+        oracle_query_ns, missing_total, extra_total);
+    row.workload_mode = "mixed";
+    row.mixed_profile = options.mixed_profile;
+    row.operation_count = completed_ops;
+    row.checkpoint_ops = completed_ops - interval_begin;
+    row.success_count = interval_success;
+    row.failed_count = interval_failed;
+    if (!options.check_correctness) {
+      row.answers_match_boost = -1;
+    }
+    annotate_fn(row);
+    rows.push_back(row);
+    print_compare_summary(rows.back());
+
+    ++checkpoint_id;
+    interval_begin = completed_ops;
+    aggregate = SimpleQueryAggregate();
+    interval_insert_ns = 0;
+    interval_delete_ns = 0;
+    interval_insert_count = 0;
+    interval_delete_count = 0;
+    interval_success = 0;
+    interval_failed = 0;
+  };
+
+  for (std::size_t i = 0; i < operations.size(); ++i) {
+    const MixedOperation& op = operations[i];
+    if (op.kind == 'q') {
+      add_simple_query_result(aggregate,
+                              query_fn(queries[op.query_index], state.live));
+    } else if (op.kind == 'i') {
+      auto start = std::chrono::high_resolution_clock::now();
+      bool ok = insert_fn(op.oid);
+      auto end = std::chrono::high_resolution_clock::now();
+      interval_insert_ns += ns_count(end - start);
+      ++interval_insert_count;
+      ok ? ++interval_success : ++interval_failed;
+      state.insert(op.oid);
+    } else if (op.kind == 'd') {
+      auto start = std::chrono::high_resolution_clock::now();
+      bool ok = delete_fn(op.oid);
+      auto end = std::chrono::high_resolution_clock::now();
+      interval_delete_ns += ns_count(end - start);
+      ++interval_delete_count;
+      ok ? ++interval_success : ++interval_failed;
+      state.erase(op.oid);
+    }
+
+    const std::size_t completed_ops = i + 1;
+    if (completed_ops % options.mixed_checkpoint_interval == 0 ||
+        completed_ops == operations.size()) {
+      emit_checkpoint(completed_ops);
+    }
   }
 }
 
@@ -4315,6 +4653,295 @@ int main(int argc, char* argv[]) {
               << "\n";
 
     std::vector<CompareSummary> rows;
+
+    if (options.workload_mode == "mixed") {
+      std::vector<MixedOperation> operations = generate_mixed_operations(
+          options, geometries.size(), initial_count, queries.size());
+
+      auto annotate_deli_dynamic = [&](DynamicExtentIndex& idx,
+                                       CompareSummary& row) {
+        row.block_count = idx.block_count();
+        row.stale_block_count = idx.stale_block_count();
+        row.summary_rebuild_count = idx.summary_rebuild_count();
+        row.summary_rebuild_ns = idx.summary_rebuild_ns();
+        row.block_split_count = idx.block_split_count();
+        row.index_bytes_estimate = estimate_deli_bytes(idx);
+        row.tombstone_ratio =
+            idx.total_records() == 0
+                ? 0.0
+                : static_cast<double>(idx.dead_records()) /
+                      static_cast<double>(idx.total_records());
+        std::string validation_message;
+        row.validate_ok = idx.validate_index(&validation_message) ? 1 : 0;
+        row.note = "Mixed workload; DELI-Dynamic-Single.";
+      };
+
+      {
+        DynamicExtentIndex mixed_index(options, geometries);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(initial_ids);
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, "DELI_DYNAMIC_SINGLE", geometries, queries, initial_ids,
+            operations, mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>&) {
+              return simple_from_deli_query(mixed_index.query(query_case));
+            },
+            [&](ObjectId oid) {
+              mixed_index.insert(oid);
+              return true;
+            },
+            [&](ObjectId oid) { return mixed_index.erase(oid); },
+            [&](CompareSummary& row) { annotate_deli_dynamic(mixed_index, row); },
+            rows);
+      }
+
+      {
+        DeliAlexIndex mixed_index(options, geometries, geometry_metadata);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(initial_ids);
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, "DELI_ALEX", geometries, queries, initial_ids, operations,
+            mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>&) {
+              return mixed_index.query(query_case);
+            },
+            [&](ObjectId oid) { return mixed_index.insert(oid); },
+            [&](ObjectId oid) { return mixed_index.erase(oid); },
+            [&](CompareSummary& row) {
+              row.block_count = mixed_index.group_count();
+              row.tree_nodes = mixed_index.leaf_count();
+              row.stale_block_count = mixed_index.stale_leaf_count();
+              row.summary_rebuild_count =
+                  mixed_index.summary_rebuild_count() +
+                  mixed_index.group_directory_rebuild_count();
+              row.summary_rebuild_ns =
+                  mixed_index.summary_rebuild_ns() +
+                  mixed_index.group_directory_rebuild_ns();
+              row.index_bytes_estimate = mixed_index.index_bytes_estimate();
+              row.note = "Mixed workload; DELI-ALEX.";
+            },
+            rows);
+      }
+
+      auto run_mixed_hybrid = [&](const std::string& name, auto& mixed_index,
+                                  long long mixed_build_ns) {
+        run_mixed_workload_for_index(
+            options, name, geometries, queries, initial_ids, operations,
+            mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>&) {
+              return mixed_index.query(query_case);
+            },
+            [&](ObjectId oid) { return mixed_index.insert(oid); },
+            [&](ObjectId oid) { return mixed_index.erase(oid); },
+            [&](CompareSummary& row) {
+              row.block_count = mixed_index.block_count();
+              row.tree_nodes = mixed_index.leaf_count();
+              row.stale_block_count = mixed_index.stale_block_count();
+              row.summary_rebuild_count = mixed_index.summary_rebuild_count();
+              row.summary_rebuild_ns = mixed_index.summary_rebuild_ns();
+              row.block_split_count = mixed_index.block_split_count();
+              row.index_bytes_estimate = mixed_index.index_bytes_estimate();
+              std::string validation_message;
+              row.validate_ok =
+                  mixed_index.validate_index(&validation_message) ? 1 : 0;
+              row.note = "Mixed workload; " + name + ".";
+            },
+            rows);
+      };
+
+      {
+        DeliAlexHybridIndex mixed_index(options, geometries, geometry_metadata);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(initial_ids);
+        auto end = std::chrono::high_resolution_clock::now();
+        run_mixed_hybrid("DELI_ALEX_HYBRID", mixed_index, ns_count(end - start));
+      }
+      {
+        DeliAlexHybridBufferedIndex mixed_index(options, geometries,
+                                                geometry_metadata, false);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(initial_ids);
+        auto end = std::chrono::high_resolution_clock::now();
+        run_mixed_hybrid("DELI_ALEX_HYBRID_BUF", mixed_index,
+                         ns_count(end - start));
+      }
+      {
+        DeliAlexHybridBufferedIndex mixed_index(options, geometries,
+                                                geometry_metadata, true);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(initial_ids);
+        auto end = std::chrono::high_resolution_clock::now();
+        run_mixed_hybrid("DELI_ALEX_HYBRID_BOUNDED", mixed_index,
+                         ns_count(end - start));
+      }
+      {
+        DeliAlexHybridLocalBoundedIndex mixed_index(options, geometries,
+                                                    geometry_metadata);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(initial_ids);
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, "DELI_ALEX_HYBRID_LOCAL_BOUNDED", geometries, queries,
+            initial_ids, operations, mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>&) {
+              return mixed_index.query(query_case);
+            },
+            [&](ObjectId oid) { return mixed_index.insert(oid); },
+            [&](ObjectId oid) { return mixed_index.erase(oid); },
+            [&](CompareSummary& row) {
+              row.block_count = mixed_index.block_count();
+              row.tree_nodes = mixed_index.leaf_count();
+              row.stale_block_count = mixed_index.stale_block_count();
+              row.summary_rebuild_count = mixed_index.summary_rebuild_count();
+              row.summary_rebuild_ns = mixed_index.summary_rebuild_ns();
+              row.block_split_count = mixed_index.block_split_count();
+              row.local_compaction_count =
+                  mixed_index.local_compaction_count();
+              row.local_compaction_ns = mixed_index.local_compaction_ns();
+              row.local_delta_bound = mixed_index.local_delta_bound();
+              row.delete_compact_bound = mixed_index.delete_compact_bound();
+              row.max_local_delta_size = mixed_index.max_local_delta_size();
+              row.avg_local_delta_size = mixed_index.avg_local_delta_size();
+              row.blocks_with_delta = mixed_index.blocks_with_delta();
+              row.tombstone_ratio = mixed_index.tombstone_ratio();
+              row.index_bytes_estimate = mixed_index.index_bytes_estimate();
+              std::string validation_message;
+              row.validate_ok =
+                  mixed_index.validate_index(&validation_message) ? 1 : 0;
+              row.note =
+                  "Mixed workload; DELI-ALEX-Hybrid-LocalBounded.";
+            },
+            rows);
+      }
+
+      {
+        auto start = std::chrono::high_resolution_clock::now();
+        RTree mixed_index =
+            build_rtree_for_ids(geometries, initial_ids, live_bulkload, nullptr);
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, "Boost_Rtree", geometries, queries, initial_ids,
+            operations, mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>& live) {
+              return query_boost_index(mixed_index, geometries, live,
+                                       query_case);
+            },
+            [&](ObjectId oid) {
+              mixed_index.insert(std::make_pair(
+                  boost_box_from_envelope(
+                      *geometries[oid]->getEnvelopeInternal()),
+                  oid));
+              return true;
+            },
+            [&](ObjectId oid) {
+              return mixed_index.remove(std::make_pair(
+                         boost_box_from_envelope(
+                             *geometries[oid]->getEnvelopeInternal()),
+                         oid)) > 0;
+            },
+            [&](CompareSummary& row) {
+              row.index_bytes_estimate = estimate_boost_bytes(row.live_count);
+              row.note = "Mixed workload; Boost R-tree.";
+            },
+            rows);
+      }
+
+      {
+        Quadtree mixed_index;
+        auto start = std::chrono::high_resolution_clock::now();
+        for (ObjectId oid : initial_ids) {
+          Geometry* geometry = geometries[oid].get();
+          mixed_index.insert(geometry->getEnvelopeInternal(), geometry);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, "GEOS_Quadtree", geometries, queries, initial_ids,
+            operations, mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>& live) {
+              return query_quadtree_index(mixed_index, geometry_to_oid,
+                                          geometries, live, query_case);
+            },
+            [&](ObjectId oid) {
+              Geometry* geometry = geometries[oid].get();
+              mixed_index.insert(geometry->getEnvelopeInternal(), geometry);
+              return true;
+            },
+            [&](ObjectId oid) {
+              Geometry* geometry = geometries[oid].get();
+              return mixed_index.remove(geometry->getEnvelopeInternal(),
+                                        geometry);
+            },
+            [&](CompareSummary& row) {
+              row.tree_size = mixed_index.size();
+              row.tree_depth = static_cast<std::size_t>(mixed_index.depth());
+              row.index_bytes_estimate = estimate_quadtree_bytes(mixed_index);
+              row.note = "Mixed workload; GEOS Quadtree.";
+            },
+            rows);
+      }
+
+      {
+        alex::Glin<double, Geometry*> mixed_index;
+        std::vector<std::tuple<double, double, double, double>> mixed_pieces;
+        std::vector<Geometry*> glin_initial =
+            raw_ptrs_for_ids(geometries, initial_ids);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.glin_bulk_load(
+            glin_initial, options.piece_limit, "z", options.cell_xmin,
+            options.cell_ymin, options.cell_size, options.cell_size,
+            mixed_pieces);
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, "GLIN_PIECEWISE", geometries, queries, initial_ids,
+            operations, mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>& live) {
+              return query_glin_piece_index(mixed_index, mixed_pieces,
+                                            geometry_to_oid, live, options,
+                                            query_case);
+            },
+            [&](ObjectId oid) {
+              Geometry* geometry = geometries[oid].get();
+              geos::geom::Envelope* envelope =
+                  const_cast<geos::geom::Envelope*>(
+                      geometry->getEnvelopeInternal());
+              auto result = mixed_index.glin_insert(
+                  std::make_tuple(geometry, envelope), "z", options.cell_xmin,
+                  options.cell_ymin, options.cell_size, options.cell_size,
+                  options.piece_limit, mixed_pieces);
+              return result.second;
+            },
+            [&](ObjectId oid) {
+              Geometry* geometry = geometries[oid].get();
+              return mixed_index.erase(geometry, "z", options.cell_xmin,
+                                       options.cell_ymin, options.cell_size,
+                                       options.cell_size, options.piece_limit,
+                                       mixed_pieces) > 0;
+            },
+            [&](CompareSummary& row) {
+              row.pieces = mixed_pieces.size();
+              row.index_bytes_estimate =
+                  estimate_glin_piece_bytes(row.live_count,
+                                            mixed_pieces.size());
+              row.note = "Mixed workload; GLIN-piece.";
+            },
+            rows);
+      }
+
+      annotate_stage_maintenance(rows);
+      write_compare_csv(options.output_csv, options, stats, rows);
+      if (!options.output_csv.empty()) {
+        std::cout << "CSV: " << options.output_csv << "\n";
+      }
+      return 0;
+    }
 
     // DELI-Dynamic-Single.
     DynamicExtentIndex index(options, geometries);
