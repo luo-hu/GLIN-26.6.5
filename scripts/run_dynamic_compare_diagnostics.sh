@@ -235,7 +235,22 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     1pct
   分别表示希望query的答案规模大约对应数据集一定的比例。这样比随机生成随机框更稳定，因为不同数据集大小和空间分布不同。
 
-
+orrectness oracle 可以理解成“标准答案生成器”。
+  这里我们用 Boost R-tree + GEOS exact intersects 当 oracle。意思是：
+  1. 用 Boost R-tree 找候选对象；
+  2. 再用 GEOS 精确判断 intersects；
+  3. 得到一组标准答案；
+  4. 拿 DELI / GLIN-piece / Quadtree 的答案和它对比。
+  如果结果一致：
+  answers_match_boost = 1
+  如果不一致：
+  answers_match_boost = 0
+  如果你设置：
+  CHECK_CORRECTNESS=0
+  那就不做这个标准答案检查，所以：
+  answers_match_boost = -1
+  这不是错，只是表示“这次为了省时间，没有检查正确性”
+  
 输出：
   RESULT_DIR/dynamic_compare_summary.csv
   FIGURE_DIR/dynamic_compare_*.png

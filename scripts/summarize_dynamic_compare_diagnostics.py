@@ -54,6 +54,10 @@ def enrich(row, path):
     out["avg_query_ms"] = as_float(out, "avg_query_ns") / 1e6
     out["p95_query_ms"] = as_float(out, "p95_query_ns") / 1e6
     out["p99_query_ms"] = as_float(out, "p99_query_ns") / 1e6
+    out["p95_insert_ms"] = as_float(out, "p95_insert_ns") / 1e6
+    out["p99_insert_ms"] = as_float(out, "p99_insert_ns") / 1e6
+    out["p95_delete_ms"] = as_float(out, "p95_delete_ns") / 1e6
+    out["p99_delete_ms"] = as_float(out, "p99_delete_ns") / 1e6
     out["build_ms"] = as_float(out, "build_ns") / 1e6
     out["insert_ms"] = as_float(out, "insert_ns") / 1e6
     out["delete_ms"] = as_float(out, "delete_ns") / 1e6
@@ -81,8 +85,14 @@ def field_order(rows):
         "avg_query_ms",
         "p95_query_ms",
         "p99_query_ms",
+        "query_tps",
+        "overall_ops_tps",
         "insert_tps",
         "delete_tps",
+        "p95_insert_ms",
+        "p99_insert_ms",
+        "p95_delete_ms",
+        "p99_delete_ms",
         "index_mb_estimate",
         "answers_match_boost",
         "missing_count",

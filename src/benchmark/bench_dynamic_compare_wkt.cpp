@@ -1190,8 +1190,14 @@ struct CompareSummary {
   long long build_ns = 0;
   long long insert_ns = 0;
   long long delete_ns = 0;
+  long long p95_insert_ns = 0;
+  long long p99_insert_ns = 0;
+  long long p95_delete_ns = 0;
+  long long p99_delete_ns = 0;
   double insert_tps = 0.0;
   double delete_tps = 0.0;
+  double query_tps = 0.0;
+  double overall_ops_tps = 0.0;
   long long avg_query_ns = 0;
   long long p50_query_ns = 0;
   long long p95_query_ns = 0;
@@ -3784,6 +3790,11 @@ CompareSummary finalize_compare_summary(
   summary.p50_query_ns = percentile_value(aggregate.latencies_ns, 0.50);
   summary.p95_query_ns = percentile_value(aggregate.latencies_ns, 0.95);
   summary.p99_query_ns = percentile_value(aggregate.latencies_ns, 0.99);
+  summary.query_tps =
+      aggregate.latencies_ns.empty() || total_query_ns == 0
+          ? 0.0
+          : static_cast<double>(aggregate.latencies_ns.size()) /
+                (static_cast<double>(total_query_ns) / 1e9);
   summary.candidates = aggregate.candidates;
   summary.exact_calls = aggregate.exact_calls;
   summary.answers = aggregate.answers;
@@ -4288,10 +4299,12 @@ void print_compare_summary(const CompareSummary& summary) {
             << " index=" << summary.index
             << " live=" << summary.live_count
             << " avg_query_ms=" << summary.avg_query_ns / 1e6
-            << " p95_query_ms=" << summary.p95_query_ns / 1e6
-            << " insert_tps=" << summary.insert_tps
-            << " delete_tps=" << summary.delete_tps
-            << " candidates=" << summary.candidates
+	            << " p95_query_ms=" << summary.p95_query_ns / 1e6
+	            << " insert_tps=" << summary.insert_tps
+	            << " delete_tps=" << summary.delete_tps
+            << " query_tps=" << summary.query_tps
+            << " overall_ops_tps=" << summary.overall_ops_tps
+	            << " candidates=" << summary.candidates
             << " candidate_answer_ratio=" << summary.candidate_answer_ratio
             << " answers_match_boost=" << summary.answers_match_boost
             << " missing=" << summary.missing_count
@@ -4368,10 +4381,11 @@ void write_compare_csv(const std::string& path,
   output
       << "dataset,workload_mode,mixed_profile,operation_count,checkpoint_ops,"
          "mixed_query_ratio,mixed_insert_ratio,mixed_delete_ratio,"
-         "index,checkpoint,checkpoint_id,loaded_count,initial_count,"
-         "insert_count,delete_count,live_count,query_count,build_ns,insert_ns,"
-         "delete_ns,insert_tps,delete_tps,avg_query_ns,p50_query_ns,"
-         "p95_query_ns,p99_query_ns,candidates,exact_calls,answers,"
+	         "index,checkpoint,checkpoint_id,loaded_count,initial_count,"
+	         "insert_count,delete_count,live_count,query_count,build_ns,insert_ns,"
+         "delete_ns,p95_insert_ns,p99_insert_ns,p95_delete_ns,p99_delete_ns,"
+         "insert_tps,delete_tps,query_tps,overall_ops_tps,avg_query_ns,p50_query_ns,"
+	         "p95_query_ns,p99_query_ns,candidates,exact_calls,answers,"
          "candidate_answer_ratio,zero_answer_queries,answers_match_boost,"
          "missing_count,extra_count,oracle_build_ns,oracle_query_ns,"
          "block_size,stale_threshold_fraction,delete_compact_fraction,"
@@ -4394,12 +4408,15 @@ void write_compare_csv(const std::string& path,
            << row.checkpoint_ops << "," << row.mixed_query_ratio << ","
            << row.mixed_insert_ratio << "," << row.mixed_delete_ratio << ","
            << row.index << "," << row.checkpoint << "," << row.checkpoint_id << ","
-           << row.loaded_count << "," << row.initial_count << ","
-           << row.insert_count << "," << row.delete_count << ","
-           << row.live_count << "," << row.query_count << ","
-           << row.build_ns << "," << row.insert_ns << "," << row.delete_ns
+	           << row.loaded_count << "," << row.initial_count << ","
+	           << row.insert_count << "," << row.delete_count << ","
+	           << row.live_count << "," << row.query_count << ","
+	           << row.build_ns << "," << row.insert_ns << "," << row.delete_ns
+           << "," << row.p95_insert_ns << "," << row.p99_insert_ns
+           << "," << row.p95_delete_ns << "," << row.p99_delete_ns
            << "," << row.insert_tps << "," << row.delete_tps << ","
-           << row.avg_query_ns << "," << row.p50_query_ns << ","
+           << row.query_tps << "," << row.overall_ops_tps << ","
+	           << row.avg_query_ns << "," << row.p50_query_ns << ","
            << row.p95_query_ns << "," << row.p99_query_ns << ","
            << row.candidates << "," << row.exact_calls << ","
            << row.answers << "," << row.candidate_answer_ratio << ","
@@ -4621,6 +4638,8 @@ void run_mixed_workload_for_index(
   SimpleQueryAggregate aggregate;
   long long interval_insert_ns = 0;
   long long interval_delete_ns = 0;
+  std::vector<long long> interval_insert_latencies_ns;
+  std::vector<long long> interval_delete_latencies_ns;
   std::size_t interval_insert_count = 0;
   std::size_t interval_delete_count = 0;
   std::size_t interval_success = 0;
@@ -4648,23 +4667,39 @@ void run_mixed_workload_for_index(
         oracle_query_ns, missing_total, extra_total);
     row.workload_mode = "mixed";
     row.mixed_profile = options.mixed_profile;
-    row.operation_count = completed_ops;
-    row.checkpoint_ops = completed_ops - interval_begin;
-    row.success_count = interval_success;
-    row.failed_count = interval_failed;
-    if (!do_correctness) {
-      row.answers_match_boost = -1;
-    }
+	    row.operation_count = completed_ops;
+	    row.checkpoint_ops = completed_ops - interval_begin;
+	    row.success_count = interval_success;
+	    row.failed_count = interval_failed;
+    row.p95_insert_ns = percentile_value(interval_insert_latencies_ns, 0.95);
+    row.p99_insert_ns = percentile_value(interval_insert_latencies_ns, 0.99);
+    row.p95_delete_ns = percentile_value(interval_delete_latencies_ns, 0.95);
+    row.p99_delete_ns = percentile_value(interval_delete_latencies_ns, 0.99);
+    const long long foreground_ns =
+        row.query_count == 0 ? 0 : row.avg_query_ns *
+                                   static_cast<long long>(row.query_count);
+    const long long total_foreground_ns =
+        foreground_ns + interval_insert_ns + interval_delete_ns;
+    row.overall_ops_tps =
+        row.checkpoint_ops == 0 || total_foreground_ns == 0
+            ? 0.0
+            : static_cast<double>(row.checkpoint_ops) /
+                  (static_cast<double>(total_foreground_ns) / 1e9);
+	    if (!do_correctness) {
+	      row.answers_match_boost = -1;
+	    }
     annotate_fn(row);
     rows.push_back(row);
     print_compare_summary(rows.back());
 
     ++checkpoint_id;
     interval_begin = completed_ops;
-    aggregate = SimpleQueryAggregate();
-    interval_insert_ns = 0;
-    interval_delete_ns = 0;
-    interval_insert_count = 0;
+	    aggregate = SimpleQueryAggregate();
+	    interval_insert_ns = 0;
+	    interval_delete_ns = 0;
+    interval_insert_latencies_ns.clear();
+    interval_delete_latencies_ns.clear();
+	    interval_insert_count = 0;
     interval_delete_count = 0;
     interval_success = 0;
     interval_failed = 0;
@@ -4677,17 +4712,21 @@ void run_mixed_workload_for_index(
                               query_fn(queries[op.query_index], state.live));
     } else if (op.kind == 'i') {
       auto start = std::chrono::high_resolution_clock::now();
-      bool ok = insert_fn(op.oid);
-      auto end = std::chrono::high_resolution_clock::now();
-      interval_insert_ns += ns_count(end - start);
+	      bool ok = insert_fn(op.oid);
+	      auto end = std::chrono::high_resolution_clock::now();
+      const long long op_ns = ns_count(end - start);
+      interval_insert_ns += op_ns;
+      interval_insert_latencies_ns.push_back(op_ns);
       ++interval_insert_count;
       ok ? ++interval_success : ++interval_failed;
       state.insert(op.oid);
     } else if (op.kind == 'd') {
       auto start = std::chrono::high_resolution_clock::now();
-      bool ok = delete_fn(op.oid);
-      auto end = std::chrono::high_resolution_clock::now();
-      interval_delete_ns += ns_count(end - start);
+	      bool ok = delete_fn(op.oid);
+	      auto end = std::chrono::high_resolution_clock::now();
+      const long long op_ns = ns_count(end - start);
+      interval_delete_ns += op_ns;
+      interval_delete_latencies_ns.push_back(op_ns);
       ++interval_delete_count;
       ok ? ++interval_success : ++interval_failed;
       state.erase(op.oid);
