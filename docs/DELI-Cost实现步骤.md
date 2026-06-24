@@ -4,14 +4,13 @@ Codex 2026-06-24 修订结论：
 
 ```text
 这条路线总体可行，但不能把 5 个阶段一次性全塞进主代码。
-当前最稳的实现顺序是：
-  先做 DELI-Cost-Lite v1：
-    per-block 统计
-    per-block beta/tau 闭式自适应
-    benefit-cost local compaction
+当前代码已经推进到 DELI-Cost-Lite v2：
+  已做：
+    workload-aware beta/tau 自适应
+    benefit-cost local compaction 的可选开关
+    bulk-load 阶段的 DP adaptive block partition
 
-  暂缓：
-    离线 DP 自适应 block 划分
+  仍暂缓：
     在线 split/merge 自适应
     Limbo / Bayesian Optimization 集成
 ```
@@ -19,9 +18,9 @@ Codex 2026-06-24 修订结论：
 原因：
 
 ```text
-1. per-block beta/tau 和 benefit-cost compaction 改动局部，能直接和固定 LocalBounded 对比。
-2. DP block partition 会改变 block layout，和 beta/tau 同时改会很难判断收益来源。
-3. 在线 split/merge 会牵涉 object_to_block、directory 顺序和 ALEX 写路径，风险更高。
+1. beta/tau 只影响块内 delta 和 tombstone 的维护预算，无法改变 block 本身的剪枝质量。
+2. DP block partition 是下一步最值得做的结构性改进，因为它直接控制 block 的 Z 区间、maxZmax 和 MBR 松紧程度。
+3. 在线 split/merge 会牵涉 object_to_block、directory 顺序和 ALEX 写路径，风险更高，所以先做 bulk-load 阶段的离线 DP。
 4. BO 如果过早接入，容易把论文故事变成“黑盒调参”，不如先用确定性 cost model。
 ```
 
@@ -105,6 +104,28 @@ COST_COMPACTION_HORIZON
 COST_MIN_COMPACT_INTERVAL
   中文：同一个 block 两次 local compaction 之间至少间隔多少次操作。
   默认 64。
+
+COST_ADAPTIVE_PARTITION
+  中文：是否启用 DP 自适应 block 划分。
+  默认 1。
+  只影响 DELI_ALEX_HYBRID_COST，不影响 DELI_ALEX_HYBRID_LOCAL_BOUNDED。
+
+COST_PARTITION_MIN_BLOCK_SIZE
+  中文：DP 划分时每个 block 的最小记录数。
+  默认 0，表示自动使用 BLOCK_SIZE/2。
+
+COST_PARTITION_MAX_BLOCK_SIZE
+  中文：DP 划分时每个 block 的最大记录数。
+  默认 0，表示自动使用 2*BLOCK_SIZE。
+
+COST_PARTITION_STEP
+  中文：DP 候选切分点步长。
+  默认 0，表示自动使用 BLOCK_SIZE/8。
+  步长越小，候选切分点越密，构建时间越长。
+
+COST_PARTITION_QUERY_SAMPLE
+  中文：用于估计 block 查询代价的 query 样本数量。
+  默认 128。
 ```
 
 新增输出指标：
@@ -133,6 +154,32 @@ avg_adaptive_delete_bound
 说明方法在减少 compaction，保护写入吞吐。
 
 如果它们不随 workload 改变，说明 cost model 参数还需要校准。
+```
+
+DP adaptive block partition 的含义：
+
+```text
+固定 LocalBounded：
+  按 zmin 排序后，每 512 条切成一个 block。
+
+DELI-Cost：
+  按 zmin 排序后，不再机械地每 512 条切块；
+  而是在 [BLOCK_SIZE/2, 2*BLOCK_SIZE] 范围内选择 block 大小；
+  用 query 样本估计每个候选 block 的查询代价；
+  再用动态规划选择总代价最低的连续分区。
+```
+
+当前实现的代价函数直觉：
+
+```text
+一个候选 block 的代价 =
+  所有 query 检查这个 block summary 的元数据成本
+  + 通过 maxZmax / MBR 剪枝后仍会命中的扫描成本
+  + 根据 mixed workload 更新比例估计的维护成本
+
+因此：
+  如果某段对象的 Z 区间和 MBR 很紧，适合合成较大的 block；
+  如果某段对象 maxZmax 膨胀严重或 query 经常命中，DP 会倾向切成较小 block。
 ```
 
 ---

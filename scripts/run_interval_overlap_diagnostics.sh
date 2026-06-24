@@ -406,6 +406,29 @@ query_file_for_dataset() {
   echo "$QUERY_ROOT/${dataset}_jts_strtree_knn_${tag}.csv"
 }
 
+selectivity_for_tag() {
+  local tag="$1"
+  if [[ "$tag" == *pct ]]; then
+    local percent="${tag%pct}"
+    percent="${percent//p/.}"
+    echo "${percent}%"
+    return
+  fi
+  echo "$tag"
+}
+
+query_selectivities_for_tags() {
+  local result=""
+  local tag
+  for tag in $SELECTIVITY_TAGS; do
+    if [[ -n "$result" ]]; then
+      result+=","
+    fi
+    result+="$(selectivity_for_tag "$tag")"
+  done
+  echo "$result"
+}
+
 file_line_count() {
   local path="$1"
   if [[ ! -f "$path" ]]; then
@@ -551,7 +574,8 @@ generate_queries_if_needed() {
     echo "Generating queries for $dataset: $reason"
   fi
   mkdir -p "$QUERY_ROOT"
-  scripts/generate_jts_strtree_knn_queries.sh \
+  QUERY_SELECTIVITIES="$(query_selectivities_for_tags)" \
+    scripts/generate_jts_strtree_knn_queries.sh \
     "$(realpath "$data_file")" \
     "$QUERY_ROOT/${dataset}_jts_strtree_knn" \
     "$QUERY_LIMIT" \

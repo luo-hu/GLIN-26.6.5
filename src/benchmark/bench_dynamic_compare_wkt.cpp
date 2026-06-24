@@ -91,6 +91,11 @@ struct Options {
   double cost_compact_per_entry = 5.0;
   double cost_compaction_horizon = 0.0;
   std::size_t cost_min_compact_interval = 64;
+  bool cost_adaptive_partition = true;
+  std::size_t cost_partition_min_block_size = 0;
+  std::size_t cost_partition_max_block_size = 0;
+  std::size_t cost_partition_step = 0;
+  std::size_t cost_partition_query_sample = 128;
   double piece_limit = 10000.0;
   std::uint64_t seed = 42;
   double cell_xmin = -180.0;
@@ -261,6 +266,11 @@ void print_usage(const char* program) {
       << "  --cost_compact_per_entry F       DELI-Cost relative compact cost (default: 5.0)\n"
       << "  --cost_compaction_horizon F      DELI-Cost benefit horizon in operations; 0 disables early compaction (default: 0)\n"
       << "  --cost_min_compact_interval N    DELI-Cost min ops between local compactions per block (default: 64)\n"
+      << "  --cost_adaptive_partition 0|1    DELI-Cost DP adaptive bulk-load block partition (default: 1)\n"
+      << "  --cost_partition_min_block_size N  DELI-Cost min adaptive block records; 0 uses block_size/2\n"
+      << "  --cost_partition_max_block_size N  DELI-Cost max adaptive block records; 0 uses 2*block_size\n"
+      << "  --cost_partition_step N          DELI-Cost DP candidate split step; 0 uses block_size/8\n"
+      << "  --cost_partition_query_sample N  DELI-Cost query samples for partition cost (default: 128)\n"
       << "  --piece_limit N                  GLIN-piece records per piece (default: 10000)\n"
       << "  --seed N                         Random seed (default: 42)\n"
       << "  --cell_xmin X                    Z-order longitude origin (default: -180)\n"
@@ -352,6 +362,20 @@ Options parse_args(int argc, char* argv[]) {
     } else if (key == "--cost_min_compact_interval") {
       options.cost_min_compact_interval =
           static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--cost_adaptive_partition") {
+      options.cost_adaptive_partition = std::stoi(require_value(key)) != 0;
+    } else if (key == "--cost_partition_min_block_size") {
+      options.cost_partition_min_block_size =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--cost_partition_max_block_size") {
+      options.cost_partition_max_block_size =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--cost_partition_step") {
+      options.cost_partition_step =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--cost_partition_query_sample") {
+      options.cost_partition_query_sample =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--piece_limit") {
       options.piece_limit = std::stod(require_value(key));
     } else if (key == "--seed") {
@@ -423,6 +447,16 @@ Options parse_args(int argc, char* argv[]) {
       options.cost_compact_per_entry <= 0.0 ||
       options.cost_compaction_horizon < 0.0) {
     throw std::runtime_error("DELI-Cost unit costs must be positive and horizon must be non-negative");
+  }
+  if (options.cost_partition_query_sample == 0) {
+    throw std::runtime_error("--cost_partition_query_sample must be greater than 0");
+  }
+  if (options.cost_partition_min_block_size > 0 &&
+      options.cost_partition_max_block_size > 0 &&
+      options.cost_partition_min_block_size >
+          options.cost_partition_max_block_size) {
+    throw std::runtime_error(
+        "--cost_partition_min_block_size must be <= --cost_partition_max_block_size");
   }
   if (options.initial_fraction <= 0.0) {
     throw std::runtime_error("--initial_fraction must be greater than 0");
@@ -1255,6 +1289,11 @@ struct CompareSummary {
   long long p50_query_ns = 0;
   long long p95_query_ns = 0;
   long long p99_query_ns = 0;
+  std::size_t block_checks = 0;
+  std::size_t visited_blocks = 0;
+  std::size_t compact_records_scanned = 0;
+  std::size_t delta_records_scanned = 0;
+  std::size_t mbr_candidates = 0;
   std::size_t candidates = 0;
   std::size_t exact_calls = 0;
   std::size_t answers = 0;
@@ -1307,6 +1346,11 @@ struct CompareSummary {
 
 struct SimpleQueryResult {
   long long query_ns = 0;
+  std::size_t block_checks = 0;
+  std::size_t visited_blocks = 0;
+  std::size_t compact_records_scanned = 0;
+  std::size_t delta_records_scanned = 0;
+  std::size_t mbr_candidates = 0;
   std::size_t candidates = 0;
   std::size_t exact_calls = 0;
   std::unordered_set<ObjectId> answers;
@@ -1314,6 +1358,11 @@ struct SimpleQueryResult {
 
 struct SimpleQueryAggregate {
   std::vector<long long> latencies_ns;
+  std::size_t block_checks = 0;
+  std::size_t visited_blocks = 0;
+  std::size_t compact_records_scanned = 0;
+  std::size_t delta_records_scanned = 0;
+  std::size_t mbr_candidates = 0;
   std::size_t candidates = 0;
   std::size_t exact_calls = 0;
   std::size_t answers = 0;
@@ -1323,6 +1372,11 @@ struct SimpleQueryAggregate {
 void add_simple_query_result(SimpleQueryAggregate& aggregate,
                              const SimpleQueryResult& result) {
   aggregate.latencies_ns.push_back(result.query_ns);
+  aggregate.block_checks += result.block_checks;
+  aggregate.visited_blocks += result.visited_blocks;
+  aggregate.compact_records_scanned += result.compact_records_scanned;
+  aggregate.delta_records_scanned += result.delta_records_scanned;
+  aggregate.mbr_candidates += result.mbr_candidates;
   aggregate.candidates += result.candidates;
   aggregate.exact_calls += result.exact_calls;
   aggregate.answers += result.answers.size();
@@ -2939,10 +2993,13 @@ class LocalBoundedCompactQueryOverlay {
   LocalBoundedCompactQueryOverlay(const Options& options,
                                   const std::vector<GeometryPtr>& geometries,
                                   const std::vector<GeometryMeta>& metadata,
-                                  bool cost_driven = false)
+                                  bool cost_driven = false,
+                                  const std::vector<QueryCase>* calibration_queries =
+                                      nullptr)
       : options_(options),
         geometries_(geometries),
         metadata_(metadata),
+        calibration_queries_(calibration_queries),
         cost_driven_(cost_driven) {
     live_.assign(geometries.size(), 0);
     in_delta_.assign(geometries.size(), 0);
@@ -2964,21 +3021,15 @@ class LocalBoundedCompactQueryOverlay {
     }
     std::sort(ids.begin(), ids.end(), ObjectIdLess(metadata_));
 
+    if (should_use_adaptive_partition(ids)) {
+      bulk_load_adaptive_partition(ids);
+      return;
+    }
+
     for (std::size_t begin = 0; begin < ids.size();
          begin += options_.block_size) {
-      const std::size_t end = std::min(begin + options_.block_size, ids.size());
-      std::unique_ptr<LocalBoundedOverlayBlock> block(
-          new LocalBoundedOverlayBlock());
-      block->block_id = next_block_id_++;
-      block->beta = default_beta();
-      block->tau = default_tau();
-      block->last_stats_op = operation_clock_;
-      block->last_compact_op = operation_clock_;
-      block->compact_ids.assign(ids.begin() + begin, ids.begin() + end);
-      LocalBoundedOverlayBlock* block_ptr = block.get();
-      owned_blocks_.push_back(std::move(block));
-      directory_.push_back(block_ptr);
-      rebuild_block_summary(block_ptr, false);
+      create_compact_block(ids, begin,
+                           std::min(begin + options_.block_size, ids.size()));
     }
   }
 
@@ -3056,6 +3107,7 @@ class LocalBoundedCompactQueryOverlay {
         *query_case.geometry->getEnvelopeInternal();
 
     for (LocalBoundedOverlayBlock* block : directory_) {
+      ++result.block_checks;
       if (block->live_count == 0) {
         continue;
       }
@@ -3068,6 +3120,7 @@ class LocalBoundedCompactQueryOverlay {
       if (!envelopes_intersect(block->mbr, query_envelope)) {
         continue;
       }
+      ++result.visited_blocks;
       observe_query_hit(block);
       query_compact_ids(*block, query_case, query_zmin, query_zmax,
                         query_envelope, result);
@@ -3312,6 +3365,260 @@ class LocalBoundedCompactQueryOverlay {
 
     const std::vector<GeometryMeta>& metadata;
   };
+
+  struct PartitionQueryFeature {
+    double zmin = 0.0;
+    double zmax = 0.0;
+    geos::geom::Envelope envelope;
+  };
+
+  struct PartitionSegmentSummary {
+    double min_zmin = std::numeric_limits<double>::infinity();
+    double max_zmin = -std::numeric_limits<double>::infinity();
+    double max_zmax = -std::numeric_limits<double>::infinity();
+    geos::geom::Envelope mbr;
+    bool has_object = false;
+  };
+
+  bool should_use_adaptive_partition(const std::vector<ObjectId>& ids) const {
+    return cost_driven_ && options_.cost_adaptive_partition &&
+           calibration_queries_ != nullptr && !calibration_queries_->empty() &&
+           ids.size() > options_.block_size;
+  }
+
+  std::size_t adaptive_partition_min_block_size() const {
+    if (options_.cost_partition_min_block_size > 0) {
+      return options_.cost_partition_min_block_size;
+    }
+    return std::max<std::size_t>(64, options_.block_size / 2);
+  }
+
+  std::size_t adaptive_partition_max_block_size() const {
+    if (options_.cost_partition_max_block_size > 0) {
+      return options_.cost_partition_max_block_size;
+    }
+    return std::max<std::size_t>(options_.block_size, options_.block_size * 2);
+  }
+
+  std::size_t adaptive_partition_step() const {
+    if (options_.cost_partition_step > 0) {
+      return options_.cost_partition_step;
+    }
+    return std::max<std::size_t>(32, options_.block_size / 8);
+  }
+
+  LocalBoundedOverlayBlock* create_compact_block(
+      const std::vector<ObjectId>& ids, std::size_t begin, std::size_t end) {
+    std::unique_ptr<LocalBoundedOverlayBlock> block(
+        new LocalBoundedOverlayBlock());
+    block->block_id = next_block_id_++;
+    block->beta = default_beta();
+    block->tau = default_tau();
+    block->last_stats_op = operation_clock_;
+    block->last_compact_op = operation_clock_;
+    block->compact_ids.assign(ids.begin() + begin, ids.begin() + end);
+    LocalBoundedOverlayBlock* block_ptr = block.get();
+    owned_blocks_.push_back(std::move(block));
+    directory_.push_back(block_ptr);
+    rebuild_block_summary(block_ptr, false);
+    return block_ptr;
+  }
+
+  std::vector<PartitionQueryFeature> build_partition_query_features() const {
+    std::vector<PartitionQueryFeature> features;
+    if (calibration_queries_ == nullptr || calibration_queries_->empty()) {
+      return features;
+    }
+    const std::size_t sample_count = std::min(
+        options_.cost_partition_query_sample, calibration_queries_->size());
+    const std::size_t stride = std::max<std::size_t>(
+        1, calibration_queries_->size() / std::max<std::size_t>(1, sample_count));
+    features.reserve(sample_count);
+    for (std::size_t i = 0; i < calibration_queries_->size() &&
+                            features.size() < sample_count;
+         i += stride) {
+      const QueryCase& query = (*calibration_queries_)[i];
+      PartitionQueryFeature feature;
+      curve_shape_projection(query.geometry, "z", options_.cell_xmin,
+                             options_.cell_ymin, options_.cell_size,
+                             options_.cell_size, feature.zmin, feature.zmax);
+      feature.envelope = *query.geometry->getEnvelopeInternal();
+      features.push_back(feature);
+    }
+    return features;
+  }
+
+  PartitionSegmentSummary summarize_partition_segment(
+      const std::vector<ObjectId>& ids, std::size_t begin,
+      std::size_t end) const {
+    PartitionSegmentSummary summary;
+    for (std::size_t i = begin; i < end; ++i) {
+      const GeometryMeta& meta = metadata_[ids[i]];
+      summary.min_zmin = std::min(summary.min_zmin, meta.zmin);
+      summary.max_zmin = std::max(summary.max_zmin, meta.zmin);
+      summary.max_zmax = std::max(summary.max_zmax, meta.zmax);
+      if (!summary.has_object) {
+        summary.mbr = meta.envelope;
+        summary.has_object = true;
+      } else {
+        summary.mbr.expandToInclude(&meta.envelope);
+      }
+    }
+    return summary;
+  }
+
+  bool partition_segment_may_match(
+      const PartitionSegmentSummary& segment,
+      const PartitionQueryFeature& query) const {
+    if (!segment.has_object) {
+      return false;
+    }
+    if (segment.min_zmin > query.zmax) {
+      return false;
+    }
+    if (segment.max_zmax < query.zmin) {
+      return false;
+    }
+    return envelopes_intersect(segment.mbr, query.envelope);
+  }
+
+  double adaptive_partition_segment_cost(
+      const std::vector<ObjectId>& ids, std::size_t begin, std::size_t end,
+      const std::vector<PartitionQueryFeature>& queries) const {
+    const std::size_t count = end - begin;
+    if (count == 0) {
+      return std::numeric_limits<double>::infinity();
+    }
+    const PartitionSegmentSummary segment =
+        summarize_partition_segment(ids, begin, end);
+    // A block-summary check only compares a few scalar bounds and one MBR; it
+    // is much cheaper than scanning an object entry. Scale it below one record
+    // scan so the DP does not over-merge blocks just to reduce metadata checks.
+    const double summary_check_unit_cost =
+        options_.cost_scan_per_entry /
+        std::sqrt(static_cast<double>(
+            std::max<std::size_t>(1, options_.block_size)));
+    const double block_check_cost =
+        static_cast<double>(std::max<std::size_t>(1, queries.size())) *
+        summary_check_unit_cost;
+    double hit_count = 0.0;
+    double scanned_records = 0.0;
+    for (const PartitionQueryFeature& query : queries) {
+      if (partition_segment_may_match(segment, query)) {
+        hit_count += 1.0;
+        auto scan_end = std::upper_bound(
+            ids.begin() + static_cast<std::ptrdiff_t>(begin),
+            ids.begin() + static_cast<std::ptrdiff_t>(end), query.zmax,
+            [&](double value, ObjectId oid) {
+              return value < metadata_[oid].zmin;
+            });
+        scanned_records += static_cast<double>(
+            scan_end - (ids.begin() + static_cast<std::ptrdiff_t>(begin)));
+      }
+    }
+    const double scan_cost =
+        scanned_records * options_.cost_scan_per_entry;
+    const double maintenance_cost =
+        (options_.mixed_insert_ratio + options_.mixed_delete_ratio) *
+        options_.cost_compact_per_entry * std::sqrt(static_cast<double>(count));
+    return block_check_cost + scan_cost + maintenance_cost;
+  }
+
+  void bulk_load_adaptive_partition(const std::vector<ObjectId>& ids) {
+    const std::vector<PartitionQueryFeature> queries =
+        build_partition_query_features();
+    if (queries.empty()) {
+      for (std::size_t begin = 0; begin < ids.size();
+           begin += options_.block_size) {
+        create_compact_block(
+            ids, begin, std::min(begin + options_.block_size, ids.size()));
+      }
+      return;
+    }
+
+    const std::size_t min_block = adaptive_partition_min_block_size();
+    const std::size_t max_block =
+        std::max(min_block, adaptive_partition_max_block_size());
+    const std::size_t step =
+        std::min(std::max<std::size_t>(1, adaptive_partition_step()),
+                 min_block);
+
+    std::vector<std::size_t> positions;
+    positions.push_back(0);
+    for (std::size_t pos = step; pos < ids.size(); pos += step) {
+      positions.push_back(pos);
+    }
+    if (positions.back() != ids.size()) {
+      positions.push_back(ids.size());
+    }
+
+    const double infinity = std::numeric_limits<double>::infinity();
+    std::vector<double> dp(positions.size(), infinity);
+    std::vector<std::size_t> parent(positions.size(),
+                                    std::numeric_limits<std::size_t>::max());
+    dp[0] = 0.0;
+
+    for (std::size_t j = 1; j < positions.size(); ++j) {
+      const std::size_t end = positions[j];
+      for (std::size_t i = j; i-- > 0;) {
+        const std::size_t begin = positions[i];
+        const std::size_t size = end - begin;
+        if (size == 0) {
+          continue;
+        }
+        if (size > max_block) {
+          break;
+        }
+        if (end != ids.size() && size < min_block) {
+          continue;
+        }
+        if (!std::isfinite(dp[i])) {
+          continue;
+        }
+        double cost = adaptive_partition_segment_cost(ids, begin, end, queries);
+        if (end == ids.size() && size < min_block && begin > 0) {
+          cost *= 4.0;
+        }
+        const double candidate = dp[i] + cost;
+        if (candidate < dp[j]) {
+          dp[j] = candidate;
+          parent[j] = i;
+        }
+      }
+    }
+
+    if (!std::isfinite(dp.back())) {
+      for (std::size_t begin = 0; begin < ids.size();
+           begin += options_.block_size) {
+        create_compact_block(
+            ids, begin, std::min(begin + options_.block_size, ids.size()));
+      }
+      return;
+    }
+
+    std::vector<std::pair<std::size_t, std::size_t>> segments;
+    for (std::size_t cursor = positions.size() - 1; cursor > 0;) {
+      const std::size_t prev = parent[cursor];
+      if (prev == std::numeric_limits<std::size_t>::max()) {
+        segments.clear();
+        break;
+      }
+      segments.emplace_back(positions[prev], positions[cursor]);
+      cursor = prev;
+    }
+    if (segments.empty()) {
+      for (std::size_t begin = 0; begin < ids.size();
+           begin += options_.block_size) {
+        create_compact_block(
+            ids, begin, std::min(begin + options_.block_size, ids.size()));
+      }
+      return;
+    }
+    std::reverse(segments.begin(), segments.end());
+    for (const auto& segment : segments) {
+      create_compact_block(ids, segment.first, segment.second);
+    }
+  }
 
   LocalBoundedOverlayBlock* create_empty_block() {
     std::unique_ptr<LocalBoundedOverlayBlock> block(
@@ -3755,12 +4062,14 @@ class LocalBoundedCompactQueryOverlay {
       if (!live_[oid]) {
         continue;
       }
+      ++result.compact_records_scanned;
       if (meta.zmax < query_zmin) {
         continue;
       }
       if (!envelopes_intersect(meta.envelope, query_envelope)) {
         continue;
       }
+      ++result.mbr_candidates;
       ++result.candidates;
       ++result.exact_calls;
       if (query_case.geometry->intersects(geometries_[oid].get())) {
@@ -3778,6 +4087,7 @@ class LocalBoundedCompactQueryOverlay {
       if (oid >= metadata_.size() || !live_[oid]) {
         continue;
       }
+      ++result.delta_records_scanned;
       const GeometryMeta& meta = metadata_[oid];
       if (meta.zmin > query_zmax || meta.zmax < query_zmin) {
         continue;
@@ -3785,6 +4095,7 @@ class LocalBoundedCompactQueryOverlay {
       if (!envelopes_intersect(meta.envelope, query_envelope)) {
         continue;
       }
+      ++result.mbr_candidates;
       ++result.candidates;
       ++result.exact_calls;
       if (query_case.geometry->intersects(geometries_[oid].get())) {
@@ -3796,12 +4107,13 @@ class LocalBoundedCompactQueryOverlay {
   const Options& options_;
   const std::vector<GeometryPtr>& geometries_;
   const std::vector<GeometryMeta>& metadata_;
+  const std::vector<QueryCase>* calibration_queries_ = nullptr;
+  bool cost_driven_ = false;
   std::vector<char> live_;
   std::vector<char> in_delta_;
   std::vector<LocalBoundedOverlayBlock*> object_to_block_;
   std::vector<std::unique_ptr<LocalBoundedOverlayBlock>> owned_blocks_;
   std::vector<LocalBoundedOverlayBlock*> directory_;
-  bool cost_driven_ = false;
   std::uint64_t next_block_id_ = 0;
   std::uint64_t operation_clock_ = 0;
   std::uint64_t query_ops_ = 0;
@@ -3823,11 +4135,13 @@ class DeliAlexHybridLocalBoundedIndex {
 
   DeliAlexHybridLocalBoundedIndex(
       const Options& options, const std::vector<GeometryPtr>& geometries,
-      const std::vector<GeometryMeta>& metadata, bool cost_driven = false)
+      const std::vector<GeometryMeta>& metadata, bool cost_driven = false,
+      const std::vector<QueryCase>* calibration_queries = nullptr)
       : options_(options),
         geometries_(geometries),
         metadata_(metadata),
-        overlay_(options, geometries, metadata, cost_driven) {}
+        overlay_(options, geometries, metadata, cost_driven,
+                 calibration_queries) {}
 
   void bulk_load(const std::vector<ObjectId>& ids) {
     std::vector<std::pair<double, Geometry*>> values;
@@ -3997,6 +4311,7 @@ SimpleQueryResult query_boost_index(const RTree& rtree,
     if (oid >= geometries.size() || oid >= live.size() || !live[oid]) {
       continue;
     }
+    ++result.mbr_candidates;
     ++result.exact_calls;
     if (query_case.geometry->intersects(geometries[oid].get())) {
       result.answers.insert(oid);
@@ -4030,6 +4345,7 @@ SimpleQueryResult query_quadtree_index(
     if (oid >= live.size() || !live[oid]) {
       continue;
     }
+    ++result.mbr_candidates;
     ++result.exact_calls;
     if (query_case.geometry->intersects(geometries[oid].get())) {
       result.answers.insert(oid);
@@ -4056,6 +4372,7 @@ SimpleQueryResult query_glin_piece_index(
                   pieces, found_geometries, count_filter);
   result.candidates = static_cast<std::size_t>(std::max(0, count_filter));
   result.exact_calls = result.candidates;
+  result.mbr_candidates = result.candidates;
   for (Geometry* geometry : found_geometries) {
     auto found = geometry_to_oid.find(geometry);
     if (found == geometry_to_oid.end()) {
@@ -4133,6 +4450,11 @@ CompareSummary finalize_compare_summary(
           ? 0.0
           : static_cast<double>(aggregate.latencies_ns.size()) /
                 (static_cast<double>(total_query_ns) / 1e9);
+  summary.block_checks = aggregate.block_checks;
+  summary.visited_blocks = aggregate.visited_blocks;
+  summary.compact_records_scanned = aggregate.compact_records_scanned;
+  summary.delta_records_scanned = aggregate.delta_records_scanned;
+  summary.mbr_candidates = aggregate.mbr_candidates;
   summary.candidates = aggregate.candidates;
   summary.exact_calls = aggregate.exact_calls;
   summary.answers = aggregate.answers;
@@ -4723,7 +5045,9 @@ void write_compare_csv(const std::string& path,
 	         "insert_count,delete_count,live_count,query_count,build_ns,insert_ns,"
          "delete_ns,p95_insert_ns,p99_insert_ns,p95_delete_ns,p99_delete_ns,"
          "insert_tps,delete_tps,query_tps,overall_ops_tps,avg_query_ns,p50_query_ns,"
-	         "p95_query_ns,p99_query_ns,candidates,exact_calls,answers,"
+         "p95_query_ns,p99_query_ns,block_checks,visited_blocks,"
+         "compact_records_scanned,delta_records_scanned,mbr_candidates,"
+         "candidates,exact_calls,answers,"
          "candidate_answer_ratio,zero_answer_queries,answers_match_boost,"
          "missing_count,extra_count,oracle_build_ns,oracle_query_ns,"
          "block_size,stale_threshold_fraction,delete_compact_fraction,"
@@ -4756,8 +5080,11 @@ void write_compare_csv(const std::string& path,
            << "," << row.p95_delete_ns << "," << row.p99_delete_ns
            << "," << row.insert_tps << "," << row.delete_tps << ","
            << row.query_tps << "," << row.overall_ops_tps << ","
-	           << row.avg_query_ns << "," << row.p50_query_ns << ","
+           << row.avg_query_ns << "," << row.p50_query_ns << ","
            << row.p95_query_ns << "," << row.p99_query_ns << ","
+           << row.block_checks << "," << row.visited_blocks << ","
+           << row.compact_records_scanned << ","
+           << row.delta_records_scanned << "," << row.mbr_candidates << ","
            << row.candidates << "," << row.exact_calls << ","
            << row.answers << "," << row.candidate_answer_ratio << ","
            << row.zero_answer_queries << "," << row.answers_match_boost
@@ -4927,6 +5254,10 @@ std::vector<MixedOperation> generate_mixed_operations(
 SimpleQueryResult simple_from_deli_query(const QueryResult& source) {
   SimpleQueryResult result;
   result.query_ns = source.query_ns;
+  result.block_checks = source.prefix_blocks;
+  result.visited_blocks = source.visited_blocks;
+  result.compact_records_scanned = source.records_scanned;
+  result.mbr_candidates = source.mbr_candidates;
   result.candidates = source.exact_calls;
   result.exact_calls = source.exact_calls;
   result.answers = source.answers;
@@ -5397,7 +5728,8 @@ int main(int argc, char* argv[]) {
       }
       if (index_enabled(options, "DELI_ALEX_HYBRID_COST")) {
         DeliAlexHybridLocalBoundedIndex mixed_index(options, geometries,
-                                                    geometry_metadata, true);
+                                                    geometry_metadata, true,
+                                                    &queries);
         auto start = std::chrono::high_resolution_clock::now();
         mixed_index.bulk_load(initial_ids);
         auto end = std::chrono::high_resolution_clock::now();
@@ -6353,7 +6685,7 @@ int main(int argc, char* argv[]) {
       // predicted scan benefit covers the local compaction cost.
       if (index_enabled(options, "DELI_ALEX_HYBRID_COST")) {
         DeliAlexHybridLocalBoundedIndex deli_alex_hybrid_cost(
-            options, geometries, geometry_metadata, true);
+            options, geometries, geometry_metadata, true, &queries);
         auto cost_build_start = std::chrono::high_resolution_clock::now();
         deli_alex_hybrid_cost.bulk_load(initial_ids);
         auto cost_build_end = std::chrono::high_resolution_clock::now();

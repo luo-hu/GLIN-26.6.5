@@ -92,6 +92,21 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     compaction_horizon 表示估计未来收益时看的操作窗口。
     默认 0，表示不做提前 compaction；Cost 版只根据负载比例放宽局部阈值。
 
+  COST_ADAPTIVE_PARTITION
+    是否为 DELI-ALEX-Hybrid-Cost 启用 DP 自适应 block 划分。默认 1。
+    这个开关只影响 Cost 版，不影响 LocalBounded 固定分区基线。
+
+  COST_PARTITION_MIN_BLOCK_SIZE / COST_PARTITION_MAX_BLOCK_SIZE
+    DP 划分时每个 block 的最小/最大记录数。
+    默认 0 表示自动使用 BLOCK_SIZE/2 和 2*BLOCK_SIZE。
+
+  COST_PARTITION_STEP
+    DP 候选切分点步长。默认 0 表示自动使用 BLOCK_SIZE/8。
+    步长越小，划分越细，但 build 时间越长。
+
+  COST_PARTITION_QUERY_SAMPLE
+    用多少条 query 样本估计 block 的查询代价。默认 128。
+
   INDEXES
     只跑指定索引，避免每次都把所有方法重建一遍。默认 all。
     例子：
@@ -285,9 +300,13 @@ SELECTIVITY_TAGS="${SELECTIVITY_TAGS:-1pct}"
 BUILD_DIR="${BUILD_DIR:-build}"
 
 # 这里故意固定为论文默认参数，避免每个数据集单独调参。
-BLOCK_SIZE="${BLOCK_SIZE:-512}"
+BLOCK_SIZE="${BLOCK_SIZE:-512}"   #只有DELI_ALEX_HYBRID_COST这个方法在bulk-load阶段用动态规划进行block分区,其它方法还是默认每个block的容量是512
 STALE_THRESHOLD="${STALE_THRESHOLD:-0.05}"
 LOCAL_DELTA_BOUND="${LOCAL_DELTA_BOUND:-0}"
+if [[ -z "${DELETE_COMPACT_FRACTION+x}" && -n "${DELETE_COMPAPACT_FRACTION:-}" ]]; then
+  echo "Warning: DELETE_COMPAPACT_FRACTION 拼写有误，已按 DELETE_COMPACT_FRACTION 处理。" >&2
+  DELETE_COMPACT_FRACTION="$DELETE_COMPAPACT_FRACTION"
+fi
 DELETE_COMPACT_FRACTION="${DELETE_COMPACT_FRACTION:-0.25}"
 COST_EMA_ALPHA="${COST_EMA_ALPHA:-0.10}"
 COST_BETA_MIN="${COST_BETA_MIN:-0.25}"
@@ -298,6 +317,11 @@ COST_SCAN_PER_ENTRY="${COST_SCAN_PER_ENTRY:-1.0}"
 COST_COMPACT_PER_ENTRY="${COST_COMPACT_PER_ENTRY:-5.0}"
 COST_COMPACTION_HORIZON="${COST_COMPACTION_HORIZON:-0}"
 COST_MIN_COMPACT_INTERVAL="${COST_MIN_COMPACT_INTERVAL:-64}"
+COST_ADAPTIVE_PARTITION="${COST_ADAPTIVE_PARTITION:-1}"
+COST_PARTITION_MIN_BLOCK_SIZE="${COST_PARTITION_MIN_BLOCK_SIZE:-0}"
+COST_PARTITION_MAX_BLOCK_SIZE="${COST_PARTITION_MAX_BLOCK_SIZE:-0}"
+COST_PARTITION_STEP="${COST_PARTITION_STEP:-0}"
+COST_PARTITION_QUERY_SAMPLE="${COST_PARTITION_QUERY_SAMPLE:-128}"
 PIECE_LIMIT="${PIECE_LIMIT:-10000}"
 
 INITIAL_FRACTION="${INITIAL_FRACTION:-0.5}"
@@ -368,6 +392,29 @@ query_file_for_dataset() {
   local dataset="$1"
   local tag="$2"
   echo "$QUERY_ROOT/${dataset}_jts_strtree_knn_${tag}.csv"
+}
+
+selectivity_for_tag() {
+  local tag="$1"
+  if [[ "$tag" == *pct ]]; then
+    local percent="${tag%pct}"
+    percent="${percent//p/.}"
+    echo "${percent}%"
+    return
+  fi
+  echo "$tag"
+}
+
+query_selectivities_for_tags() {
+  local result=""
+  local tag
+  for tag in $SELECTIVITY_TAGS; do
+    if [[ -n "$result" ]]; then
+      result+=","
+    fi
+    result+="$(selectivity_for_tag "$tag")"
+  done
+  echo "$result"
 }
 
 mixed_profile_ratios() {
@@ -445,7 +492,8 @@ generate_queries_if_needed() {
     echo "Generating queries for $dataset: $reason"
   fi
   mkdir -p "$QUERY_ROOT"
-  scripts/generate_jts_strtree_knn_queries.sh \
+  QUERY_SELECTIVITIES="$(query_selectivities_for_tags)" \
+    scripts/generate_jts_strtree_knn_queries.sh \
     "$(realpath "$data_file")" \
     "$QUERY_ROOT/${dataset}_jts_strtree_knn" \
     "$QUERY_LIMIT" \
@@ -535,6 +583,11 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --cost_compact_per_entry "$COST_COMPACT_PER_ENTRY" \
           --cost_compaction_horizon "$COST_COMPACTION_HORIZON" \
           --cost_min_compact_interval "$COST_MIN_COMPACT_INTERVAL" \
+          --cost_adaptive_partition "$COST_ADAPTIVE_PARTITION" \
+          --cost_partition_min_block_size "$COST_PARTITION_MIN_BLOCK_SIZE" \
+          --cost_partition_max_block_size "$COST_PARTITION_MAX_BLOCK_SIZE" \
+          --cost_partition_step "$COST_PARTITION_STEP" \
+          --cost_partition_query_sample "$COST_PARTITION_QUERY_SAMPLE" \
           --piece_limit "$PIECE_LIMIT" \
           --cell_size "$CELL_SIZE" \
           --seed "$SEED" \
