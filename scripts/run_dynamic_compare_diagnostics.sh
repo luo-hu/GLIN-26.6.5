@@ -16,6 +16,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   DELI-ALEX-Hybrid-Buf
   DELI-ALEX-Hybrid-Bounded
   DELI-ALEX-Hybrid-LocalBounded
+  DELI-ALEX-Hybrid-Cost
   Boost R-tree
   GEOS Quadtree
   GLIN-piece
@@ -79,6 +80,18 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     DELI-ALEX-Hybrid-LocalBounded 的删除物理压缩阈值。
     默认 0.25，表示每个 block 最多容忍约 25% tombstone 后才做 physical compaction。
 
+  COST_EMA_ALPHA / COST_BETA_MIN / COST_BETA_MAX / COST_TAU_MIN / COST_TAU_MAX
+    DELI-ALEX-Hybrid-Cost 的自适应参数。
+    beta 是局部增量比例，tau 是墓碑比例。
+    默认 beta/tau 都限制在 0.25 到 0.50 之间，避免 Cost 版在当前数据上过度压实。
+    如果想测试激进读优化，可以显式设置 COST_BETA_MIN=0.05 COST_TAU_MIN=0.05。
+
+  COST_SCAN_PER_ENTRY / COST_COMPACT_PER_ENTRY / COST_COMPACTION_HORIZON
+    DELI-ALEX-Hybrid-Cost 的代价模型相对权重。
+    scan_per_entry 表示扫描一条记录的成本，compact_per_entry 表示整理一条记录的成本。
+    compaction_horizon 表示估计未来收益时看的操作窗口。
+    默认 0，表示不做提前 compaction；Cost 版只根据负载比例放宽局部阈值。
+
   INDEXES
     只跑指定索引，避免每次都把所有方法重建一遍。默认 all。
     例子：
@@ -90,6 +103,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
       DELI_ALEX_HYBRID_BUF 
       DELI_ALEX_HYBRID_BOUNDED
       DELI_ALEX_HYBRID_LOCAL_BOUNDED 
+      DELI_ALEX_HYBRID_COST
       Boost_Rtree
       GEOS_Quadtree 
       GLIN_PIECEWISE
@@ -275,6 +289,15 @@ BLOCK_SIZE="${BLOCK_SIZE:-512}"
 STALE_THRESHOLD="${STALE_THRESHOLD:-0.05}"
 LOCAL_DELTA_BOUND="${LOCAL_DELTA_BOUND:-0}"
 DELETE_COMPACT_FRACTION="${DELETE_COMPACT_FRACTION:-0.25}"
+COST_EMA_ALPHA="${COST_EMA_ALPHA:-0.10}"
+COST_BETA_MIN="${COST_BETA_MIN:-0.25}"
+COST_BETA_MAX="${COST_BETA_MAX:-0.50}"
+COST_TAU_MIN="${COST_TAU_MIN:-0.25}"
+COST_TAU_MAX="${COST_TAU_MAX:-0.50}"
+COST_SCAN_PER_ENTRY="${COST_SCAN_PER_ENTRY:-1.0}"
+COST_COMPACT_PER_ENTRY="${COST_COMPACT_PER_ENTRY:-5.0}"
+COST_COMPACTION_HORIZON="${COST_COMPACTION_HORIZON:-0}"
+COST_MIN_COMPACT_INTERVAL="${COST_MIN_COMPACT_INTERVAL:-64}"
 PIECE_LIMIT="${PIECE_LIMIT:-10000}"
 
 INITIAL_FRACTION="${INITIAL_FRACTION:-0.5}"
@@ -503,6 +526,15 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --stale_threshold_fraction "$STALE_THRESHOLD" \
           --local_delta_bound "$LOCAL_DELTA_BOUND" \
           --delete_compact_fraction "$DELETE_COMPACT_FRACTION" \
+          --cost_ema_alpha "$COST_EMA_ALPHA" \
+          --cost_beta_min "$COST_BETA_MIN" \
+          --cost_beta_max "$COST_BETA_MAX" \
+          --cost_tau_min "$COST_TAU_MIN" \
+          --cost_tau_max "$COST_TAU_MAX" \
+          --cost_scan_per_entry "$COST_SCAN_PER_ENTRY" \
+          --cost_compact_per_entry "$COST_COMPACT_PER_ENTRY" \
+          --cost_compaction_horizon "$COST_COMPACTION_HORIZON" \
+          --cost_min_compact_interval "$COST_MIN_COMPACT_INTERVAL" \
           --piece_limit "$PIECE_LIMIT" \
           --cell_size "$CELL_SIZE" \
           --seed "$SEED" \

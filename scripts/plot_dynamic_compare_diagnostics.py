@@ -20,6 +20,7 @@ INDEX_ORDER = [
     "DELI_ALEX_HYBRID_BUF",
     "DELI_ALEX_HYBRID_BOUNDED",
     "DELI_ALEX_HYBRID_LOCAL_BOUNDED",
+    "DELI_ALEX_HYBRID_COST",
     "GLIN_PIECEWISE",
     "Boost_Rtree",
     "GEOS_Quadtree",
@@ -31,6 +32,7 @@ COLORS = {
     "DELI_ALEX_HYBRID_BUF": "#8BAE3F",
     "DELI_ALEX_HYBRID_BOUNDED": "#D49A2A",
     "DELI_ALEX_HYBRID_LOCAL_BOUNDED": "#E76F51",
+    "DELI_ALEX_HYBRID_COST": "#C43C7A",
     "GLIN_PIECEWISE": "#6D8F3F",
     "Boost_Rtree": "#B86442",
     "GEOS_Quadtree": "#7C5FB3",
@@ -42,6 +44,7 @@ LABELS = {
     "DELI_ALEX_HYBRID_BUF": "DELI-ALEX-Hybrid-Buf",
     "DELI_ALEX_HYBRID_BOUNDED": "DELI-ALEX-Hybrid-Bounded",
     "DELI_ALEX_HYBRID_LOCAL_BOUNDED": "DELI-ALEX-Hybrid-LocalBounded",
+    "DELI_ALEX_HYBRID_COST": "DELI-ALEX-Hybrid-Cost",
     "GLIN_PIECEWISE": "GLIN-piece",
     "Boost_Rtree": "Boost R-tree",
     "GEOS_Quadtree": "GEOS Quadtree",
@@ -188,6 +191,10 @@ def write_notes(rows, output_dir, prefix):
                     f"local_delta_bound={as_float(row, 'local_delta_bound'):.0f}, "
                     f"delete_compact_fraction={as_float(row, 'delete_compact_fraction'):.2f}, "
                     f"delete_compact_bound={as_float(row, 'delete_compact_bound'):.0f}, "
+                    f"avg_beta={as_float(row, 'avg_beta'):.3f}, "
+                    f"avg_tau={as_float(row, 'avg_tau'):.3f}, "
+                    f"avg_delta_bound={as_float(row, 'avg_adaptive_delta_bound'):.1f}, "
+                    f"avg_delete_bound={as_float(row, 'avg_adaptive_delete_bound'):.1f}, "
                     f"max_local_delta={as_float(row, 'max_local_delta_size'):.0f}, "
                     f"blocks_with_delta={as_float(row, 'blocks_with_delta'):.0f}, "
                     f"local_compactions_stage={as_float(row, 'local_compaction_count_stage'):.0f}, "
@@ -233,6 +240,10 @@ def main():
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_local_delta_size", "Average local delta size", "avg_local_delta_size", args.dpi))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "max_local_delta_size", "Max local delta size", "max_local_delta_size", args.dpi))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "tombstone_ratio", "Tombstone ratio", "tombstone_ratio", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_beta", "Average beta (local delta ratio)", "avg_beta", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_tau", "Average tau (tombstone ratio)", "avg_tau", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_adaptive_delta_bound", "Average adaptive delta bound", "avg_adaptive_delta_bound", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_adaptive_delete_bound", "Average adaptive delete bound", "avg_adaptive_delete_bound", args.dpi))
     paths.append(write_notes(rows, output_dir, args.figure_prefix))
     for path in paths:
         if path:
