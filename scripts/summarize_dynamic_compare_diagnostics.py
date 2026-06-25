@@ -103,6 +103,8 @@ def field_order(rows):
         "compact_records_scanned",
         "delta_records_scanned",
         "mbr_candidates",
+        "predicate_shortcuts",
+        "predicate_shortcuts_enabled",
         "exact_calls",
         "answers",
         "build_ms",

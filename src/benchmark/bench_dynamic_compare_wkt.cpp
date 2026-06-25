@@ -96,6 +96,7 @@ struct Options {
   std::size_t cost_partition_max_block_size = 0;
   std::size_t cost_partition_step = 0;
   std::size_t cost_partition_query_sample = 128;
+  bool predicate_shortcuts = true;
   double piece_limit = 10000.0;
   std::uint64_t seed = 42;
   double cell_xmin = -180.0;
@@ -271,6 +272,7 @@ void print_usage(const char* program) {
       << "  --cost_partition_max_block_size N  DELI-Cost max adaptive block records; 0 uses 2*block_size\n"
       << "  --cost_partition_step N          DELI-Cost DP candidate split step; 0 uses block_size/8\n"
       << "  --cost_partition_query_sample N  DELI-Cost query samples for partition cost (default: 128)\n"
+      << "  --predicate_shortcuts 0|1        Enable exact-safe rectangle-query envelope shortcuts before GEOS (default: 1)\n"
       << "  --piece_limit N                  GLIN-piece records per piece (default: 10000)\n"
       << "  --seed N                         Random seed (default: 42)\n"
       << "  --cell_xmin X                    Z-order longitude origin (default: -180)\n"
@@ -376,6 +378,8 @@ Options parse_args(int argc, char* argv[]) {
     } else if (key == "--cost_partition_query_sample") {
       options.cost_partition_query_sample =
           static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--predicate_shortcuts") {
+      options.predicate_shortcuts = std::stoi(require_value(key)) != 0;
     } else if (key == "--piece_limit") {
       options.piece_limit = std::stod(require_value(key));
     } else if (key == "--seed") {
@@ -1294,6 +1298,8 @@ struct CompareSummary {
   std::size_t compact_records_scanned = 0;
   std::size_t delta_records_scanned = 0;
   std::size_t mbr_candidates = 0;
+  std::size_t predicate_shortcuts = 0;
+  int predicate_shortcuts_enabled = 0;
   std::size_t candidates = 0;
   std::size_t exact_calls = 0;
   std::size_t answers = 0;
@@ -1351,6 +1357,7 @@ struct SimpleQueryResult {
   std::size_t compact_records_scanned = 0;
   std::size_t delta_records_scanned = 0;
   std::size_t mbr_candidates = 0;
+  std::size_t predicate_shortcuts = 0;
   std::size_t candidates = 0;
   std::size_t exact_calls = 0;
   std::unordered_set<ObjectId> answers;
@@ -1363,6 +1370,7 @@ struct SimpleQueryAggregate {
   std::size_t compact_records_scanned = 0;
   std::size_t delta_records_scanned = 0;
   std::size_t mbr_candidates = 0;
+  std::size_t predicate_shortcuts = 0;
   std::size_t candidates = 0;
   std::size_t exact_calls = 0;
   std::size_t answers = 0;
@@ -1377,6 +1385,7 @@ void add_simple_query_result(SimpleQueryAggregate& aggregate,
   aggregate.compact_records_scanned += result.compact_records_scanned;
   aggregate.delta_records_scanned += result.delta_records_scanned;
   aggregate.mbr_candidates += result.mbr_candidates;
+  aggregate.predicate_shortcuts += result.predicate_shortcuts;
   aggregate.candidates += result.candidates;
   aggregate.exact_calls += result.exact_calls;
   aggregate.answers += result.answers.size();
@@ -3482,6 +3491,13 @@ class LocalBoundedCompactQueryOverlay {
     return envelopes_intersect(segment.mbr, query.envelope);
   }
 
+  bool query_rectangle_contains_object_envelope(
+      const geos::geom::Envelope& query_envelope,
+      const geos::geom::Envelope& object_envelope) const {
+    return options_.predicate_shortcuts &&
+           envelope_contains(query_envelope, object_envelope);
+  }
+
   double adaptive_partition_segment_cost(
       const std::vector<ObjectId>& ids, std::size_t begin, std::size_t end,
       const std::vector<PartitionQueryFeature>& queries) const {
@@ -4071,6 +4087,12 @@ class LocalBoundedCompactQueryOverlay {
       }
       ++result.mbr_candidates;
       ++result.candidates;
+      if (query_rectangle_contains_object_envelope(query_envelope,
+                                                   meta.envelope)) {
+        ++result.predicate_shortcuts;
+        result.answers.insert(oid);
+        continue;
+      }
       ++result.exact_calls;
       if (query_case.geometry->intersects(geometries_[oid].get())) {
         result.answers.insert(oid);
@@ -4097,6 +4119,12 @@ class LocalBoundedCompactQueryOverlay {
       }
       ++result.mbr_candidates;
       ++result.candidates;
+      if (query_rectangle_contains_object_envelope(query_envelope,
+                                                   meta.envelope)) {
+        ++result.predicate_shortcuts;
+        result.answers.insert(oid);
+        continue;
+      }
       ++result.exact_calls;
       if (query_case.geometry->intersects(geometries_[oid].get())) {
         result.answers.insert(oid);
@@ -4455,6 +4483,7 @@ CompareSummary finalize_compare_summary(
   summary.compact_records_scanned = aggregate.compact_records_scanned;
   summary.delta_records_scanned = aggregate.delta_records_scanned;
   summary.mbr_candidates = aggregate.mbr_candidates;
+  summary.predicate_shortcuts = aggregate.predicate_shortcuts;
   summary.candidates = aggregate.candidates;
   summary.exact_calls = aggregate.exact_calls;
   summary.answers = aggregate.answers;
@@ -4598,6 +4627,8 @@ CompareSummary convert_deli_summary(const CheckpointSummary& source,
   summary.p50_query_ns = source.p50_query_ns;
   summary.p95_query_ns = source.p95_query_ns;
   summary.p99_query_ns = source.p99_query_ns;
+  summary.mbr_candidates = source.mbr_candidates;
+  summary.predicate_shortcuts_enabled = 0;
   summary.candidates = source.exact_calls;
   summary.exact_calls = source.exact_calls;
   summary.answers = source.answers;
@@ -5047,7 +5078,7 @@ void write_compare_csv(const std::string& path,
          "insert_tps,delete_tps,query_tps,overall_ops_tps,avg_query_ns,p50_query_ns,"
          "p95_query_ns,p99_query_ns,block_checks,visited_blocks,"
          "compact_records_scanned,delta_records_scanned,mbr_candidates,"
-         "candidates,exact_calls,answers,"
+         "predicate_shortcuts,predicate_shortcuts_enabled,candidates,exact_calls,answers,"
          "candidate_answer_ratio,zero_answer_queries,answers_match_boost,"
          "missing_count,extra_count,oracle_build_ns,oracle_query_ns,"
          "block_size,stale_threshold_fraction,delete_compact_fraction,"
@@ -5085,7 +5116,9 @@ void write_compare_csv(const std::string& path,
            << row.block_checks << "," << row.visited_blocks << ","
            << row.compact_records_scanned << ","
            << row.delta_records_scanned << "," << row.mbr_candidates << ","
-           << row.candidates << "," << row.exact_calls << ","
+           << row.predicate_shortcuts << "," << row.predicate_shortcuts_enabled
+           << "," << row.candidates << ","
+           << row.exact_calls << ","
            << row.answers << "," << row.candidate_answer_ratio << ","
            << row.zero_answer_queries << "," << row.answers_match_boost
            << "," << row.missing_count << "," << row.extra_count << ","
@@ -5543,6 +5576,8 @@ int main(int argc, char* argv[]) {
       row.blocks_with_delta = index.blocks_with_delta();
       row.tombstone_ratio = index.tombstone_ratio();
       row.index_bytes_estimate = index.index_bytes_estimate();
+      row.predicate_shortcuts_enabled =
+          options.predicate_shortcuts ? 1 : 0;
       std::string validation_message;
       row.validate_ok = index.validate_index(&validation_message) ? 1 : 0;
       if (!row.validate_ok) {
@@ -5718,6 +5753,8 @@ int main(int argc, char* argv[]) {
               row.blocks_with_delta = mixed_index.blocks_with_delta();
               row.tombstone_ratio = mixed_index.tombstone_ratio();
               row.index_bytes_estimate = mixed_index.index_bytes_estimate();
+              row.predicate_shortcuts_enabled =
+                  options.predicate_shortcuts ? 1 : 0;
               std::string validation_message;
               row.validate_ok =
                   mixed_index.validate_index(&validation_message) ? 1 : 0;
@@ -6506,6 +6543,8 @@ int main(int argc, char* argv[]) {
         deli_alex_hybrid_local_bounded.tombstone_ratio();
     rows.back().index_bytes_estimate =
         deli_alex_hybrid_local_bounded.index_bytes_estimate();
+    rows.back().predicate_shortcuts_enabled =
+        options.predicate_shortcuts ? 1 : 0;
     {
       std::string validation_message;
       rows.back().validate_ok =
@@ -6582,6 +6621,8 @@ int main(int argc, char* argv[]) {
         deli_alex_hybrid_local_bounded.tombstone_ratio();
     rows.back().index_bytes_estimate =
         deli_alex_hybrid_local_bounded.index_bytes_estimate();
+    rows.back().predicate_shortcuts_enabled =
+        options.predicate_shortcuts ? 1 : 0;
     {
       std::string validation_message;
       rows.back().validate_ok =
@@ -6659,6 +6700,8 @@ int main(int argc, char* argv[]) {
         deli_alex_hybrid_local_bounded.tombstone_ratio();
     rows.back().index_bytes_estimate =
         deli_alex_hybrid_local_bounded.index_bytes_estimate();
+    rows.back().predicate_shortcuts_enabled =
+        options.predicate_shortcuts ? 1 : 0;
     {
       std::string validation_message;
       rows.back().validate_ok =

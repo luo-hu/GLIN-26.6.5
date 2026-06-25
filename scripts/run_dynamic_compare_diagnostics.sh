@@ -107,6 +107,13 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   COST_PARTITION_QUERY_SAMPLE
     用多少条 query 样本估计 block 的查询代价。默认 128。
 
+  PREDICATE_SHORTCUTS
+    是否启用 DELI predicate-aware shortcut。默认 1。
+    当前实现只使用严格安全的矩形查询 shortcut：
+    如果 query 矩形的 envelope 完全包含对象 envelope，则该对象必然与 query 矩形相交，
+    可以直接返回答案并跳过 GEOS exact intersects。
+    设为 0 可以复现实验中的 DELI v1，不使用该 predicate-aware 层。
+
   INDEXES
     只跑指定索引，避免每次都把所有方法重建一遍。默认 all。
     例子：
@@ -322,6 +329,7 @@ COST_PARTITION_MIN_BLOCK_SIZE="${COST_PARTITION_MIN_BLOCK_SIZE:-0}"
 COST_PARTITION_MAX_BLOCK_SIZE="${COST_PARTITION_MAX_BLOCK_SIZE:-0}"
 COST_PARTITION_STEP="${COST_PARTITION_STEP:-0}"
 COST_PARTITION_QUERY_SAMPLE="${COST_PARTITION_QUERY_SAMPLE:-128}"
+PREDICATE_SHORTCUTS="${PREDICATE_SHORTCUTS:-1}"
 PIECE_LIMIT="${PIECE_LIMIT:-10000}"
 
 INITIAL_FRACTION="${INITIAL_FRACTION:-0.5}"
@@ -588,6 +596,7 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --cost_partition_max_block_size "$COST_PARTITION_MAX_BLOCK_SIZE" \
           --cost_partition_step "$COST_PARTITION_STEP" \
           --cost_partition_query_sample "$COST_PARTITION_QUERY_SAMPLE" \
+          --predicate_shortcuts "$PREDICATE_SHORTCUTS" \
           --piece_limit "$PIECE_LIMIT" \
           --cell_size "$CELL_SIZE" \
           --seed "$SEED" \

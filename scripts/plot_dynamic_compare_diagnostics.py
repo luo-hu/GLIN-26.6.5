@@ -122,8 +122,11 @@ def safe_name(value):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "unknown")
 
 
-def plot_mixed_metric(rows, output_dir, prefix, metric, ylabel, filename, dpi, log_y=False):
+def plot_mixed_metric(rows, output_dir, prefix, metric, ylabel, filename, dpi,
+                      log_y=False, skip_zero_series=False):
     subset = [row for row in rows if row.get("workload_mode") == "mixed"]
+    if metric == "answers_match_boost":
+        subset = [row for row in subset if row.get(metric) != "-1"]
     if not subset:
         return []
     paths = []
@@ -143,8 +146,12 @@ def plot_mixed_metric(rows, output_dir, prefix, metric, ylabel, filename, dpi, l
         for index in indexes:
             series = [row for row in group_rows if row["index"] == index]
             series.sort(key=lambda row: as_float(row, "operation_count"))
+            if not series:
+                continue
             xs = [as_float(row, "operation_count") for row in series]
             ys = [as_float(row, metric) for row in series]
+            if skip_zero_series and all((math.isnan(y) or abs(y) < 1e-12) for y in ys):
+                continue
             ax.plot(xs, ys, marker="o", linewidth=1.5, markersize=3.5,
                     color=COLORS.get(index), label=LABELS.get(index, index))
         ax.set_xlabel("Operations")
@@ -227,11 +234,15 @@ def main():
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_query_ms", "Average query latency in mixed workload (ms)", "avg_query_ms", args.dpi))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p95_query_ms", "P95 query latency in mixed workload (ms)", "p95_query_ms", args.dpi))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p99_query_ms", "P99 query latency in mixed workload (ms)", "p99_query_ms", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "block_checks", "Block summary checks per interval", "block_checks", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "visited_blocks", "Visited blocks per interval", "visited_blocks", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "compact_records_scanned", "Compact records scanned per interval", "compact_records_scanned", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "delta_records_scanned", "Delta records scanned per interval", "delta_records_scanned", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "answers_match_boost", "Answers match Boost oracle", "answers_match_boost", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "block_checks", "Block summary checks per interval", "block_checks", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "visited_blocks", "Visited blocks per interval", "visited_blocks", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "compact_records_scanned", "Compact records scanned per interval", "compact_records_scanned", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "delta_records_scanned", "Delta records scanned per interval", "delta_records_scanned", args.dpi, skip_zero_series=True))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "mbr_candidates", "MBR candidates per interval", "mbr_candidates", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "predicate_shortcuts", "Predicate shortcuts per interval", "predicate_shortcuts", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "predicate_shortcuts_enabled", "Predicate shortcuts enabled", "predicate_shortcuts_enabled", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "exact_calls", "GEOS exact calls per interval", "exact_calls", args.dpi))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "insert_tps", "Interval insert throughput (ops/s)", "insert_tps", args.dpi))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "delete_tps", "Interval delete throughput (ops/s)", "delete_tps", args.dpi))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "query_tps", "Interval query throughput (queries/s)", "query_tps", args.dpi))
@@ -240,15 +251,15 @@ def main():
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p99_insert_ms", "P99 insert latency in mixed workload (ms)", "p99_insert_ms", args.dpi))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p95_delete_ms", "P95 delete latency in mixed workload (ms)", "p95_delete_ms", args.dpi))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p99_delete_ms", "P99 delete latency in mixed workload (ms)", "p99_delete_ms", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "local_compaction_count_stage", "Local compactions per interval", "local_compaction_count_stage", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "local_compaction_ns_stage", "Local compaction time per interval (ns)", "local_compaction_ns_stage", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_local_delta_size", "Average local delta size", "avg_local_delta_size", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "max_local_delta_size", "Max local delta size", "max_local_delta_size", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "tombstone_ratio", "Tombstone ratio", "tombstone_ratio", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_beta", "Average beta (local delta ratio)", "avg_beta", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_tau", "Average tau (tombstone ratio)", "avg_tau", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_adaptive_delta_bound", "Average adaptive delta bound", "avg_adaptive_delta_bound", args.dpi))
-    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_adaptive_delete_bound", "Average adaptive delete bound", "avg_adaptive_delete_bound", args.dpi))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "local_compaction_count_stage", "Local compactions per interval", "local_compaction_count_stage", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "local_compaction_ns_stage", "Local compaction time per interval (ns)", "local_compaction_ns_stage", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_local_delta_size", "Average local delta size", "avg_local_delta_size", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "max_local_delta_size", "Max local delta size", "max_local_delta_size", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "tombstone_ratio", "Tombstone ratio", "tombstone_ratio", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_beta", "Average beta (local delta ratio)", "avg_beta", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_tau", "Average tau (tombstone ratio)", "avg_tau", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_adaptive_delta_bound", "Average adaptive delta bound", "avg_adaptive_delta_bound", args.dpi, skip_zero_series=True))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_adaptive_delete_bound", "Average adaptive delete bound", "avg_adaptive_delete_bound", args.dpi, skip_zero_series=True))
     paths.append(write_notes(rows, output_dir, args.figure_prefix))
     for path in paths:
         if path:
