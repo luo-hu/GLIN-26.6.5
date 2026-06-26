@@ -88,6 +88,10 @@ struct Options {
   double cost_tau_min = 0.25;
   double cost_tau_max = 0.50;
   double cost_scan_per_entry = 1.0;
+  double cost_mbr_per_candidate = 0.25;
+  double cost_predicate_shortcut = 0.05;
+  double cost_exact_per_call = 8.0;
+  double cost_dirty_query_penalty = 1.0;
   double cost_compact_per_entry = 5.0;
   double cost_compaction_horizon = 0.0;
   std::size_t cost_min_compact_interval = 64;
@@ -264,6 +268,10 @@ void print_usage(const char* program) {
       << "  --cost_tau_min F                 DELI-Cost minimum tombstone ratio tau (default: 0.25)\n"
       << "  --cost_tau_max F                 DELI-Cost maximum tombstone ratio tau (default: 0.50)\n"
       << "  --cost_scan_per_entry F          DELI-Cost relative scan cost (default: 1.0)\n"
+      << "  --cost_mbr_per_candidate F       DELI-Cost record MBR candidate cost in DP partitioning (default: 0.25)\n"
+      << "  --cost_predicate_shortcut F      DELI-Cost PRL shortcut cost in DP partitioning (default: 0.05)\n"
+      << "  --cost_exact_per_call F          DELI-Cost GEOS exact-call cost in DP partitioning (default: 8.0)\n"
+      << "  --cost_dirty_query_penalty F     DELI-Cost delta/tombstone query penalty weight (default: 1.0)\n"
       << "  --cost_compact_per_entry F       DELI-Cost relative compact cost (default: 5.0)\n"
       << "  --cost_compaction_horizon F      DELI-Cost benefit horizon in operations; 0 disables early compaction (default: 0)\n"
       << "  --cost_min_compact_interval N    DELI-Cost min ops between local compactions per block (default: 64)\n"
@@ -357,6 +365,14 @@ Options parse_args(int argc, char* argv[]) {
       options.cost_tau_max = std::stod(require_value(key));
     } else if (key == "--cost_scan_per_entry") {
       options.cost_scan_per_entry = std::stod(require_value(key));
+    } else if (key == "--cost_mbr_per_candidate") {
+      options.cost_mbr_per_candidate = std::stod(require_value(key));
+    } else if (key == "--cost_predicate_shortcut") {
+      options.cost_predicate_shortcut = std::stod(require_value(key));
+    } else if (key == "--cost_exact_per_call") {
+      options.cost_exact_per_call = std::stod(require_value(key));
+    } else if (key == "--cost_dirty_query_penalty") {
+      options.cost_dirty_query_penalty = std::stod(require_value(key));
     } else if (key == "--cost_compact_per_entry") {
       options.cost_compact_per_entry = std::stod(require_value(key));
     } else if (key == "--cost_compaction_horizon") {
@@ -448,6 +464,10 @@ Options parse_args(int argc, char* argv[]) {
     throw std::runtime_error("--cost_tau_min must be <= --cost_tau_max");
   }
   if (options.cost_scan_per_entry <= 0.0 ||
+      options.cost_mbr_per_candidate < 0.0 ||
+      options.cost_predicate_shortcut < 0.0 ||
+      options.cost_exact_per_call < 0.0 ||
+      options.cost_dirty_query_penalty < 0.0 ||
       options.cost_compact_per_entry <= 0.0 ||
       options.cost_compaction_horizon < 0.0) {
     throw std::runtime_error("DELI-Cost unit costs must be positive and horizon must be non-negative");
@@ -3519,6 +3539,9 @@ class LocalBoundedCompactQueryOverlay {
         summary_check_unit_cost;
     double hit_count = 0.0;
     double scanned_records = 0.0;
+    double mbr_candidates = 0.0;
+    double predicate_shortcuts = 0.0;
+    double exact_calls = 0.0;
     for (const PartitionQueryFeature& query : queries) {
       if (partition_segment_may_match(segment, query)) {
         hit_count += 1.0;
@@ -3530,14 +3553,64 @@ class LocalBoundedCompactQueryOverlay {
             });
         scanned_records += static_cast<double>(
             scan_end - (ids.begin() + static_cast<std::ptrdiff_t>(begin)));
+        const std::size_t prefix_count = static_cast<std::size_t>(
+            scan_end - (ids.begin() + static_cast<std::ptrdiff_t>(begin)));
+        if (prefix_count == 0) {
+          continue;
+        }
+        const std::size_t sample_limit = 64;
+        const std::size_t stride =
+            std::max<std::size_t>(1, (prefix_count + sample_limit - 1) /
+                                         sample_limit);
+        std::size_t sampled = 0;
+        std::size_t sampled_mbr = 0;
+        std::size_t sampled_shortcuts = 0;
+        std::size_t sampled_exact = 0;
+        for (std::size_t offset = 0; offset < prefix_count; offset += stride) {
+          const GeometryMeta& meta = metadata_[ids[begin + offset]];
+          ++sampled;
+          if (meta.zmax < query.zmin) {
+            continue;
+          }
+          if (!envelopes_intersect(meta.envelope, query.envelope)) {
+            continue;
+          }
+          ++sampled_mbr;
+          if (query_rectangle_contains_object_envelope(query.envelope,
+                                                       meta.envelope)) {
+            ++sampled_shortcuts;
+          } else {
+            ++sampled_exact;
+          }
+        }
+        if (sampled > 0) {
+          const double scale =
+              static_cast<double>(prefix_count) /
+              static_cast<double>(sampled);
+          mbr_candidates += static_cast<double>(sampled_mbr) * scale;
+          predicate_shortcuts +=
+              static_cast<double>(sampled_shortcuts) * scale;
+          exact_calls += static_cast<double>(sampled_exact) * scale;
+        }
       }
     }
     const double scan_cost =
         scanned_records * options_.cost_scan_per_entry;
+    const double predicate_cost =
+        mbr_candidates * options_.cost_mbr_per_candidate +
+        predicate_shortcuts * options_.cost_predicate_shortcut +
+        exact_calls * options_.cost_exact_per_call;
+    const double expected_dirty_entries =
+        (default_beta() + default_tau()) * static_cast<double>(count);
+    const double dirty_query_cost =
+        hit_count * expected_dirty_entries * options_.cost_scan_per_entry *
+        (options_.mixed_insert_ratio + options_.mixed_delete_ratio) *
+        options_.cost_dirty_query_penalty;
     const double maintenance_cost =
         (options_.mixed_insert_ratio + options_.mixed_delete_ratio) *
         options_.cost_compact_per_entry * std::sqrt(static_cast<double>(count));
-    return block_check_cost + scan_cost + maintenance_cost;
+    return block_check_cost + scan_cost + predicate_cost + dirty_query_cost +
+           maintenance_cost;
   }
 
   void bulk_load_adaptive_partition(const std::vector<ObjectId>& ids) {

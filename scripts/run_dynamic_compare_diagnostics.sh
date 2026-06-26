@@ -56,7 +56,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   SELECTIVITY_TAGS="0p001pct 0p01pct 0p1pct 1pct" \
     ./scripts/run_dynamic_compare_diagnostics.sh
 
-常用参数：
+常用参数说明：
   DATASETS
     默认 ZGAP_MIXED。可选：AW LW ROADS PARKS UNIF_S DIAG_S ZGAP_WIDE ZGAP_MIXED。
 
@@ -66,31 +66,94 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   SELECTIVITY_TAGS
     query 选择性。默认 1pct。
 
+核心 DELI 参数：
   BLOCK_SIZE
-    DELI block size。默认 512。
+    DELI block size，中文叫“块大小”。默认 512。
+    含义：主索引里一个 compact block 期望容纳多少条记录。
+    对 LocalBounded：通常就是固定块大小。
+    对 Cost/DP：不是最终固定答案，而是自适应划分的中心值；
+      如果没有显式设置 DP 的 min/max，脚本会用 BLOCK_SIZE/2 到 2*BLOCK_SIZE 作为搜索范围。
 
   STALE_THRESHOLD
-    DELI stale_threshold_fraction。默认 0.05。
+    DELI-Dynamic-Single 的 stale_threshold_fraction，中文叫“过期摘要重建比例”。默认 0.05。
+    含义：删除产生 tombstone 后，block summary 可能偏大但仍然安全；
+      tombstone 累积到这个比例后才局部重建摘要。
+    注意：这是早期 DELI-Dynamic-Single 原型参数，不是 DELI-ALEX-Hybrid-Cost 的主控制项。
 
   LOCAL_DELTA_BOUND
     DELI-ALEX-Hybrid-LocalBounded 的每个 block 局部 delta 上限。
-    默认 0，表示自动使用 max(64, BLOCK_SIZE/4)，把每个 block 的额外扫描量控制在约 25%。
+    delta buffer 中文叫“局部增量缓存”：新插入对象先放在 block 的小缓存里，
+      不立刻打乱 compact 主区。
+    默认 0，表示自动使用 max(64, BLOCK_SIZE/4)，大约把每个 block 的额外扫描量控制在 25%。
+    这是 LocalBounded 固定参数基线使用的硬上限；Cost 版主要使用 beta/tau 的自适应预算。
 
   DELETE_COMPACT_FRACTION
-    DELI-ALEX-Hybrid-LocalBounded 的删除物理压缩阈值。
-    默认 0.25，表示每个 block 最多容忍约 25% tombstone 后才做 physical compaction。
+    DELI-ALEX-Hybrid-LocalBounded 的删除物理压缩阈值。默认 0.25。
+    tombstone 中文叫“墓碑记录”：删除时先标记 dead，不立刻物理移除。
+    compaction 中文叫“压实/局部整理”：把 live compact records + live delta records 合并、
+      删除 tombstone、重新排序并重算 block summary。
+    默认 0.25 表示每个 block 最多容忍约 25% tombstone 后才做 physical compaction。
 
-  COST_EMA_ALPHA / COST_BETA_MIN / COST_BETA_MAX / COST_TAU_MIN / COST_TAU_MAX
-    DELI-ALEX-Hybrid-Cost 的自适应参数。
-    beta 是局部增量比例，tau 是墓碑比例。
-    默认 beta/tau 都限制在 0.25 到 0.50 之间，避免 Cost 版在当前数据上过度压实。
-    如果想测试激进读优化，可以显式设置 COST_BETA_MIN=0.05 COST_TAU_MIN=0.05。
+DELI-Cost 自适应维护参数：
+  COST_EMA_ALPHA
+    指数滑动平均系数，中文可以理解成“历史统计平滑系数”。默认 0.10。
+    值越大，Cost 对最近 workload 变化反应越快，但曲线也更容易抖动；
+    值越小，决策更平滑，但适应负载漂移更慢。
 
-  COST_SCAN_PER_ENTRY / COST_COMPACT_PER_ENTRY / COST_COMPACTION_HORIZON
-    DELI-ALEX-Hybrid-Cost 的代价模型相对权重。
-    scan_per_entry 表示扫描一条记录的成本，compact_per_entry 表示整理一条记录的成本。
-    compaction_horizon 表示估计未来收益时看的操作窗口。
-    默认 0，表示不做提前 compaction；Cost 版只根据负载比例放宽局部阈值。
+  COST_BETA_MIN / COST_BETA_MAX
+    beta 是局部增量比例，中文叫“局部增量预算比例”。
+    例如 beta=0.25 且 block 约 512 条，则该 block 大约允许 128 条 delta。
+    Cost 版会在 [COST_BETA_MIN, COST_BETA_MAX] 内自动选择 beta，
+      不是在全空间里无限制搜索。
+    默认 0.25 到 0.50，目的是避免 Cost 版在当前数据上过度压实。
+    如果想测试激进读优化，可以显式设置 COST_BETA_MIN=0.05。
+
+  COST_TAU_MIN / COST_TAU_MAX
+    tau 是墓碑比例，中文叫“延迟删除预算比例”。
+    例如 tau=0.25 表示 tombstone 约达到 block 主区 25% 后才考虑物理压实。
+    Cost 版会在 [COST_TAU_MIN, COST_TAU_MAX] 内自动选择 tau。
+    默认 0.25 到 0.50；如果想测试更积极的删除清理，可以显式设置 COST_TAU_MIN=0.05。
+
+  COST_SCAN_PER_ENTRY
+    扫描一条记录的相对成本。默认 1.0。
+    这是代价模型的单位成本，不是实际纳秒值；它用于比较不同划分方案的相对好坏。
+
+  COST_COMPACT_PER_ENTRY
+    压实/局部整理一条记录的相对成本。默认 5.0。
+    值越大，Cost 越不愿意频繁 compaction；值越小，Cost 越愿意用整理成本换查询干净度。
+
+  COST_COMPACTION_HORIZON
+    估计提前 compaction 收益时看的未来操作窗口。默认 0。
+    0 表示关闭 benefit-cost 提前压实：Cost 版只根据负载比例调节 beta/tau，
+      不主动预测“现在整理是否能在未来查询中赚回来”。
+    建议主实验保持 0，敏感性实验可测试 1000/2000/5000。
+    注意：这个参数只影响在线更新时是否提前做局部 compaction，
+      不影响 bulk-load 阶段的 DP 自适应 block 划分。
+
+  COST_MIN_COMPACT_INTERVAL
+    Cost 版同一个 block 两次提前 compaction 之间的最小操作间隔。默认 64。
+    作用是防止 benefit-cost 规则因为短期统计噪声反复整理同一个 block，
+      从而造成插入/删除吞吐量曲线抖动。
+
+DELI-Cost 的 PRL-aware DP 划分参数：
+  PRL 是 predicate-aware refinement layer，中文可叫“谓词感知过滤层”。
+  当前安全 shortcut 是：当 query 矩形 envelope 完全包含 object envelope 时，
+  该对象必然 intersects query，可以直接返回并跳过 GEOS。
+
+  COST_MBR_PER_CANDIDATE / COST_PREDICATE_SHORTCUT / COST_EXACT_PER_CALL
+    DELI-Cost 的 PRL-aware DP 划分权重。
+    COST_MBR_PER_CANDIDATE：处理一个 MBR candidate 的相对成本。默认 0.25。
+    COST_PREDICATE_SHORTCUT：执行一次安全 shortcut 判断/直接命中的相对成本。默认 0.05。
+    COST_EXACT_PER_CALL：剩余 GEOS exact intersects 调用的相对成本。默认 8.0。
+    这三个值让 DP 不只估计 scan cost，还估计：
+      MBR candidates、predicate shortcuts、remaining exact calls。
+    一般 exact call 应明显大于 scan/shortcut，因为 GEOS 精确谓词最贵。
+
+  COST_DIRTY_QUERY_PENALTY
+    DELI-Cost 对 local delta / tombstone 查询污染的惩罚权重。
+    dirty 中文指“还没整理干净的 delta/tombstone”。
+    值越大，DP 越倾向于避免过大的 block 和过多 dirty scan；
+    代价是可能增加 block 数量或维护成本。
 
   COST_ADAPTIVE_PARTITION
     是否为 DELI-ALEX-Hybrid-Cost 启用 DP 自适应 block 划分。默认 1。
@@ -99,6 +162,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   COST_PARTITION_MIN_BLOCK_SIZE / COST_PARTITION_MAX_BLOCK_SIZE
     DP 划分时每个 block 的最小/最大记录数。
     默认 0 表示自动使用 BLOCK_SIZE/2 和 2*BLOCK_SIZE。
+    这是 DP 的搜索边界：避免 block 被切得极小导致元数据爆炸，
+      也避免 block 过大导致剪枝变粗。
 
   COST_PARTITION_STEP
     DP 候选切分点步长。默认 0 表示自动使用 BLOCK_SIZE/8。
@@ -106,6 +171,27 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 
   COST_PARTITION_QUERY_SAMPLE
     用多少条 query 样本估计 block 的查询代价。默认 128。
+    样本越大，DP 对 query 分布的估计越稳定，但 bulk-load/build 时间越长。
+
+为什么有了动态规划和代价模型，还需要一些固定参数？
+  1. 代价模型是在“有边界的配置空间”里优化，不是在无限空间里随便选。
+     BLOCK_SIZE、min/max block size、beta/tau min/max 是搜索边界和系统预算。
+
+  2. 这些固定值不是按数据集手工调最优，而是论文默认约束。
+     它们保证所有数据集、所有 baseline 都在同一规则下比较，避免“每个数据集单独调参”的不公平。
+
+  3. 自适应模型也需要安全护栏。
+     如果不限制 beta/tau，模型可能因为短期统计噪声选择极小阈值，导致过度 compaction；
+     或选择极大阈值，导致 delta/tombstone 堆积，查询尾延迟变差。
+
+  4. DP 只能决定“如何划分 block”，不能替代系统设计约束。
+     例如最小/最大 block size 控制元数据开销、cache locality、summary 粗细和 build 时间。
+
+  5. COST_* 权重是代价单位/先验，不是每个数据集都要调的实验旋钮。
+     主实验应使用统一默认值；只有 sensitivity study 才系统改变这些值。
+
+  6. LocalBounded 需要固定参数作为 ablation baseline。
+     这样才能回答：Cost/DP 是否比固定经验规则更稳，而不是把两个方法都变成不可解释的调参结果。
 
   PREDICATE_SHORTCUTS
     是否启用 DELI predicate-aware shortcut。默认 1。
@@ -139,6 +225,50 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     例子：CORRECTNESS_EVERY_N=5 表示只检查第 5、10、15... 个 checkpoint。
     设为 0 等价于 CHECK_CORRECTNESS=0。
 
+  PLOT_MIXED_ROLLING_WINDOW                          滚动窗口平均／滑动窗口平均吞吐量
+    mixed workload 曲线的 trailing rolling average 窗口。                     默认 1，表示不平滑。
+
+    含义：对于第 i 个 checkpoint 的指标，不取它本身的原始值，而是取它和它前面连续 4 个 checkpoint（共 5 个点）的平均值，作为平滑后的值。
+    窗口大小 = 5 个 checkpoint，对应约 5 × 5000 = 25000 次操作的时间跨度；
+    窗口是向前滚动的，每个点都代表「最近一个窗口内的平均性能」。
+    作用：滤掉单个 checkpoint 的随机抖动（比如刚好某个 checkpoint 触发了一次 local compaction，瞬时吞吐掉坑、延迟冲顶，原始曲线会出现尖刺）；
+    敏感度：能反映性能的动态变化，窗口越小越灵敏、越抖；窗口越大越平滑、越滞后；适合让论文主图展示长期趋势。
+
+  PLOT_MIXED_CUMULATIVE_THROUGHPUT                    累计吞吐量
+    是否额外画 mixed workload 的累计吞吐图。默认 0。
+    设为 1 时，会画从 workload 开始到当前 checkpoint 的累计 query/insert/delete/overall throughput。
+
+    累计吞吐更平滑，适合主图；interval 吞吐保留局部 compaction 抖动，适合诊断图。
+    含义：从 mixed 负载开始的第 1 个操作，到当前 checkpoint 的最后一个操作，用「总操作数 ÷ 总耗时」计算从开始到现在的整体平均吞吐量。
+    越往后，历史数据占比越大，曲线越平缓；
+    它反映的是「截至目前的长期平均吞吐水平」。
+    
+    作用：展示整个实验周期内的整体吞吐能力，最稳定，最适合用来横向对比不同方法的总体吞吐水平；
+    敏感度：对短期抖动完全不敏感；如果后半段性能退化，累计曲线会被前面的历史数据 “稀释”，下降趋势会很平缓，不容易看出拐点。
+
+
+    注意：查询时间，插入，删除吞吐量可以做滚动窗口平均和累计吞吐，但是P95和P99延迟是不能做这个的
+    
+    论文配图的最佳实践
+    给你一个直接能用的组合方案，兼顾美观和严谨：
+    主结果图（正文放）
+    查询延迟：画 avg /p95 /p99 三条线，使用滚动窗口平滑（window=5），曲线干净，趋势清晰；
+    吞吐量：画累计整体吞吐曲线，或者滚动窗口的平均吞吐，二选一即可；
+    图注明确说明平滑方式。
+    机制分析图（附录或诊断小节放）
+    放原始 raw checkpoint 的吞吐和延迟曲线；
+    标注 compaction 发生的位置，解释尖峰产生的原因，对应你的局部维护机制设计。
+
+    性能对比表格
+    所有数值用全局统计结果：整个阶段的平均延迟、真实全局 p95/p99、总平均吞吐；
+    不使用平滑后的数值。
+
+    一句话总结
+    滚动窗口 = 局部平滑，看动态趋势，消抖动；
+    累计吞吐 = 全局平均，看整体水平，最稳定；
+    二者可以同时开，互补使用；
+    P95/P99 可以滚动画图，但正式结论必须用全局真实分位数。
+
   INITIAL_FRACTION / INSERT_FRACTION / DELETE_FRACTION
     默认 0.5 / 0.2 / 0.1。
 
@@ -156,7 +286,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     ...
     然后所有方法都按照这条完全相同的序列一个操作一个操作地执行，所以它不是：
     一个线程一直query
-    一个线程一直insrt
+    一个线程一直insert
     一个线程一直delete
     而是：
     同一个线程里query/insert/delete交错出现
@@ -271,7 +401,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     1pct
   分别表示希望query的答案规模大约对应数据集一定的比例。这样比随机生成随机框更稳定，因为不同数据集大小和空间分布不同。
 
-orrectness oracle 可以理解成“标准答案生成器”。
+Correctness oracle 可以理解成“标准答案生成器”。
   这里我们用 Boost R-tree + GEOS exact intersects 当 oracle。意思是：
   1. 用 Boost R-tree 找候选对象；
   2. 再用 GEOS 精确判断 intersects；
@@ -306,8 +436,9 @@ FIGURE_DIR="${FIGURE_DIR:-figures/dynamic_compare_${LIMIT}}"
 SELECTIVITY_TAGS="${SELECTIVITY_TAGS:-1pct}"
 BUILD_DIR="${BUILD_DIR:-build}"
 
-# 这里故意固定为论文默认参数，避免每个数据集单独调参。
-BLOCK_SIZE="${BLOCK_SIZE:-512}"   #只有DELI_ALEX_HYBRID_COST这个方法在bulk-load阶段用动态规划进行block分区,其它方法还是默认每个block的容量是512
+# 论文默认参数：这些值是模型搜索边界/系统预算，不是按数据集单独调出来的最优值。
+# LocalBounded 使用 BLOCK_SIZE 作为固定块大小；Cost/DP 使用它推导默认 min/max block size。
+BLOCK_SIZE="${BLOCK_SIZE:-512}"
 STALE_THRESHOLD="${STALE_THRESHOLD:-0.05}"
 LOCAL_DELTA_BOUND="${LOCAL_DELTA_BOUND:-0}"
 if [[ -z "${DELETE_COMPACT_FRACTION+x}" && -n "${DELETE_COMPAPACT_FRACTION:-}" ]]; then
@@ -321,9 +452,15 @@ COST_BETA_MAX="${COST_BETA_MAX:-0.50}"
 COST_TAU_MIN="${COST_TAU_MIN:-0.25}"
 COST_TAU_MAX="${COST_TAU_MAX:-0.50}"
 COST_SCAN_PER_ENTRY="${COST_SCAN_PER_ENTRY:-1.0}"
+COST_MBR_PER_CANDIDATE="${COST_MBR_PER_CANDIDATE:-0.25}"
+COST_PREDICATE_SHORTCUT="${COST_PREDICATE_SHORTCUT:-0.05}"
+COST_EXACT_PER_CALL="${COST_EXACT_PER_CALL:-8.0}"
+COST_DIRTY_QUERY_PENALTY="${COST_DIRTY_QUERY_PENALTY:-1.0}"
 COST_COMPACT_PER_ENTRY="${COST_COMPACT_PER_ENTRY:-5.0}"
+# 0 表示关闭 benefit-cost 提前压实，只使用 beta/tau 预算；敏感性实验可测试 1000/2000/5000。
 COST_COMPACTION_HORIZON="${COST_COMPACTION_HORIZON:-0}"
 COST_MIN_COMPACT_INTERVAL="${COST_MIN_COMPACT_INTERVAL:-64}"
+# 只影响 DELI_ALEX_HYBRID_COST：1 启用 DP 自适应块划分，0 退化为固定块划分。
 COST_ADAPTIVE_PARTITION="${COST_ADAPTIVE_PARTITION:-1}"
 COST_PARTITION_MIN_BLOCK_SIZE="${COST_PARTITION_MIN_BLOCK_SIZE:-0}"
 COST_PARTITION_MAX_BLOCK_SIZE="${COST_PARTITION_MAX_BLOCK_SIZE:-0}"
@@ -352,13 +489,77 @@ RUN_BENCHMARKS="${RUN_BENCHMARKS:-1}"
 RESET_RESULTS="${RESET_RESULTS:-1}"
 OVERWRITE="${OVERWRITE:-0}"
 PLOT_RESULTS="${PLOT_RESULTS:-1}"
+PLOT_MIXED_ROLLING_WINDOW="${PLOT_MIXED_ROLLING_WINDOW:-1}"
+PLOT_MIXED_CUMULATIVE_THROUGHPUT="${PLOT_MIXED_CUMULATIVE_THROUGHPUT:-0}"
 EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-}"
 AUTO_GENERATE_QUERIES="${AUTO_GENERATE_QUERIES:-0}"
 REGENERATE_QUERIES="${REGENERATE_QUERIES:-0}"
+SHOW_CONFIG="${SHOW_CONFIG:-1}"
 
 if [[ "$RUN_BENCHMARKS" == "0" && "$RESET_RESULTS" == "1" ]]; then
   echo "Error: RUN_BENCHMARKS=0 时不能使用 RESET_RESULTS=1，否则会删掉已有结果。" >&2
   exit 1
+fi
+
+if [[ "$SHOW_CONFIG" == "1" ]]; then
+  cat <<CONFIG
+动态对比 runner 参数总览：
+  数据与查询：
+    DATASETS=$DATASETS
+    LIMIT=$LIMIT, QUERY_LIMIT=$QUERY_LIMIT, QUERY_COUNT=$QUERY_COUNT
+    QUERY_ROOT=$QUERY_ROOT
+    RESULT_DIR=$RESULT_DIR
+    FIGURE_DIR=$FIGURE_DIR
+    SELECTIVITY_TAGS=$SELECTIVITY_TAGS
+
+  workload：
+    WORKLOAD_MODE=$WORKLOAD_MODE
+    MIXED_PROFILES=$MIXED_PROFILES
+    MIXED_OPERATIONS=$MIXED_OPERATIONS
+    MIXED_CHECKPOINT_INTERVAL=$MIXED_CHECKPOINT_INTERVAL
+    PLOT_MIXED_ROLLING_WINDOW=$PLOT_MIXED_ROLLING_WINDOW
+      1 表示原始 interval 曲线；大于 1 表示画最近 N 个 checkpoint 的滚动平均。
+    PLOT_MIXED_CUMULATIVE_THROUGHPUT=$PLOT_MIXED_CUMULATIVE_THROUGHPUT
+      1 表示额外画累计吞吐曲线，适合作为论文主趋势图。
+
+  索引与正确性：
+    INDEXES=$INDEXES
+    CHECK_CORRECTNESS=$CHECK_CORRECTNESS
+    CORRECTNESS_EVERY_N=$CORRECTNESS_EVERY_N
+    PREDICATE_SHORTCUTS=$PREDICATE_SHORTCUTS
+
+  DELI / LocalBounded：
+    BLOCK_SIZE=$BLOCK_SIZE
+    STALE_THRESHOLD=$STALE_THRESHOLD
+    LOCAL_DELTA_BOUND=$LOCAL_DELTA_BOUND
+      0 表示自动使用 max(64, BLOCK_SIZE/4)。
+    DELETE_COMPACT_FRACTION=$DELETE_COMPACT_FRACTION
+
+  DELI-Cost：
+    COST_EMA_ALPHA=$COST_EMA_ALPHA
+    COST_BETA_MIN=$COST_BETA_MIN, COST_BETA_MAX=$COST_BETA_MAX
+    COST_TAU_MIN=$COST_TAU_MIN, COST_TAU_MAX=$COST_TAU_MAX
+    COST_SCAN_PER_ENTRY=$COST_SCAN_PER_ENTRY
+    COST_MBR_PER_CANDIDATE=$COST_MBR_PER_CANDIDATE
+    COST_PREDICATE_SHORTCUT=$COST_PREDICATE_SHORTCUT
+    COST_EXACT_PER_CALL=$COST_EXACT_PER_CALL
+    COST_DIRTY_QUERY_PENALTY=$COST_DIRTY_QUERY_PENALTY
+    COST_COMPACT_PER_ENTRY=$COST_COMPACT_PER_ENTRY
+    COST_COMPACTION_HORIZON=$COST_COMPACTION_HORIZON
+      0 表示关闭提前 compaction；大于 0 会尝试用未来收益换当前整理成本。
+    COST_MIN_COMPACT_INTERVAL=$COST_MIN_COMPACT_INTERVAL
+    COST_ADAPTIVE_PARTITION=$COST_ADAPTIVE_PARTITION
+    COST_PARTITION_MIN_BLOCK_SIZE=$COST_PARTITION_MIN_BLOCK_SIZE
+    COST_PARTITION_MAX_BLOCK_SIZE=$COST_PARTITION_MAX_BLOCK_SIZE
+    COST_PARTITION_STEP=$COST_PARTITION_STEP
+    COST_PARTITION_QUERY_SAMPLE=$COST_PARTITION_QUERY_SAMPLE
+
+  说明：
+    固定参数是模型的搜索边界和系统预算，不是逐数据集调参结果。
+    Cost/DP 在这些边界内自适应选择 block 划分和维护预算；
+    LocalBounded 保留固定参数，是为了作为经验规则 baseline。
+
+CONFIG
 fi
 
 mkdir -p "$RESULT_DIR"
@@ -588,6 +789,10 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --cost_tau_min "$COST_TAU_MIN" \
           --cost_tau_max "$COST_TAU_MAX" \
           --cost_scan_per_entry "$COST_SCAN_PER_ENTRY" \
+          --cost_mbr_per_candidate "$COST_MBR_PER_CANDIDATE" \
+          --cost_predicate_shortcut "$COST_PREDICATE_SHORTCUT" \
+          --cost_exact_per_call "$COST_EXACT_PER_CALL" \
+          --cost_dirty_query_penalty "$COST_DIRTY_QUERY_PENALTY" \
           --cost_compact_per_entry "$COST_COMPACT_PER_ENTRY" \
           --cost_compaction_horizon "$COST_COMPACTION_HORIZON" \
           --cost_min_compact_interval "$COST_MIN_COMPACT_INTERVAL" \
@@ -622,7 +827,9 @@ if [[ "$PLOT_RESULTS" == "1" ]]; then
     --input "$RESULT_DIR/dynamic_compare_summary.csv" \
     --output_dir "$FIGURE_DIR" \
     --figure_prefix dynamic_compare \
-    --exclude_datasets "$EXCLUDE_DATASETS"
+    --exclude_datasets "$EXCLUDE_DATASETS" \
+    --mixed_rolling_window "$PLOT_MIXED_ROLLING_WINDOW" \
+    --plot_mixed_cumulative_throughput "$PLOT_MIXED_CUMULATIVE_THROUGHPUT"
 fi
 
 echo "Result dir: $RESULT_DIR"
