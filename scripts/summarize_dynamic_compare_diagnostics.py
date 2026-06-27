@@ -39,6 +39,11 @@ def selectivity_tag_from_name(path):
     return match.group(1) if match else ""
 
 
+def predicate_mode_from_name(path):
+    match = re.search(r"_prl([01])_", path.name)
+    return match.group(1) if match else ""
+
+
 def as_float(row, field):
     try:
         return float(row.get(field) or 0)
@@ -49,6 +54,7 @@ def as_float(row, field):
 def enrich(row, path):
     out = dict(row)
     out["source_file"] = path.name
+    out["predicate_shortcuts_mode"] = predicate_mode_from_name(path)
     out["selectivity"] = selectivity_from_name(path)
     out["selectivity_tag"] = selectivity_tag_from_name(path)
     out["avg_query_ms"] = as_float(out, "avg_query_ns") / 1e6
@@ -63,6 +69,19 @@ def enrich(row, path):
     out["delete_ms"] = as_float(out, "delete_ns") / 1e6
     out["index_mb_estimate"] = as_float(out, "index_bytes_estimate") / (1024 * 1024)
     return out
+
+
+def disambiguate_predicate_modes(rows):
+    modes = {row.get("predicate_shortcuts_mode", "") for row in rows}
+    modes.discard("")
+    if len(modes) <= 1:
+        return
+    for row in rows:
+        mode = row.get("predicate_shortcuts_mode", "")
+        if mode == "0":
+            row["index"] = f"{row.get('index', '')}_NOPRL"
+        elif mode == "1":
+            row["index"] = f"{row.get('index', '')}_PRL"
 
 
 def field_order(rows):
@@ -156,6 +175,7 @@ def main():
                 if row.get("dataset", "") in excluded:
                     continue
                 rows.append(enrich(row, path))
+    disambiguate_predicate_modes(rows)
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     fields = field_order(rows) if rows else ["dataset", "index", "checkpoint"]

@@ -637,6 +637,13 @@ bool envelope_contains(const geos::geom::Envelope& outer,
          outer.getMaxY() >= inner.getMaxY();
 }
 
+bool rectangle_query_contains_candidate_envelope(
+    const Options& options, const geos::geom::Envelope& query_envelope,
+    const geos::geom::Envelope& candidate_envelope) {
+  return options.predicate_shortcuts &&
+         envelope_contains(query_envelope, candidate_envelope);
+}
+
 BoostBox boost_box_from_envelope(const geos::geom::Envelope& envelope) {
   return BoostBox(BoostPoint(envelope.getMinX(), envelope.getMinY()),
                   BoostPoint(envelope.getMaxX(), envelope.getMaxY()));
@@ -3017,6 +3024,20 @@ struct LocalBoundedOverlayBlock {
   std::uint64_t last_compact_op = 0;
 };
 
+enum class ConservativePredicateKind {
+  QueryRectangleContainsObjectEnvelope,
+};
+
+struct ConservativePredicatePlanItem {
+  ConservativePredicateKind kind;
+  double cost = 1.0;
+  double decision_probability = 0.0;
+
+  double score() const {
+    return decision_probability / std::max(cost, 1e-12);
+  }
+};
+
 class LocalBoundedCompactQueryOverlay {
  public:
   LocalBoundedCompactQueryOverlay(const Options& options,
@@ -3036,6 +3057,7 @@ class LocalBoundedCompactQueryOverlay {
     local_delta_bound_ = options_.local_delta_bound == 0
                              ? std::max<std::size_t>(64, options_.block_size / 4)
                              : options_.local_delta_bound;
+    refresh_conservative_predicate_plan(std::vector<ObjectId>());
   }
 
   void bulk_load(const std::vector<ObjectId>& object_ids) {
@@ -3049,6 +3071,7 @@ class LocalBoundedCompactQueryOverlay {
       live_[oid] = 1;
     }
     std::sort(ids.begin(), ids.end(), ObjectIdLess(metadata_));
+    refresh_conservative_predicate_plan(ids);
 
     if (should_use_adaptive_partition(ids)) {
       bulk_load_adaptive_partition(ids);
@@ -3514,8 +3537,89 @@ class LocalBoundedCompactQueryOverlay {
   bool query_rectangle_contains_object_envelope(
       const geos::geom::Envelope& query_envelope,
       const geos::geom::Envelope& object_envelope) const {
-    return options_.predicate_shortcuts &&
-           envelope_contains(query_envelope, object_envelope);
+    return rectangle_query_contains_candidate_envelope(
+        options_, query_envelope, object_envelope);
+  }
+
+  double estimate_query_rectangle_contains_probability(
+      const std::vector<ObjectId>& ids) const {
+    if (!options_.predicate_shortcuts || calibration_queries_ == nullptr ||
+        calibration_queries_->empty() || ids.empty()) {
+      return 1.0;
+    }
+
+    const std::size_t query_sample =
+        std::min<std::size_t>(calibration_queries_->size(), 64);
+    const std::size_t object_sample = std::min<std::size_t>(ids.size(), 4096);
+    const std::size_t object_stride =
+        std::max<std::size_t>(1, ids.size() / object_sample);
+    std::size_t mbr_candidates = 0;
+    std::size_t shortcut_decisions = 0;
+    for (std::size_t qi = 0; qi < query_sample; ++qi) {
+      const geos::geom::Envelope& query_envelope =
+          *(*calibration_queries_)[qi].geometry->getEnvelopeInternal();
+      std::size_t sampled = 0;
+      for (std::size_t pos = 0; pos < ids.size() && sampled < object_sample;
+           pos += object_stride, ++sampled) {
+        const GeometryMeta& meta = metadata_[ids[pos]];
+        if (!envelopes_intersect(meta.envelope, query_envelope)) {
+          continue;
+        }
+        ++mbr_candidates;
+        if (envelope_contains(query_envelope, meta.envelope)) {
+          ++shortcut_decisions;
+        }
+      }
+    }
+    if (mbr_candidates == 0) {
+      return 0.0;
+    }
+    return static_cast<double>(shortcut_decisions) /
+           static_cast<double>(mbr_candidates);
+  }
+
+  void refresh_conservative_predicate_plan(
+      const std::vector<ObjectId>& ids) {
+    conservative_predicate_plan_.clear();
+    if (options_.predicate_shortcuts) {
+      conservative_predicate_plan_.push_back(ConservativePredicatePlanItem{
+          ConservativePredicateKind::QueryRectangleContainsObjectEnvelope,
+          options_.cost_predicate_shortcut,
+          estimate_query_rectangle_contains_probability(ids)});
+    }
+    std::sort(conservative_predicate_plan_.begin(),
+              conservative_predicate_plan_.end(),
+              [](const ConservativePredicatePlanItem& lhs,
+                 const ConservativePredicatePlanItem& rhs) {
+                if (lhs.score() != rhs.score()) {
+                  return lhs.score() > rhs.score();
+                }
+                return lhs.cost < rhs.cost;
+              });
+  }
+
+  void apply_conservative_predicate_layer(
+      const QueryCase& query_case,
+      const geos::geom::Envelope& query_envelope, const GeometryMeta& meta,
+      ObjectId oid, SimpleQueryResult& result) const {
+    for (const ConservativePredicatePlanItem& item :
+         conservative_predicate_plan_) {
+      switch (item.kind) {
+        case ConservativePredicateKind::QueryRectangleContainsObjectEnvelope:
+          if (query_rectangle_contains_object_envelope(query_envelope,
+                                                       meta.envelope)) {
+            ++result.predicate_shortcuts;
+            result.answers.insert(oid);
+            return;
+          }
+          break;
+      }
+    }
+
+    ++result.exact_calls;
+    if (query_case.geometry->intersects(geometries_[oid].get())) {
+      result.answers.insert(oid);
+    }
   }
 
   double adaptive_partition_segment_cost(
@@ -4160,16 +4264,8 @@ class LocalBoundedCompactQueryOverlay {
       }
       ++result.mbr_candidates;
       ++result.candidates;
-      if (query_rectangle_contains_object_envelope(query_envelope,
-                                                   meta.envelope)) {
-        ++result.predicate_shortcuts;
-        result.answers.insert(oid);
-        continue;
-      }
-      ++result.exact_calls;
-      if (query_case.geometry->intersects(geometries_[oid].get())) {
-        result.answers.insert(oid);
-      }
+      apply_conservative_predicate_layer(query_case, query_envelope, meta, oid,
+                                         result);
     }
   }
 
@@ -4192,16 +4288,8 @@ class LocalBoundedCompactQueryOverlay {
       }
       ++result.mbr_candidates;
       ++result.candidates;
-      if (query_rectangle_contains_object_envelope(query_envelope,
-                                                   meta.envelope)) {
-        ++result.predicate_shortcuts;
-        result.answers.insert(oid);
-        continue;
-      }
-      ++result.exact_calls;
-      if (query_case.geometry->intersects(geometries_[oid].get())) {
-        result.answers.insert(oid);
-      }
+      apply_conservative_predicate_layer(query_case, query_envelope, meta, oid,
+                                         result);
     }
   }
 
@@ -4213,6 +4301,7 @@ class LocalBoundedCompactQueryOverlay {
   std::vector<char> live_;
   std::vector<char> in_delta_;
   std::vector<LocalBoundedOverlayBlock*> object_to_block_;
+  std::vector<ConservativePredicatePlanItem> conservative_predicate_plan_;
   std::vector<std::unique_ptr<LocalBoundedOverlayBlock>> owned_blocks_;
   std::vector<LocalBoundedOverlayBlock*> directory_;
   std::uint64_t next_block_id_ = 0;
@@ -4398,6 +4487,8 @@ RTree build_rtree_for_ids(const std::vector<GeometryPtr>& geometries,
 SimpleQueryResult query_boost_index(const RTree& rtree,
                                     const std::vector<GeometryPtr>& geometries,
                                     const std::vector<char>& live,
+                                    const Options& options,
+                                    bool enable_predicate_shortcuts,
                                     const QueryCase& query_case) {
   auto start = std::chrono::high_resolution_clock::now();
   SimpleQueryResult result;
@@ -4413,6 +4504,13 @@ SimpleQueryResult query_boost_index(const RTree& rtree,
       continue;
     }
     ++result.mbr_candidates;
+    if (enable_predicate_shortcuts &&
+        rectangle_query_contains_candidate_envelope(
+            options, query_envelope, *geometries[oid]->getEnvelopeInternal())) {
+      ++result.predicate_shortcuts;
+      result.answers.insert(oid);
+      continue;
+    }
     ++result.exact_calls;
     if (query_case.geometry->intersects(geometries[oid].get())) {
       result.answers.insert(oid);
@@ -4428,6 +4526,8 @@ SimpleQueryResult query_quadtree_index(
     const std::unordered_map<Geometry*, ObjectId>& geometry_to_oid,
     const std::vector<GeometryPtr>& geometries,
     const std::vector<char>& live,
+    const Options& options,
+    bool enable_predicate_shortcuts,
     const QueryCase& query_case) {
   auto start = std::chrono::high_resolution_clock::now();
   SimpleQueryResult result;
@@ -4447,6 +4547,13 @@ SimpleQueryResult query_quadtree_index(
       continue;
     }
     ++result.mbr_candidates;
+    if (enable_predicate_shortcuts &&
+        rectangle_query_contains_candidate_envelope(
+            options, query_envelope, *geometries[oid]->getEnvelopeInternal())) {
+      ++result.predicate_shortcuts;
+      result.answers.insert(oid);
+      continue;
+    }
     ++result.exact_calls;
     if (query_case.geometry->intersects(geometries[oid].get())) {
       result.answers.insert(oid);
@@ -4468,12 +4575,19 @@ SimpleQueryResult query_glin_piece_index(
   SimpleQueryResult result;
   std::vector<Geometry*> found_geometries;
   int count_filter = 0;
+  int predicate_shortcut_count = 0;
   index.glin_find(query_case.geometry, "z", options.cell_xmin,
                   options.cell_ymin, options.cell_size, options.cell_size,
-                  pieces, found_geometries, count_filter);
+                  pieces, found_geometries, count_filter,
+                  options.predicate_shortcuts, &predicate_shortcut_count);
   result.candidates = static_cast<std::size_t>(std::max(0, count_filter));
-  result.exact_calls = result.candidates;
   result.mbr_candidates = result.candidates;
+  result.predicate_shortcuts =
+      static_cast<std::size_t>(std::max(0, predicate_shortcut_count));
+  result.exact_calls =
+      result.candidates >= result.predicate_shortcuts
+          ? result.candidates - result.predicate_shortcuts
+          : 0;
   for (Geometry* geometry : found_geometries) {
     auto found = geometry_to_oid.find(geometry);
     if (found == geometry_to_oid.end()) {
@@ -4588,7 +4702,8 @@ std::vector<std::unordered_set<ObjectId>> compute_oracle_answers(
   long long total_query_ns = 0;
   for (const QueryCase& query_case : queries) {
     SimpleQueryResult result =
-        query_boost_index(oracle, geometries, live, query_case);
+        query_boost_index(oracle, geometries, live, Options(), false,
+                          query_case);
     total_query_ns += result.query_ns;
     answers.push_back(std::move(result.answers));
   }
@@ -5872,7 +5987,7 @@ int main(int argc, char* argv[]) {
             operations, mixed_build_ns,
             [&](const QueryCase& query_case, const std::vector<char>& live) {
               return query_boost_index(mixed_index, geometries, live,
-                                       query_case);
+                                       options, true, query_case);
             },
             [&](ObjectId oid) {
               mixed_index.insert(std::make_pair(
@@ -5908,7 +6023,8 @@ int main(int argc, char* argv[]) {
             operations, mixed_build_ns,
             [&](const QueryCase& query_case, const std::vector<char>& live) {
               return query_quadtree_index(mixed_index, geometry_to_oid,
-                                          geometries, live, query_case);
+                                          geometries, live, options, true,
+                                          query_case);
             },
             [&](ObjectId oid) {
               Geometry* geometry = geometries[oid].get();
@@ -6879,7 +6995,7 @@ int main(int argc, char* argv[]) {
         boost_build_ns, 0, 0,
         [&](const QueryCase& query_case) {
           return query_boost_index(boost_index, geometries, live_bulkload,
-                                   query_case);
+                                   options, true, query_case);
         }));
     rows.back().index_bytes_estimate =
         estimate_boost_bytes(live_after_bulkload.size());
@@ -6900,7 +7016,7 @@ int main(int argc, char* argv[]) {
         boost_build_ns, boost_insert_ns, 0,
         [&](const QueryCase& query_case) {
           return query_boost_index(boost_index, geometries, live_insert,
-                                   query_case);
+                                   options, true, query_case);
         }));
     rows.back().index_bytes_estimate =
         estimate_boost_bytes(live_after_insert.size());
@@ -6928,7 +7044,7 @@ int main(int argc, char* argv[]) {
         delete_count, boost_build_ns, boost_insert_ns, boost_delete_ns,
         [&](const QueryCase& query_case) {
           return query_boost_index(boost_index, geometries, live_delete,
-                                   query_case);
+                                   options, true, query_case);
         }));
     rows.back().success_count = boost_delete_success;
     rows.back().failed_count = boost_delete_failed;
@@ -6954,7 +7070,8 @@ int main(int argc, char* argv[]) {
         quad_build_ns, 0, 0,
         [&](const QueryCase& query_case) {
           return query_quadtree_index(quadtree, geometry_to_oid, geometries,
-                                      live_bulkload, query_case);
+                                      live_bulkload, options, true,
+                                      query_case);
         }));
     rows.back().tree_size = quadtree.size();
     rows.back().tree_depth = static_cast<std::size_t>(quadtree.depth());
@@ -6976,7 +7093,7 @@ int main(int argc, char* argv[]) {
         quad_build_ns, quad_insert_ns, 0,
         [&](const QueryCase& query_case) {
           return query_quadtree_index(quadtree, geometry_to_oid, geometries,
-                                      live_insert, query_case);
+                                      live_insert, options, true, query_case);
         }));
     rows.back().tree_size = quadtree.size();
     rows.back().tree_depth = static_cast<std::size_t>(quadtree.depth());
@@ -7004,7 +7121,7 @@ int main(int argc, char* argv[]) {
         delete_count, quad_build_ns, quad_insert_ns, quad_delete_ns,
         [&](const QueryCase& query_case) {
           return query_quadtree_index(quadtree, geometry_to_oid, geometries,
-                                      live_delete, query_case);
+                                      live_delete, options, true, query_case);
         }));
     rows.back().success_count = quad_delete_success;
     rows.back().failed_count = quad_delete_failed;

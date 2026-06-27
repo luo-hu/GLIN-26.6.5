@@ -200,6 +200,12 @@ DELI-Cost 的 PRL-aware DP 划分参数：
     可以直接返回答案并跳过 GEOS exact intersects。
     设为 0 可以复现实验中的 DELI v1，不使用该 predicate-aware 层。
 
+  PREDICATE_SHORTCUTS_LIST
+    一次运行多个 PRL 配置。默认等于 PREDICATE_SHORTCUTS。
+    例子：PREDICATE_SHORTCUTS_LIST="0 1"
+    runner 会生成 *_prl0_dynamic_compare.csv 和 *_prl1_dynamic_compare.csv，
+    summary/plot 会把 index 标成 noPRL / +PRL，方便做 PRL on/off 消融。
+
   INDEXES
     只跑指定索引，避免每次都把所有方法重建一遍。默认 all。
     例子：
@@ -467,6 +473,7 @@ COST_PARTITION_MAX_BLOCK_SIZE="${COST_PARTITION_MAX_BLOCK_SIZE:-0}"
 COST_PARTITION_STEP="${COST_PARTITION_STEP:-0}"
 COST_PARTITION_QUERY_SAMPLE="${COST_PARTITION_QUERY_SAMPLE:-128}"
 PREDICATE_SHORTCUTS="${PREDICATE_SHORTCUTS:-1}"
+PREDICATE_SHORTCUTS_LIST="${PREDICATE_SHORTCUTS_LIST:-$PREDICATE_SHORTCUTS}"
 PIECE_LIMIT="${PIECE_LIMIT:-10000}"
 
 INITIAL_FRACTION="${INITIAL_FRACTION:-0.5}"
@@ -490,7 +497,7 @@ RESET_RESULTS="${RESET_RESULTS:-1}"
 OVERWRITE="${OVERWRITE:-0}"
 PLOT_RESULTS="${PLOT_RESULTS:-1}"
 PLOT_MIXED_ROLLING_WINDOW="${PLOT_MIXED_ROLLING_WINDOW:-1}"
-PLOT_MIXED_CUMULATIVE_THROUGHPUT="${PLOT_MIXED_CUMULATIVE_THROUGHPUT:-0}"
+PLOT_MIXED_CUMULATIVE_THROUGHPUT="${PLOT_MIXED_CUMULATIVE_THROUGHPUT:-1}"
 EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-}"
 AUTO_GENERATE_QUERIES="${AUTO_GENERATE_QUERIES:-0}"
 REGENERATE_QUERIES="${REGENERATE_QUERIES:-0}"
@@ -527,6 +534,7 @@ if [[ "$SHOW_CONFIG" == "1" ]]; then
     CHECK_CORRECTNESS=$CHECK_CORRECTNESS
     CORRECTNESS_EVERY_N=$CORRECTNESS_EVERY_N
     PREDICATE_SHORTCUTS=$PREDICATE_SHORTCUTS
+    PREDICATE_SHORTCUTS_LIST=$PREDICATE_SHORTCUTS_LIST
 
   DELI / LocalBounded：
     BLOCK_SIZE=$BLOCK_SIZE
@@ -711,6 +719,7 @@ generate_queries_if_needed() {
 }
 
 if [[ "$RUN_BENCHMARKS" == "1" ]]; then
+  prl_mode_count="$(wc -w <<<"$PREDICATE_SHORTCUTS_LIST")"
   for dataset in $DATASETS; do
     data_file="$(data_file_for_dataset "$dataset")"
     if [[ ! -e "$data_file" ]]; then
@@ -756,9 +765,14 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           fi
         fi
 
-        raw_csv="$RESULT_DIR/${dataset}_${tag}_${raw_suffix}.csv"
+        for predicate_shortcuts_value in $PREDICATE_SHORTCUTS_LIST; do
+        raw_suffix_for_prl="$raw_suffix"
+        if [[ "$prl_mode_count" -gt 1 ]]; then
+          raw_suffix_for_prl="${raw_suffix%dynamic_compare}prl${predicate_shortcuts_value}_dynamic_compare"
+        fi
+        raw_csv="$RESULT_DIR/${dataset}_${tag}_${raw_suffix_for_prl}.csv"
         if should_run_file "$raw_csv"; then
-          echo "Running dynamic compare dataset=$dataset selectivity=$tag workload=$WORKLOAD_MODE profile=$profile"
+          echo "Running dynamic compare dataset=$dataset selectivity=$tag workload=$WORKLOAD_MODE profile=$profile predicate_shortcuts=$predicate_shortcuts_value"
           "$BUILD_DIR/bench_dynamic_compare_wkt" \
           --data_file "$data_file" \
           --query_file "$query_file" \
@@ -801,7 +815,7 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --cost_partition_max_block_size "$COST_PARTITION_MAX_BLOCK_SIZE" \
           --cost_partition_step "$COST_PARTITION_STEP" \
           --cost_partition_query_sample "$COST_PARTITION_QUERY_SAMPLE" \
-          --predicate_shortcuts "$PREDICATE_SHORTCUTS" \
+          --predicate_shortcuts "$predicate_shortcuts_value" \
           --piece_limit "$PIECE_LIMIT" \
           --cell_size "$CELL_SIZE" \
           --seed "$SEED" \
@@ -810,6 +824,7 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
         else
           echo "Skip existing raw CSV: $raw_csv"
         fi
+        done
       done
     done
   done

@@ -1667,6 +1667,32 @@ p_i 极高：实验中 predicate_shortcuts / mbr_candidates 可达到 98% 以上
 
 因此它应该排在 GEOS exact intersects 之前。
 
+当前代码实现状态：
+
+```text
+src/benchmark/bench_dynamic_compare_wkt.cpp
+  ConservativePredicatePlanItem:
+    记录 conservative predicate 的 cost、decision_probability 和 score=p_i/c_i。
+
+  refresh_conservative_predicate_plan:
+    根据校准 query 和对象样本估计当前 predicate 的 p_i，
+    并按 p_i/c_i 从高到低排序。
+
+  apply_conservative_predicate_layer:
+    在 record MBR candidate 之后、GEOS exact intersects 之前执行排序后的保守谓词层级。
+```
+
+当前只有一个安全谓词：
+
+```text
+query rectangle envelope contains object envelope
+```
+
+所以排序本身不会改变当前实验结果；它的意义是把原来的硬编码 shortcut
+改成可扩展的 PRL predicate ordering 框架。后续新增 envelope covers、
+prepared geometry covers、或其它严格保守谓词时，不能直接凭经验决定顺序，
+而应继续使用 p_i/c_i 排序。
+
 ### 7.5.5 PRL 与 DELI-Cost 的关系
 
 DELI-Cost 和 DELI-PRL 优化的是不同层。

@@ -34,7 +34,7 @@ COLORS = {
     "DELI_ALEX_HYBRID_LOCAL_BOUNDED": "#E76F51",
     "DELI_ALEX_HYBRID_COST": "#C43C7A",
     "GLIN_PIECEWISE": "#6D8F3F",
-    "Boost_Rtree": "#B86442",
+    "Boost_Rtree": "#0066FF",
     "GEOS_Quadtree": "#7C5FB3",
 }
 LABELS = {
@@ -49,6 +49,82 @@ LABELS = {
     "Boost_Rtree": "Boost R-tree",
     "GEOS_Quadtree": "GEOS Quadtree",
 }
+
+
+def canonical_index(index):
+    if index.endswith("_NOPRL"):
+        return index[:-6]
+    if index.endswith("_PRL"):
+        return index[:-4]
+    return index
+
+
+def index_order_value(index):
+    base = canonical_index(index)
+    base_order = INDEX_ORDER.index(base) if base in INDEX_ORDER else len(INDEX_ORDER)
+    if index.endswith("_NOPRL"):
+        return base_order * 3
+    if index.endswith("_PRL"):
+        return base_order * 3 + 1
+    return base_order * 3 + 2
+
+
+def label_for_index(index):
+    base = canonical_index(index)
+    label = LABELS.get(base, base)
+    if index.endswith("_NOPRL"):
+        return f"{label} noPRL"
+    if index.endswith("_PRL"):
+        return f"{label} +PRL"
+    return label
+
+
+def hex_to_rgb(color):
+    if not color or not color.startswith("#") or len(color) != 7:
+        return (0.35, 0.35, 0.35)
+    return tuple(int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+
+
+def blend_rgb(rgb, target, amount):
+    return tuple((1.0 - amount) * value + amount * target[i]
+                 for i, value in enumerate(rgb))
+
+
+def color_for_index(index):
+    base = hex_to_rgb(COLORS.get(canonical_index(index)))
+    if index.endswith("_NOPRL"):
+        return blend_rgb(base, (1.0, 1.0, 1.0), 0.48)
+    if index.endswith("_PRL"):
+        return blend_rgb(base, (0.0, 0.0, 0.0), 0.18)
+    return base
+
+
+def linestyle_for_index(index):
+    if index.endswith("_NOPRL"):
+        return (0, (4, 2))
+    return "-"
+
+
+def marker_for_index(index):
+    if index.endswith("_NOPRL"):
+        return "^"
+    if index.endswith("_PRL"):
+        return "o"
+    return "s"
+
+
+def hatch_for_index(index):
+    if index.endswith("_NOPRL"):
+        return "///"
+    if index.endswith("_PRL"):
+        return ""
+    return ""
+
+
+def marker_face_for_index(index):
+    if index.endswith("_NOPRL"):
+        return "white"
+    return color_for_index(index)
 
 
 def parse_args():
@@ -99,7 +175,7 @@ def load_rows(path):
 
 def order_key(row):
     index = row["index"]
-    return INDEX_ORDER.index(index) if index in INDEX_ORDER else len(INDEX_ORDER)
+    return index_order_value(index)
 
 
 def plot_metric(rows, output_dir, prefix, checkpoint, metric, ylabel, filename, dpi, log_y=False):
@@ -109,7 +185,7 @@ def plot_metric(rows, output_dir, prefix, checkpoint, metric, ylabel, filename, 
     if not subset:
         return None
     groups = sorted({(row["dataset"], row.get("selectivity", "")) for row in subset})
-    indexes = sorted({row["index"] for row in subset}, key=lambda x: INDEX_ORDER.index(x) if x in INDEX_ORDER else 99)
+    indexes = sorted({row["index"] for row in subset}, key=index_order_value)
     fig, ax = plt.subplots(figsize=(max(8, len(groups) * 1.8), 4.6))
     group_width = 0.78
     bar_width = group_width / max(1, len(indexes))
@@ -120,7 +196,9 @@ def plot_metric(rows, output_dir, prefix, checkpoint, metric, ylabel, filename, 
         for dataset, selectivity in groups:
             row = next((r for r in subset if r["dataset"] == dataset and r.get("selectivity", "") == selectivity and r["index"] == index), None)
             ys.append(as_float(row, metric) if row else math.nan)
-        ax.bar(xs, ys, width=bar_width * 0.92, color=COLORS.get(index), edgecolor="black", linewidth=0.45, label=LABELS.get(index, index))
+        ax.bar(xs, ys, width=bar_width * 0.92, color=color_for_index(index),
+               edgecolor="black", linewidth=0.45, hatch=hatch_for_index(index),
+               label=label_for_index(index))
     ax.set_xticks(list(centers))
     ax.set_xticklabels([f"{d}\n{s}" for d, s in groups])
     ax.set_ylabel(ylabel)
@@ -180,7 +258,7 @@ def plot_mixed_metric(rows, output_dir, prefix, metric, ylabel, filename, dpi,
             and row["dataset"] == dataset
             and row.get("selectivity", "") == selectivity
         ]
-        indexes = sorted({row["index"] for row in group_rows}, key=lambda x: INDEX_ORDER.index(x) if x in INDEX_ORDER else 99)
+        indexes = sorted({row["index"] for row in group_rows}, key=index_order_value)
         fig, ax = plt.subplots(figsize=(7.6, 4.6))
         for index in indexes:
             series = [row for row in group_rows if row["index"] == index]
@@ -192,8 +270,11 @@ def plot_mixed_metric(rows, output_dir, prefix, metric, ylabel, filename, dpi,
             if skip_zero_series and all((math.isnan(y) or abs(y) < 1e-12) for y in ys):
                 continue
             ys = rolling_average(ys, rolling_window)
-            ax.plot(xs, ys, marker="o", linewidth=1.5, markersize=3.5,
-                    color=COLORS.get(index), label=LABELS.get(index, index))
+            ax.plot(xs, ys, marker=marker_for_index(index), linewidth=1.7,
+                    markersize=4.2, markerfacecolor=marker_face_for_index(index),
+                    markeredgecolor=color_for_index(index), markeredgewidth=1.0,
+                    linestyle=linestyle_for_index(index),
+                    color=color_for_index(index), label=label_for_index(index))
         ax.set_xlabel("Operations")
         ax.set_ylabel(ylabel)
         rolling_suffix = (
@@ -265,7 +346,7 @@ def plot_mixed_cumulative_throughput(rows, output_dir, prefix, metric, ylabel,
             and row.get("selectivity", "") == selectivity
         ]
         indexes = sorted({row["index"] for row in group_rows},
-                         key=lambda x: INDEX_ORDER.index(x) if x in INDEX_ORDER else 99)
+                         key=index_order_value)
         fig, ax = plt.subplots(figsize=(7.6, 4.6))
         for index in indexes:
             series = [row for row in group_rows if row["index"] == index]
@@ -273,8 +354,11 @@ def plot_mixed_cumulative_throughput(rows, output_dir, prefix, metric, ylabel,
             if not series:
                 continue
             xs, ys = cumulative_throughput_points(series, metric)
-            ax.plot(xs, ys, marker="o", linewidth=1.5, markersize=3.5,
-                    color=COLORS.get(index), label=LABELS.get(index, index))
+            ax.plot(xs, ys, marker=marker_for_index(index), linewidth=1.7,
+                    markersize=4.2, markerfacecolor=marker_face_for_index(index),
+                    markeredgecolor=color_for_index(index), markeredgewidth=1.0,
+                    linestyle=linestyle_for_index(index),
+                    color=color_for_index(index), label=label_for_index(index))
         ax.set_xlabel("Operations")
         ax.set_ylabel(ylabel)
         ax.set_title(f"{profile} {dataset} {selectivity}: cumulative {ylabel}")
