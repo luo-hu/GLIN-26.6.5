@@ -94,6 +94,20 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
       删除 tombstone、重新排序并重算 block summary。
     默认 0.25 表示每个 block 最多容忍约 25% tombstone 后才做 physical compaction。
 
+  LAZY_ALEX_DELETE
+    DELI-ALEX-Hybrid-LocalBounded / Cost 的“懒 ALEX 删除”开关。默认 1。
+    含义：删除时只在 compact query overlay 里打 tombstone，不再同步从 ALEX 写入层物理删除。
+    为什么安全：当前 DELI-LB/Cost 的查询答案来自 overlay，不来自 ALEX leaf；
+      stale-large summary 和 tombstone 只会多扫候选，不会漏答案。
+    作用：减少双结构维护开销，主要改善 delete throughput 和 p95/p99 delete latency。
+    若要做严格消融或回退到旧实现，可设置 LAZY_ALEX_DELETE=0。
+
+  DEFER_DELETE_SUMMARY_REFRESH
+    DELI-LB/Cost 的“延迟删除摘要刷新”开关。默认 1。
+    含义：删除时只打 tombstone，不因为删到了 min_zmin/max_zmax/MBR 边界对象就立刻重算 block summary。
+    为什么安全：旧 summary 是 stale-large 保守摘要，只会让查询多扫一些候选，不会漏掉真实答案。
+    作用：进一步缩短 delete 前台路径；如果某个数据集查询被 stale summary 拖慢，可设为 0 做消融。
+
 DELI-Cost 自适应维护参数：
   COST_EMA_ALPHA
     指数滑动平均系数，中文可以理解成“历史统计平滑系数”。默认 0.10。
@@ -474,6 +488,8 @@ COST_PARTITION_STEP="${COST_PARTITION_STEP:-0}"
 COST_PARTITION_QUERY_SAMPLE="${COST_PARTITION_QUERY_SAMPLE:-128}"
 PREDICATE_SHORTCUTS="${PREDICATE_SHORTCUTS:-1}"
 PREDICATE_SHORTCUTS_LIST="${PREDICATE_SHORTCUTS_LIST:-$PREDICATE_SHORTCUTS}"
+LAZY_ALEX_DELETE="${LAZY_ALEX_DELETE:-1}"
+DEFER_DELETE_SUMMARY_REFRESH="${DEFER_DELETE_SUMMARY_REFRESH:-1}"
 PIECE_LIMIT="${PIECE_LIMIT:-10000}"
 
 INITIAL_FRACTION="${INITIAL_FRACTION:-0.5}"
@@ -535,6 +551,10 @@ if [[ "$SHOW_CONFIG" == "1" ]]; then
     CORRECTNESS_EVERY_N=$CORRECTNESS_EVERY_N
     PREDICATE_SHORTCUTS=$PREDICATE_SHORTCUTS
     PREDICATE_SHORTCUTS_LIST=$PREDICATE_SHORTCUTS_LIST
+    LAZY_ALEX_DELETE=$LAZY_ALEX_DELETE
+      1 表示 DELI-LB/Cost 删除只更新 overlay tombstone，跳过冗余 ALEX erase。
+    DEFER_DELETE_SUMMARY_REFRESH=$DEFER_DELETE_SUMMARY_REFRESH
+      1 表示删除后保留 stale-large block summary，等 local compaction 再精确重算。
 
   DELI / LocalBounded：
     BLOCK_SIZE=$BLOCK_SIZE
@@ -816,6 +836,8 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --cost_partition_step "$COST_PARTITION_STEP" \
           --cost_partition_query_sample "$COST_PARTITION_QUERY_SAMPLE" \
           --predicate_shortcuts "$predicate_shortcuts_value" \
+          --lazy_alex_delete "$LAZY_ALEX_DELETE" \
+          --defer_delete_summary_refresh "$DEFER_DELETE_SUMMARY_REFRESH" \
           --piece_limit "$PIECE_LIMIT" \
           --cell_size "$CELL_SIZE" \
           --seed "$SEED" \

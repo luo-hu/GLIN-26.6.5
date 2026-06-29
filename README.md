@@ -1,94 +1,557 @@
-# GLIN
+# GLIN / DELI Dynamic Spatial Index Benchmarks
 
-Check out our preprint: [GLIN: A Lightweight Learned Indexing Mechanism for Complex Geometries](https://arxiv.org/abs/2207.07745)
+This repository started from **GLIN: A Lightweight Learned Indexing Mechanism for Complex Geometries** and now also contains a DELI-style dynamic benchmark suite for complex-geometry exact spatial relationship queries.
 
-## Introduction
-This paper introduces GLIN, a generic learned index for spatial range queries on complex geometries. To achieve that, GLIN transforms geometries to Z-address intervals, and builds a hierarchical model to learn the cumulative distribution function between these intervals and the record positions. The lightweight hierarchical model greatly shortens the index probing time. Furthermore, GLIN augments spatial range query using an add-on piecewise function to guarantee the query accuracy for both 𝐶𝑜𝑛𝑡𝑎𝑖𝑛𝑠 and 𝐼𝑛𝑡𝑒𝑟𝑠𝑒𝑐𝑡𝑠 spatial relationships.
+The current experimental focus is:
 
-## Highlights
-- GLIN transforms geometries to 1-dimensional sortable values,namely Z-address intervals, using Z-order curve.
-- GLIN is the first learned index that handles non-point geospatial values.
-- GLIN updates its index structure efficiently with query accuracy guaranteed.
+- complex geometry range/intersection queries over WKT datasets;
+- exact refinement with GEOS predicates;
+- dynamic insert/delete maintenance;
+- unified comparisons among DELI variants, GLIN-piece, Boost R-tree, and GEOS Quadtree;
+- staged and single-thread interleaved mixed workloads.
 
-## Code Structure
-- GLIN: contains core glin fucntion other than Recursive model index(RMI) as following
-  - Z-Address Interval transformation function
-  - Index search function and update function (insertion and deletion)
-  - Piecewise function initialization, query window augmentation, piecewise function updates
-- src: GLIN-customized ALEX recursive model, including nodes, node updates function, and model training.
-- test: tests related to GLIN-customized ALEX recursive model and GLIN's function
+Original GLIN preprint: [GLIN: A Lightweight Learned Indexing Mechanism for Complex Geometries](https://arxiv.org/abs/2207.07745)
 
-## Dependencies 
-- GEOS: brew install geos
-- BOOST C++ library : brew install boost
+## Repository Layout
 
-## Build and Run test
-- Compile the project using CMake. It will build a new direcotory named as ``` build```
-  ```./build.sh ```
-- Run unit tests without query augmentation, for Contains relationship only
- ``` ./build/test_glin ```
-  - run unit tests with query augmentation. It supports both Contains and Intersects relationship
-  
-  ``` ./build/test_glin_piece```
-- GitHub Action automatically tests every commit using all unit tests.
+```text
+glin/                         Core GLIN code and Z/Hilbert helpers
+src/core/                     Customized ALEX/learned-index code
+src/benchmark/                C++ benchmark entry points
+scripts/                      Experiment runners, query generation wrappers, plotting scripts
+java/jts-query-generator/     Java/JTS STRtree KNN query generator
+cmake/                        CMake helper modules, including FindGEOS.cmake
+results/                      Generated CSV outputs, not required as input
+figures/                      Generated figures, not required as input
+manuscript/                   Paper draft and LaTeX files
+```
 
-## API Doc
-- To construct a index for geometry colomn 
+Important C++ targets:
 
- ```alex::Glin<double, geos::geom::Geometry *> index```
- - Bulkload to Index
+```text
+test_glin
+test_glin_piece
+bench_glin_wkt
+bench_glin_wkt_piece
+bench_boost_rtree_wkt
+bench_geos_quadtree_wkt
+bench_interval_overlap_wkt
+bench_dynamic_extent_wkt
+bench_dynamic_compare_wkt
+bench_index_size_wkt
+bench_update_wkt
+```
 
-```index.glin_bulk_load(poly_vec, piecelimitation, "z", cell_xmin,cell_ymin, cell_x_intvl, cell_y_intvl, pieces)```
+For most dynamic experiments, use:
 
-- Parameters:
-  - poly_vec : a vector of Geometries in std::vector<geos::geom::Geometry *>
-  - piecelimitation: a double, limits how many records is summarized in a single piece
-  - space-filling-curve : z-order-filling-curve
-  - cell_xmin: the minimal value of x in a geometry, for real-world data, set cell_xmin = -180
-  - cell_ymin: the minimal value of y in a geometry, for real-world data, set cell_ymin = -180
-  - cell_x_intvl, cell_y_intvl:: a small enough value is valid for all data, by default we set to 0.0000005, but it is tunable parameter
-  - pieces: vector of piecewise function. If the user does not choose PIECEWISE setting, this value is empty.
+```text
+scripts/run_dynamic_compare_diagnostics.sh
+```
 
-* Search in index
+It builds/runs `bench_dynamic_compare_wkt`, summarizes CSVs, and generates figures.
 
-`   index.glin_find(query, "z",  cell_xmin,cell_ymin, cell_x_intvl, cell_y_intvl, pieces, find_result, count_filter)`
-* Parameters:
-    * querywindow: the query window to perform search with
-    * space-filling-curve :  z-order-filling-curve
-    * cell_xmin:  the minimal value of x in a geometry, for real-world data, set cell_xmin = -180
-    * cell_ymin:  the minimal value of y in a geometry, for real-world data, set cell_ymin = -180
-    * cell_x_intvl, cell_y_intvl:: a small enough value is valid for all data, by default we set to 0.0000005, but it is tunable parameter
-    * pieces: vector of piecewise function. If the user does not choose PIECEWISE setting, this value is empty.
-    * find result:  The result after refine
-    * count_filter :  the number of result before refine
+## Environment
 
+The code is tested on Linux with GCC/Clang, CMake, Boost, GEOS, Python, Java, and Maven.
 
-- Insert geometry into index
+Recommended Ubuntu setup:
 
-```index.glin_insert(insert_tuple, "z", cell_xmin,cell_ymin, cell_x_intvl, cell_y_intvl, piece_limit, pieces);```
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential cmake git pkg-config \
+  libboost-all-dev libgeos-dev \
+  python3 python3-pip \
+  openjdk-17-jdk maven
+python3 -m pip install --user matplotlib pandas
+```
 
- - Parameters
-   - insert_tuple:  A tuple of to-be-inserted-Geometry and its MBR  std::tuple<geos::geom::Geometry*, geos::geom::Envelope*>
-   - space-filling-curve :  z-order-filling-curve
-   - cell_xmin:  the minimal value of x in a geometry, for real-world data, set cell_xmin = -180
-   - cell_ymin:  the minimal value of y in a geometry, for real-world data, set cell_ymin = -180
-   - cell_x_intvl, cell_y_intvl:: a small enough value is valid for all data, by default we set to 0.0000005, but it is tunable parameter
-   - piece_limit: piece_limitation
-   - pieces: vector of piecewise function. If the user does not choose PIECEWISE setting, this value is empty.
+If you use Conda:
 
+```bash
+conda install -c conda-forge cmake boost-cpp geos matplotlib pandas openjdk maven
+```
 
-- Delete geometry from index
+The provided `build.sh` automatically passes `CMAKE_PREFIX_PATH=$CONDA_PREFIX` when a Conda environment is active. If CMake cannot find GEOS or Boost, configure manually:
 
-  ` int num_erase = index.erase(poly, "z", cell_xmin,cell_ymin, cell_x_intvl, cell_y_intvl, piecelimitation, pieces);`
-    
-* Parameters:
-  * poly:  A to-be-remove geometry
-  * space-filling-curve :  z-order-filling-curve
-  * cell_xmin:  the minimal value of x in a geometry, for real-world data, set cell_xmin = -180
-  * cell_ymin:  the minimal value of y in a geometry, for real-world data, set cell_ymin = -180
-  * cell_x_intvl, cell_y_intvl:: a small enough value is valid for all data, by default we set to 0.0000005, but it is tunable parameter
-  * piece_limit: piece_limitation
-  * pieces: vector of piecewise function. If the user does not choose PIECEWISE setting, this value is empty.
-  * This function return a number of record are erased
+```bash
+cmake -S . -B build_current -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$CONDA_PREFIX"
+```
 
-Example can be found at unittest_glin.h and unittest_glin_maintenance.h
+Check tools:
+
+```bash
+cmake --version
+g++ --version
+python3 --version
+java -version
+mvn -version
+```
+
+## Build
+
+Full default build:
+
+```bash
+./build.sh
+```
+
+Recommended benchmark build directory:
+
+```bash
+cmake -S . -B build_current -DCMAKE_BUILD_TYPE=Release
+cmake --build build_current --target bench_dynamic_compare_wkt -j2
+```
+
+Run unit tests:
+
+```bash
+cmake --build build_current --target test_glin test_glin_piece -j2
+ctest --test-dir build_current --output-on-failure
+```
+
+The compiler may print GEOS C++ API warnings. They are expected for this codebase.
+
+## Data
+
+Large real datasets are not included in the repository. The dynamic runner uses these dataset labels:
+
+```text
+AW       -> $DATA_ROOT/AREAWATER.csv
+LW       -> $DATA_ROOT/LINEARWATER.csv
+ROADS    -> $DATA_ROOT/roads
+PARKS    -> $DATA_ROOT/parks
+UNIF_S   -> data/synthetic/rectangles/UNIF_S.wkt
+DIAG_S   -> data/synthetic/rectangles/DIAG_S.wkt
+ZGAP_WIDE  -> $ZGAP_WORK_DIR/ZGAP_WIDE.wkt
+ZGAP_MIXED -> $ZGAP_MIXED_WORK_DIR/ZGAP_MIXED.wkt
+```
+
+Default:
+
+```bash
+DATA_ROOT=/mnt/hgfs
+```
+
+If your files are elsewhere:
+
+```bash
+DATA_ROOT=/path/to/wkt/data \
+DATASETS="AW PARKS" \
+./scripts/run_dynamic_compare_diagnostics.sh
+```
+
+You can also override a single dataset path:
+
+```bash
+DATA_FILE_AW=/path/to/AREAWATER.csv \
+DATASETS="AW" \
+./scripts/run_dynamic_compare_diagnostics.sh
+```
+
+The WKT loader expects text files containing valid WKT geometries. Some datasets may include an id or CSV columns; the benchmark loader is written for the existing project datasets.
+
+## Query Workloads
+
+Query CSVs are generated by `java/jts-query-generator`, using JTS STRtree nearest-neighbor windows. The CSV format begins with:
+
+```text
+query_id,xmin,ymin,xmax,ymax,source_geometry_id,selectivity,k,mode
+```
+
+Build/generate manually:
+
+```bash
+scripts/generate_jts_strtree_knn_queries.sh \
+  /path/to/AREAWATER.csv \
+  queries/interval_overlap_full_500000/AW_jts_strtree_knn \
+  500000 \
+  500 \
+  42
+```
+
+This writes:
+
+```text
+queries/interval_overlap_full_500000/AW_jts_strtree_knn_1pct.csv
+queries/interval_overlap_full_500000/AW_jts_strtree_knn_0p1pct.csv
+queries/interval_overlap_full_500000/AW_jts_strtree_knn_0p01pct.csv
+queries/interval_overlap_full_500000/AW_jts_strtree_knn_0p001pct.csv
+```
+
+The dynamic runner can auto-generate missing query files:
+
+```bash
+AUTO_GENERATE_QUERIES=1 \
+QUERY_ROOT=queries/interval_overlap_full_500000 \
+QUERY_LIMIT=500000 \
+QUERY_COUNT=500 \
+DATASETS="AW" \
+./scripts/run_dynamic_compare_diagnostics.sh
+```
+
+Useful query settings:
+
+```text
+QUERY_ROOT       Directory containing query CSVs
+QUERY_LIMIT      Number of geometries used when generating query windows
+QUERY_COUNT      Number of query windows loaded into the query pool
+SELECTIVITY_TAGS Examples: "0p01pct 0p1pct 1pct"
+```
+
+`QUERY_COUNT` is the query pool size. In mixed workloads, query operations cycle through this fixed pool so all indexes see the same query sequence.
+
+## Quick Reproduction: Smoke Test
+
+This is the fastest end-to-end test. It builds the benchmark, auto-generates missing queries, runs a small staged workload, checks correctness against Boost R-tree + GEOS exact predicates, summarizes results, and plots figures.
+
+```bash
+RESET_RESULTS=1 OVERWRITE=1 AUTO_BUILD=1 \
+DATASETS="AW" \
+LIMIT=10000 QUERY_LIMIT=10000 \
+QUERY_ROOT=queries/smoke_10000 \
+RESULT_DIR=results/smoke_dynamic_compare \
+FIGURE_DIR=figures/smoke_dynamic_compare \
+SELECTIVITY_TAGS="1pct" QUERY_COUNT=20 \
+AUTO_GENERATE_QUERIES=1 CHECK_CORRECTNESS=1 \
+INDEXES="DELI_ALEX_HYBRID_LOCAL_BOUNDED DELI_ALEX_HYBRID_COST Boost_Rtree" \
+BUILD_DIR=build_current \
+./scripts/run_dynamic_compare_diagnostics.sh
+```
+
+Expected outputs:
+
+```text
+results/smoke_dynamic_compare/*.csv
+results/smoke_dynamic_compare/dynamic_compare_summary.csv
+figures/smoke_dynamic_compare/*.png
+```
+
+If correctness is checked, rows should report:
+
+```text
+answers_match_boost=1
+missing_count=0
+extra_count=0
+```
+
+## Main Dynamic Comparison
+
+The main runner supports two workload modes.
+
+### Staged Workload
+
+Staged workload isolates update phases:
+
+```text
+bulk-load 50%
+query checkpoint
+insert 20%
+query checkpoint
+delete 10%
+query checkpoint
+```
+
+Example:
+
+```bash
+RESET_RESULTS=1 OVERWRITE=1 AUTO_BUILD=1 \
+WORKLOAD_MODE=staged \
+DATASETS="AW PARKS" \
+LIMIT=500000 QUERY_LIMIT=500000 \
+QUERY_ROOT=queries/interval_overlap_full_500000 \
+RESULT_DIR=results/dynamic_compare_staged_0.5m \
+FIGURE_DIR=figures/dynamic_compare_staged_0.5m \
+SELECTIVITY_TAGS="0p1pct 1pct" QUERY_COUNT=200 \
+AUTO_GENERATE_QUERIES=1 CHECK_CORRECTNESS=1 \
+INDEXES="DELI_ALEX_HYBRID_LOCAL_BOUNDED DELI_ALEX_HYBRID_COST Boost_Rtree GEOS_Quadtree GLIN_PIECEWISE" \
+BUILD_DIR=build_current \
+./scripts/run_dynamic_compare_diagnostics.sh
+```
+
+### Mixed Workload
+
+Mixed workload is single-threaded and interleaves operations according to one fixed operation sequence shared by all indexes.
+
+Profiles:
+
+```text
+read_heavy   90% query, 5% insert, 5% delete
+balanced     70% query, 15% insert, 15% delete
+write_heavy  50% query, 25% insert, 25% delete
+```
+
+Example:
+
+```bash
+RESET_RESULTS=1 OVERWRITE=1 AUTO_BUILD=1 \
+WORKLOAD_MODE=mixed \
+MIXED_PROFILES="read_heavy balanced write_heavy" \
+MIXED_OPERATIONS=50000 \
+MIXED_CHECKPOINT_INTERVAL=1000 \
+DATASETS="AW PARKS" \
+LIMIT=500000 QUERY_LIMIT=500000 \
+QUERY_ROOT=queries/interval_overlap_full_500000 \
+RESULT_DIR=results/dynamic_compare_mixed_0.5m \
+FIGURE_DIR=figures/dynamic_compare_mixed_0.5m \
+SELECTIVITY_TAGS="0p1pct" QUERY_COUNT=200 \
+AUTO_GENERATE_QUERIES=1 CHECK_CORRECTNESS=0 \
+INDEXES="DELI_ALEX_HYBRID_LOCAL_BOUNDED DELI_ALEX_HYBRID_COST Boost_Rtree GEOS_Quadtree GLIN_PIECEWISE" \
+LOCAL_DELTA_BOUND=128 DELETE_COMPACT_FRACTION=0.25 \
+PLOT_MIXED_ROLLING_WINDOW=5 PLOT_MIXED_CUMULATIVE_THROUGHPUT=1 \
+BUILD_DIR=build_current \
+./scripts/run_dynamic_compare_diagnostics.sh
+```
+
+For final correctness runs, set:
+
+```bash
+CHECK_CORRECTNESS=1
+```
+
+Correctness checking rebuilds a Boost R-tree oracle at checkpoints and can be expensive. For long exploratory runs, use:
+
+```bash
+CHECK_CORRECTNESS=0
+```
+
+or:
+
+```bash
+CHECK_CORRECTNESS=1 CORRECTNESS_EVERY_N=5
+```
+
+When correctness is disabled, `answers_match_boost=-1` means “not checked”, not “wrong”.
+
+## Predicate Shortcut Ablation
+
+`PREDICATE_SHORTCUTS` enables a safe predicate-aware refinement shortcut:
+
+```text
+if query rectangle envelope contains object envelope:
+    object must intersect query rectangle
+    return it without GEOS exact intersects
+```
+
+The runner can test both modes in one experiment:
+
+```bash
+PREDICATE_SHORTCUTS_LIST="0 1" \
+INDEXES="DELI_ALEX_HYBRID_LOCAL_BOUNDED DELI_ALEX_HYBRID_COST Boost_Rtree GEOS_Quadtree GLIN_PIECEWISE" \
+... \
+./scripts/run_dynamic_compare_diagnostics.sh
+```
+
+The summary/plot scripts label results as `noPRL` and `+PRL`.
+
+## DELI Parameters
+
+Common parameters:
+
+```text
+BLOCK_SIZE
+  Target compact block size. Default 512.
+
+LOCAL_DELTA_BOUND
+  Per-block local delta limit for DELI-ALEX-Hybrid-LocalBounded.
+  0 means max(64, BLOCK_SIZE/4). Example: 128.
+
+DELETE_COMPACT_FRACTION
+  Tombstone fraction before local physical compaction. Default 0.25.
+
+LAZY_ALEX_DELETE
+  Default 1. Delete only tombstones the compact overlay and skips redundant ALEX erase.
+
+DEFER_DELETE_SUMMARY_REFRESH
+  Default 1. Keeps stale-large block summaries after delete until local compaction.
+
+COST_ADAPTIVE_PARTITION
+  Default 1. Enables DP adaptive block partitioning for DELI-ALEX-Hybrid-Cost.
+
+COST_BETA_MIN / COST_BETA_MAX
+  Bounds for adaptive local delta ratio beta. Default 0.25 / 0.50.
+
+COST_TAU_MIN / COST_TAU_MAX
+  Bounds for adaptive tombstone ratio tau. Default 0.25 / 0.50.
+
+COST_COMPACTION_HORIZON
+  Future-operation horizon for benefit-cost early compaction.
+  Default 0 disables early compaction.
+```
+
+These values are system budgets and search bounds, not per-dataset hand-tuned optima. Use the same defaults across datasets for fair comparisons, and vary them only in sensitivity studies.
+
+## Output Files
+
+Raw benchmark CSVs:
+
+```text
+RESULT_DIR/*_dynamic_compare.csv
+```
+
+Aggregated summary:
+
+```text
+RESULT_DIR/dynamic_compare_summary.csv
+```
+
+Figures:
+
+```text
+FIGURE_DIR/dynamic_compare_*.png
+```
+
+Important CSV fields:
+
+```text
+dataset,index,checkpoint,workload_mode,mixed_profile
+live_count,total_records,block_count,index_mb_estimate
+avg_query_ns,p50_query_ns,p95_query_ns,p99_query_ns
+query_tps,insert_tps,delete_tps,overall_ops_tps
+p95_insert_ms,p99_insert_ms,p95_delete_ms,p99_delete_ms
+block_checks,visited_blocks,compact_records_scanned,delta_records_scanned
+mbr_candidates,predicate_shortcuts,exact_calls,answers
+answers_match_boost,missing_count,extra_count
+local_compaction_count,local_compaction_ns
+avg_local_delta_size,max_local_delta_size,tombstone_ratio
+avg_beta,avg_tau,avg_adaptive_delta_bound,avg_adaptive_delete_bound
+```
+
+For mixed workload plots:
+
+```text
+PLOT_MIXED_ROLLING_WINDOW=N
+  Plots a trailing rolling average over N checkpoints.
+
+PLOT_MIXED_CUMULATIVE_THROUGHPUT=1
+  Also plots cumulative throughput from the beginning of the mixed workload.
+```
+
+Rolling curves are useful for trends; use raw/global CSV statistics for final numerical claims.
+
+## Re-plot Existing Results
+
+If benchmark CSVs already exist and you only want to regenerate summary/figures:
+
+```bash
+RUN_BENCHMARKS=0 RESET_RESULTS=0 \
+RESULT_DIR=results/dynamic_compare_mixed_0.5m \
+FIGURE_DIR=figures/dynamic_compare_mixed_0.5m_smoothed \
+PLOT_MIXED_ROLLING_WINDOW=5 \
+PLOT_MIXED_CUMULATIVE_THROUGHPUT=1 \
+./scripts/run_dynamic_compare_diagnostics.sh
+```
+
+Do not use `RESET_RESULTS=1` with `RUN_BENCHMARKS=0`, because it would delete the CSVs you want to plot.
+
+## Troubleshooting
+
+### Query file not found
+
+Error:
+
+```text
+Error: query file for AW under ... needs generation.
+```
+
+Fix:
+
+```bash
+AUTO_GENERATE_QUERIES=1
+```
+
+or manually run:
+
+```bash
+scripts/generate_jts_strtree_knn_queries.sh DATA_FILE OUTPUT_PREFIX LIMIT QUERY_COUNT SEED
+```
+
+### Dataset file not found
+
+Set `DATA_ROOT` or a dataset-specific override:
+
+```bash
+DATA_ROOT=/path/to/data DATASETS="AW PARKS" ...
+```
+
+or:
+
+```bash
+DATA_FILE_AW=/path/to/AREAWATER.csv DATASETS="AW" ...
+```
+
+### Maven or Java not found
+
+Install:
+
+```bash
+sudo apt install -y openjdk-17-jdk maven
+```
+
+### Matplotlib cache warning
+
+The plotting scripts set `MPLCONFIGDIR` under `figures/.matplotlib_cache` by default. If needed:
+
+```bash
+export MPLCONFIGDIR=/tmp/matplotlib
+```
+
+### Experiments are slow
+
+Use these controls for exploratory runs:
+
+```bash
+INDEXES="DELI_ALEX_HYBRID_LOCAL_BOUNDED Boost_Rtree"
+CHECK_CORRECTNESS=0
+LIMIT=50000
+QUERY_COUNT=100
+MIXED_OPERATIONS=20000
+```
+
+For final runs, increase `LIMIT`, `QUERY_COUNT`, and enable correctness checks.
+
+## Original GLIN API Sketch
+
+Construct an index:
+
+```cpp
+alex::Glin<double, geos::geom::Geometry*> index;
+```
+
+Bulk load:
+
+```cpp
+index.glin_bulk_load(poly_vec, piece_limitation, "z",
+                     cell_xmin, cell_ymin,
+                     cell_x_intvl, cell_y_intvl,
+                     pieces);
+```
+
+Search:
+
+```cpp
+index.glin_find(query, "z",
+                cell_xmin, cell_ymin,
+                cell_x_intvl, cell_y_intvl,
+                pieces, find_result, count_filter);
+```
+
+Insert:
+
+```cpp
+index.glin_insert(insert_tuple, "z",
+                  cell_xmin, cell_ymin,
+                  cell_x_intvl, cell_y_intvl,
+                  piece_limit, pieces);
+```
+
+Delete:
+
+```cpp
+int erased = index.erase(poly, "z",
+                         cell_xmin, cell_ymin,
+                         cell_x_intvl, cell_y_intvl,
+                         piece_limit, pieces);
+```
+
+Unit-test examples are in `test/unittest_glin.h` and `test/unittest_glin_maintenance.h`.

@@ -101,6 +101,8 @@ struct Options {
   std::size_t cost_partition_step = 0;
   std::size_t cost_partition_query_sample = 128;
   bool predicate_shortcuts = true;
+  bool lazy_alex_delete = true;
+  bool defer_delete_summary_refresh = true;
   double piece_limit = 10000.0;
   std::uint64_t seed = 42;
   double cell_xmin = -180.0;
@@ -281,6 +283,8 @@ void print_usage(const char* program) {
       << "  --cost_partition_step N          DELI-Cost DP candidate split step; 0 uses block_size/8\n"
       << "  --cost_partition_query_sample N  DELI-Cost query samples for partition cost (default: 128)\n"
       << "  --predicate_shortcuts 0|1        Enable exact-safe rectangle-query envelope shortcuts before GEOS (default: 1)\n"
+      << "  --lazy_alex_delete 0|1           DELI-LB/Cost delete only tombstones overlay and skips redundant ALEX erase (default: 1)\n"
+      << "  --defer_delete_summary_refresh 0|1  Keep stale-large block summaries after delete until local compaction (default: 1)\n"
       << "  --piece_limit N                  GLIN-piece records per piece (default: 10000)\n"
       << "  --seed N                         Random seed (default: 42)\n"
       << "  --cell_xmin X                    Z-order longitude origin (default: -180)\n"
@@ -396,6 +400,10 @@ Options parse_args(int argc, char* argv[]) {
           static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--predicate_shortcuts") {
       options.predicate_shortcuts = std::stoi(require_value(key)) != 0;
+    } else if (key == "--lazy_alex_delete") {
+      options.lazy_alex_delete = std::stoi(require_value(key)) != 0;
+    } else if (key == "--defer_delete_summary_refresh") {
+      options.defer_delete_summary_refresh = std::stoi(require_value(key)) != 0;
     } else if (key == "--piece_limit") {
       options.piece_limit = std::stod(require_value(key));
     } else if (key == "--seed") {
@@ -3137,7 +3145,7 @@ class LocalBoundedCompactQueryOverlay {
       block->stale = true;
       if (should_compact_after_delete(*block)) {
         compact_block(block);
-      } else if (summary_critical) {
+      } else if (summary_critical && !options_.defer_delete_summary_refresh) {
         refresh_block_summary(block);
       }
     }
@@ -4367,6 +4375,9 @@ class DeliAlexHybridLocalBoundedIndex {
   bool erase(ObjectId oid) {
     if (oid >= geometries_.size()) {
       return false;
+    }
+    if (options_.lazy_alex_delete) {
+      return overlay_.erase(oid);
     }
     int erased = base().erase_geo(metadata_[oid].zmin, geometries_[oid].get());
     if (erased <= 0) {
