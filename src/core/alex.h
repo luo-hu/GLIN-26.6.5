@@ -2764,7 +2764,8 @@ namespace alex {
                         cur_leaf_ = cur_leaf_->next_leaf_;
                         // Check MBR. Skip leaves until the leaf's MBR intersects the query window
                         // use JTS disjoint logic to check boundaries
-                        while (cur_leaf_ != nullptr&& cur_leaf_->max_key_ < max_end && query_window->disjoint(cur_leaf_->mbr)) {
+                        while (cur_leaf_ != nullptr && cur_leaf_->max_key_ < max_end &&
+                               !query_window->intersects(cur_leaf_->mbr)) {
                             cur_leaf_ = cur_leaf_->next_leaf_;
                             num_visited_leaf++;
                         }

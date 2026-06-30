@@ -42,7 +42,6 @@
     └── x86_64-conda-linux-gnu
 这是服务器的分区目录，我需要你指导如何在这个服务器上复现GLIN-26.6.5这个项目
 
-
 可以。你这台 AutoDL 的目录规划是合理的： **系统盘 `/root` 尽量少放东西，项目、环境、数据、第三方依赖都放 `/root/autodl-tmp`** 。下面给你一套比较稳的复现流程。
 
 **目标目录**
@@ -190,13 +189,139 @@ cmake .. \
 fatal error: geos/geom/Envelope.h: No such file or directory
 ```
 
-这通常不是 GEOS 没安装，而是 CMake target 的 include directories 没有正确传给编译命令。先检查头文件是否真实存在：
+这一步要先判断是“头文件不存在”，还是“头文件存在但 include path 没传进编译命令”。项目代码直接使用 GEOS C++ 的 `geos/geom/Envelope.h`，所以只看到 `GEOS_INCLUDE_DIR=.../include` 还不够，必须确认这个文件真实存在：
 
 ```
-ls /root/autodl-tmp/glin_env26.6.29/include/geos/geom/Envelope.h
+ls -lh /root/autodl-tmp/glin_env26.6.29/include/geos/geom/Envelope.h
+ls -lh /root/autodl-tmp/glin_env26.6.29/include/geos/geom/Geometry.h
+ls -lh /root/autodl-tmp/glin_env26.6.29/include/geos/geom/CoordinateArraySequence.h
 ```
 
-如果文件存在，清理旧的 build 缓存并重新配置：
+如果报错是：
+
+```
+fatal error: geos/geom/CoordinateArraySequence.h: No such file or directory
+```
+
+但 `Geometry.h` 已经能被找到，例如编译日志里出现：
+
+```
+/root/autodl-tmp/glin_env26.6.29/include/geos/geom/Geometry.h
+```
+
+这说明 **不是 include path 没生效**，而是当前环境里的 GEOS C++ 头文件版本和本项目代码不匹配。GLIN-26.6.5 目前直接使用 GEOS C++ 旧接口：
+
+```
+geos/geom/CoordinateArraySequence.h
+new geos::geom::CoordinateArraySequence()
+```
+
+部分较新的 conda-forge GEOS 包可能不再安装这个旧头文件，或者头文件组织方式已经变化。此时不要继续反复 `export C_INCLUDE_PATH` / `CPLUS_INCLUDE_PATH`，因为路径已经生效了，缺的是兼容的 GEOS 头文件。
+
+推荐固定使用你已经下载的 GEOS 3.8.4 源码包安装到当前环境：
+
+```
+cd /root/autodl-tmp/Software
+rm -rf geos-3.8.4
+tar -xjf geos-3.8.4.tar.bz2
+cd geos-3.8.4
+mkdir -p build
+cd build
+
+cmake .. \
+  -DCMAKE_INSTALL_PREFIX=/root/autodl-tmp/glin_env26.6.29 \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build . -j2
+cmake --install .
+```
+
+安装后必须检查这三个文件都存在：
+
+```
+ls -lh /root/autodl-tmp/glin_env26.6.29/include/geos/geom/CoordinateArraySequence.h
+ls -lh /root/autodl-tmp/glin_env26.6.29/lib/libgeos.so
+ls -lh /root/autodl-tmp/glin_env26.6.29/lib/libgeos_c.so
+```
+
+然后必须清空 GLIN 的旧 CMake 缓存重新配置。
+
+注意这里有两个容易踩坑的点：
+
+1. 项目的 `cmake/FindGEOS.cmake` 识别的是 `GEOS_C_LIB`，不是 `GEOS_CXX_LIBRARY`。
+   如果写成 `-DGEOS_CXX_LIBRARY=.../libgeos_c.so`，这个变量会被忽略。
+2. 不要手动传一个不存在的 `-DGEOS_LIBRARY=/path/libgeos.so`。
+   如果安装目录里只有 `libgeos-3.8.4.so`，没有 `libgeos.so` 软链接，Make 会报：
+
+```
+No rule to make target '/root/autodl-tmp/local_geos384/lib/libgeos.so'
+```
+
+先检查真实文件名：
+
+```
+ls -lh /root/autodl-tmp/local_geos384/lib/libgeos*
+ls -lh /root/autodl-tmp/local_geos384/include/geos/geom/Geometry.h
+ls -lh /root/autodl-tmp/local_geos384/include/geos/geom/Envelope.h
+```
+
+如果缺少 `libgeos.so` 或 `libgeos_c.so` 软链接，可以重装 GEOS，或手动补软链接：
+
+```
+cd /root/autodl-tmp/local_geos384/lib
+ln -sf libgeos-3.8.4.so libgeos.so
+ln -sf libgeos_c.so.1.13.1 libgeos_c.so   # 这里的真实版本号以 ls 输出为准
+```
+
+更推荐的配置方式是让 `FindGEOS.cmake` 自己从前缀目录找 `geos` 和 `geos_c`：
+
+```
+cd /root/autodl-tmp/Code/GLIN-26.6.5
+rm -rf build_current
+
+cmake -S . -B build_current \
+  -DCMAKE_PREFIX_PATH="/root/autodl-tmp/local_geos384;/root/autodl-tmp/local_boost179" \
+  -DGEOS_DIR=/root/autodl-tmp/local_geos384 \
+  -DBOOST_ROOT=/root/autodl-tmp/local_boost179 \
+  -DBoost_NO_SYSTEM_PATHS=ON
+
+cmake --build build_current --target bench_dynamic_compare_wkt -j2
+```
+
+如果仍然要显式指定 GEOS 库，必须同时传 `GEOS_LIB` 和 `GEOS_C_LIB`，并且路径必须真实存在：
+
+```
+cmake -S . -B build_current \
+  -DGEOS_INCLUDE_DIR=/root/autodl-tmp/local_geos384/include \
+  -DGEOS_LIB=/root/autodl-tmp/local_geos384/lib/libgeos.so \
+  -DGEOS_C_LIB=/root/autodl-tmp/local_geos384/lib/libgeos_c.so \
+  -DBOOST_ROOT=/root/autodl-tmp/local_boost179 \
+  -DBoost_NO_SYSTEM_PATHS=ON
+```
+
+如果报：
+
+```
+fatal error: geos/index/strtree/SimpleSTRtree.h: No such file or directory
+```
+
+要先确认本地和服务器实际参与编译的 GEOS 版本。本机当前能找到 `SimpleSTRtree.h` 的环境是 conda GEOS 3.9.1：
+
+```
+geos-config --version
+grep -n "GEOS_VERSION" /path/to/include/geos/version.h
+```
+
+而服务器上的 GEOS 3.8.4 可能没有这个头。当前代码不实际使用 `SimpleSTRtree`，已经去掉该 include；如果服务器代码没有同步这个修改，请同步最新代码，或手动删除：
+
+```
+# glin/glin.h
+#include <geos/index/strtree/SimpleSTRtree.h>
+```
+
+注意：这里使用 `GEOS_LIBRARY`，不要写成 `GEOS_LIB`。`C_INCLUDE_PATH` / `CPLUS_INCLUDE_PATH` 可以作为补救，但不要依赖它们覆盖 CMake 已经缓存下来的旧 GEOS 路径；最稳的是删除 `build_current` 后重新 `cmake -S . -B build_current ...`。
+
+如果 `Envelope.h` 文件存在，清理旧的 build 缓存并重新配置：
 
 ```
 cd /root/autodl-tmp/Code/GLIN-26.6.5
@@ -208,13 +333,42 @@ cmake -S . -B build_current \
 cmake --build build_current --target bench_dynamic_compare_wkt -j2
 ```
 
-如果 `Envelope.h` 文件不存在，说明当前 conda 的 GEOS 包没有提供 C++ 头文件，建议改装 conda-forge 的 GEOS/Boost：
+如果 `Envelope.h` 文件不存在，但 `Geometry.h` 存在，说明当前环境里的 GEOS 头文件不满足本项目需要。此时不要继续反复 `cmake --build`，需要先修复 GEOS C++ 头文件。
+
+优先尝试 conda-forge：
 
 ```
-conda install -y -c conda-forge geos boost-cpp cmake make
+conda install -y -c conda-forge "geos=3.8.4" boost-cpp cmake make
 ```
 
-然后重新执行上面的 `rm -rf build_current` 和 `cmake -S . -B build_current ...`。
+如果 conda 解析失败，或者安装后仍然没有 `Envelope.h`，就使用你已经放在 `/root/autodl-tmp/Software` 的 GEOS 3.8.4 源码安装到当前环境：
+
+```
+cd /root/autodl-tmp/Software
+tar -xjf geos-3.8.4.tar.bz2
+cd geos-3.8.4
+mkdir -p build
+cd build
+cmake .. \
+  -DCMAKE_INSTALL_PREFIX=/root/autodl-tmp/glin_env26.6.29 \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build . -j2
+cmake --install .
+```
+
+安装后再次确认：
+
+```
+ls -lh /root/autodl-tmp/glin_env26.6.29/include/geos/geom/Envelope.h
+ls -lh /root/autodl-tmp/glin_env26.6.29/lib/libgeos.so
+ls -lh /root/autodl-tmp/glin_env26.6.29/lib/libgeos_c.so
+```
+
+然后重新执行上面的 `rm -rf build_current` 和 `cmake -S . -B build_current ...`。如果想让 CMake 更自然地优先从当前环境找依赖，也可以加上：
+
+```
+-DCMAKE_PREFIX_PATH=/root/autodl-tmp/glin_env26.6.29
+```
 
 编译动态对比 benchmark：
 
@@ -227,6 +381,153 @@ cmake --build . --target bench_dynamic_compare_wkt -j2
 ```
 ls -lh bench_dynamic_compare_wkt
 ```
+
+
+如果 conda 安装的GEOS不行，就用你已有的源码包安装 GEOS 3.8.4：
+
+```
+cd /root/autodl-tmp/Software
+tar -xjf geos-3.8.4.tar.bz2
+cd geos-3.8.4
+mkdir -p build
+cd build
+
+cmake .. \
+  -DCMAKE_INSTALL_PREFIX=/root/autodl-tmp/glin_env26.6.29 \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build . -j2
+cmake --install .
+```
+
+然后重新编译 GLIN：
+
+```
+cd /root/autodl-tmp/Code/GLIN-26.6.5
+rm -rf build_current
+
+cmake -S . -B build_current \
+  -DCMAKE_PREFIX_PATH=/root/autodl-tmp/glin_env26.6.29 \
+  -DGEOS_INCLUDE_DIR=/root/autodl-tmp/glin_env26.6.29/include \
+  -DGEOS_LIBRARY=/root/autodl-tmp/glin_env26.6.29/lib/libgeos.so \
+  -DGEOS_C_LIB=/root/autodl-tmp/glin_env26.6.29/lib/libgeos_c.so
+
+cmake --build build_current --target bench_dynamic_compare_wkt -j2
+```
+
+如果这里出现下面两个错误，不是 CMake 路径问题，而是源码兼容性/同步问题：
+
+```
+error: 'class geos::geom::Envelope' has no member named 'disjoint'
+error: no matching function for call to 'alex::Glin<...>::glin_find(..., predicate_shortcuts, ...)'
+```
+
+处理方法：
+
+1. `Envelope::disjoint` 是 GEOS C++ API 版本差异。GEOS 3.8.4 里可以用 `!Envelope::intersects(...)` 表达同样的 MBR 不相交逻辑。当前代码已改成兼容写法：
+
+```
+!query_window->intersects(cur_leaf_->mbr)
+```
+
+2. `glin_find` 参数不匹配通常说明服务器上的 `glin/glin.h` 不是当前 benchmark 对应版本。`bench_dynamic_compare_wkt.cpp` 为了让 GLIN-piece 也公平启用/关闭 PRL，会调用带 `predicate_shortcuts` 的 11 参数版本。请确认服务器源码里有这个签名：
+
+```
+grep -n "predicate_shortcuts" glin/glin.h
+grep -n "void glin_find" glin/glin.h
+```
+
+如果没有输出 `predicate_shortcuts`，说明只同步了部分文件。需要重新同步整个仓库，或至少同步：
+
+```
+src/benchmark/bench_dynamic_compare_wkt.cpp
+glin/glin.h
+src/core/alex.h
+scripts/run_dynamic_compare_diagnostics.sh
+```
+
+同步后务必删除旧构建目录重新配置：
+
+```
+rm -rf build_current
+cmake -S . -B build_current \
+  -DCMAKE_PREFIX_PATH=/root/autodl-tmp/glin_env26.6.29 \
+  -DGEOS_INCLUDE_DIR=/root/autodl-tmp/glin_env26.6.29/include \
+  -DGEOS_LIBRARY=/root/autodl-tmp/glin_env26.6.29/lib/libgeos.so \
+  -DGEOS_C_LIB=/root/autodl-tmp/glin_env26.6.29/lib/libgeos_c.so
+cmake --build build_current --target bench_dynamic_compare_wkt -j2
+```
+
+
+**5.5. 安装 Java/Maven，用于自动生成 query**
+
+动态对比脚本里的：
+
+```
+AUTO_GENERATE_QUERIES=1
+```
+
+表示如果 `QUERY_ROOT` 下没有 query CSV，就自动调用：
+
+```
+scripts/generate_jts_strtree_knn_queries.sh
+```
+
+这个脚本内部使用 `java/jts-query-generator`，依赖 Java 和 Maven。也就是说，即使 C++ benchmark 已经编译成功，只要服务器没有 `java` 或 `mvn`，自动生成 query 仍然会报错：
+
+```
+Error: java is not installed. Run: sudo apt install -y openjdk-17-jdk maven
+```
+
+AutoDL 容器里通常是 root 用户，可以直接安装：
+
+```
+apt update
+apt install -y openjdk-17-jdk maven
+```
+
+检查：
+
+```
+java -version
+mvn -version
+```
+
+如果 apt 源不可用，或者希望把依赖装进当前 conda 环境，也可以用 conda-forge：
+
+```
+conda install -y -c conda-forge openjdk=17 maven
+```
+
+然后再次检查：
+
+```
+which java
+which mvn
+java -version
+mvn -version
+```
+
+如果想单独测试 query 生成器，可以在项目根目录运行：
+
+```
+scripts/generate_jts_strtree_knn_queries.sh \
+  /root/autodl-tmp/Datasets/AREAWATER.csv \
+  queries/smoke_10000/AW_jts_strtree_knn \
+  10000 \
+  20 \
+  42
+```
+
+成功后应该看到类似文件：
+
+```
+queries/smoke_10000/AW_jts_strtree_knn_0p1pct.csv
+queries/smoke_10000/AW_jts_strtree_knn_1pct.csv
+```
+
+注意：第一次运行 Maven 会下载 JTS 依赖，需要网络；如果服务器不能联网，可以在有网络的机器上先生成 query CSV，再把 `queries/smoke_10000` 目录拷贝到 AutoDL 服务器，并把 `AUTO_GENERATE_QUERIES=0`。
+
 
 **6. 先跑一个 smoke test**
 不要一上来跑 200 万数据，先跑 1 万确认流程通。

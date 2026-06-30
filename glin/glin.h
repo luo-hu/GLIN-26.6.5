@@ -5,7 +5,7 @@
 //#include "projection.h"
 #include "piecewise.h"
 #include <geos/geom/Point.h>
-#include <geos/index/strtree/SimpleSTRtree.h>
+//#include <geos/index/strtree/SimpleSTRtree.h>
 #include <geos/index/strtree/GeometryItemDistance.h>
 #include <geos/index/ItemVisitor.h>
 #include <geos/geom/Envelope.h>
@@ -231,7 +231,9 @@ namespace alex {
                        double cell_x_intvl, double cell_y_intvl,
                        std::vector<std::tuple<double, double, double, double>> &pieces,
                        std::vector<geos::geom::Geometry *> &find_result,
-                       int &count_filter) {
+                       int &count_filter,
+                       bool predicate_shortcuts = false,
+                       int *predicate_shortcut_count = nullptr) {
             // every time start a finding, the find_result should be empty for each find
             assert(find_result.empty());
             assert(count_filter == 0);
@@ -246,7 +248,10 @@ namespace alex {
             auto start_refine = std::chrono::high_resolution_clock::now();
             // refine the query result
 //            refine_with_curveseg(query_window, iterators.first, iterators.second, find_result, count_filter);
-            refine_with_curveseg(query_window,iterator_end.first, iterator_end.second,find_result, count_filter );
+            refine_with_curveseg(query_window, iterator_end.first,
+                                 iterator_end.second, find_result, count_filter,
+                                 predicate_shortcuts,
+                                 predicate_shortcut_count);
             auto end_refine = std::chrono::high_resolution_clock::now();
 //            std::cout << "Num visited leaf nodes in refine: " << it.num_visited_leaf << std::endl;
             index_refine_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_refine - start_refine);
@@ -372,14 +377,28 @@ namespace alex {
          * refine with curve and skip node with mbr checking
          */
         void refine_with_curveseg(geos::geom::Geometry *query_window, typename alex::Alex<T, P>::Iterator it_start, double max_end,
-                                  std::vector<geos::geom::Geometry *> &find_result, int &count_filter) {
+                                  std::vector<geos::geom::Geometry *> &find_result, int &count_filter,
+                                  bool predicate_shortcuts = false,
+                                  int *predicate_shortcut_count = nullptr) {
             // refine the query result
             typename alex::Alex<T, P>::Iterator it;
             geos::geom::Envelope env_query_window = *query_window->getEnvelopeInternal();
             for (it = it_start; it.cur_leaf_ != nullptr && it.key() <= max_end; it.it_check_mbr(&env_query_window, max_end)) {
                 geos::geom::Geometry *payload = it.payload();
 #ifdef PIECE
-                if (query_window->intersects(payload)) {
+                const geos::geom::Envelope *payload_env = payload->getEnvelopeInternal();
+                const bool shortcut_hit =
+                    predicate_shortcuts &&
+                    env_query_window.getMinX() <= payload_env->getMinX() &&
+                    env_query_window.getMaxX() >= payload_env->getMaxX() &&
+                    env_query_window.getMinY() <= payload_env->getMinY() &&
+                    env_query_window.getMaxY() >= payload_env->getMaxY();
+                if (shortcut_hit) {
+                    if (predicate_shortcut_count != nullptr) {
+                        ++(*predicate_shortcut_count);
+                    }
+                    find_result.push_back(payload);
+                } else if (query_window->intersects(payload)) {
                     find_result.push_back(payload);
                 }
 #else
