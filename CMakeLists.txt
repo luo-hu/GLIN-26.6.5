@@ -12,6 +12,16 @@ find_package(GEOS REQUIRED)# if not find geo, cannot compile find geos.cmake
 find_package(Boost REQUIRED)
 set(CMAKE_CXX_STANDARD 14)
 
+set(GLIN_DEP_INCLUDE_DIRS
+    ${GEOS_INCLUDE_DIR}
+    ${Boost_INCLUDE_DIRS})
+set(GLIN_CORE_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${GLIN_DEP_INCLUDE_DIRS})
+set(GLIN_WKT_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${GLIN_DEP_INCLUDE_DIRS})
 
 # SIMD
 if(MSVC)
@@ -26,25 +36,25 @@ endif()
 
 add_executable(test_glin test/unittest_main.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_link_libraries(test_glin PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(test_glin PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(test_glin PUBLIC ${GLIN_CORE_INCLUDE_DIRS})
 
 add_executable(test_glin_piece test/unittest_main.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_compile_definitions(test_glin_piece PRIVATE PIECE)
 target_link_libraries(test_glin_piece PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(test_glin_piece PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(test_glin_piece PUBLIC ${GLIN_CORE_INCLUDE_DIRS})
 
 add_executable(bench_glin_wkt src/benchmark/bench_glin_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_link_libraries(bench_glin_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(bench_glin_wkt PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(bench_glin_wkt PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
 
 add_executable(bench_glin_wkt_piece src/benchmark/bench_glin_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_compile_definitions(bench_glin_wkt_piece PRIVATE PIECE)
 target_link_libraries(bench_glin_wkt_piece PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(bench_glin_wkt_piece PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(bench_glin_wkt_piece PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
 
 add_executable(generate_wkt_queries src/benchmark/generate_wkt_queries.cpp)
 target_link_libraries(generate_wkt_queries PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(generate_wkt_queries PUBLIC "$<BUILD_INTERFACE:${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(generate_wkt_queries PUBLIC ${GLIN_DEP_INCLUDE_DIRS})
 
 add_executable(generate_synthetic_points scripts/generate_synthetic_points.cpp)
 
@@ -54,46 +64,46 @@ add_executable(generate_synthetic_rectangles scripts/generate_synthetic_rectangl
 
 add_executable(bench_boost_rtree_wkt src/benchmark/bench_boost_rtree_wkt.cpp)
 target_link_libraries(bench_boost_rtree_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(bench_boost_rtree_wkt PUBLIC "$<BUILD_INTERFACE:${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(bench_boost_rtree_wkt PUBLIC ${GLIN_DEP_INCLUDE_DIRS})
 
 add_executable(bench_geos_quadtree_wkt src/benchmark/bench_geos_quadtree_wkt.cpp)
 target_link_libraries(bench_geos_quadtree_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(bench_geos_quadtree_wkt PUBLIC "$<BUILD_INTERFACE:${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(bench_geos_quadtree_wkt PUBLIC ${GLIN_DEP_INCLUDE_DIRS})
 
 add_executable(bench_interval_overlap_wkt src/benchmark/bench_interval_overlap_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_link_libraries(bench_interval_overlap_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(bench_interval_overlap_wkt PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(bench_interval_overlap_wkt PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
 
 add_executable(bench_dynamic_extent_wkt src/benchmark/bench_dynamic_extent_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_link_libraries(bench_dynamic_extent_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(bench_dynamic_extent_wkt PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(bench_dynamic_extent_wkt PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
 
 add_executable(bench_dynamic_compare_wkt src/benchmark/bench_dynamic_compare_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_compile_definitions(bench_dynamic_compare_wkt PRIVATE PIECE)
 target_link_libraries(bench_dynamic_compare_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(bench_dynamic_compare_wkt PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(bench_dynamic_compare_wkt PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
 
 add_executable(bench_index_size_wkt src/benchmark/bench_index_size_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_link_libraries(bench_index_size_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(bench_index_size_wkt PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(bench_index_size_wkt PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
 
 add_executable(export_zrange_cdf_wkt src/benchmark/export_zrange_cdf_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_link_libraries(export_zrange_cdf_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(export_zrange_cdf_wkt PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(export_zrange_cdf_wkt PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
 
 add_executable(bench_update_wkt src/benchmark/bench_update_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_link_libraries(bench_update_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(bench_update_wkt PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(bench_update_wkt PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
 
 add_executable(bench_update_wkt_piece src/benchmark/bench_update_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_compile_definitions(bench_update_wkt_piece PRIVATE PIECE)
 target_link_libraries(bench_update_wkt_piece PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(bench_update_wkt_piece PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(bench_update_wkt_piece PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
 
 add_executable(bench_hybrid_wkt_piece src/benchmark/bench_hybrid_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_compile_definitions(bench_hybrid_wkt_piece PRIVATE PIECE)
 target_link_libraries(bench_hybrid_wkt_piece PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
-target_include_directories(bench_hybrid_wkt_piece PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/core;${GEOS_INCLUDE_DIR};${Boost_INCLUDE_DIRS}>")
+target_include_directories(bench_hybrid_wkt_piece PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
 
 enable_testing()
 add_test(NAME test_glin COMMAND test_glin)
