@@ -21,6 +21,8 @@ INDEX_ORDER = [
     "DELI_ALEX_HYBRID_BOUNDED",
     "DELI_ALEX_HYBRID_LOCAL_BOUNDED",
     "DELI_ALEX_HYBRID_COST",
+    "DELI_ALEX_HYBRID_SINGLE_STORE",
+    "DELI_ALEX_HYBRID_SINGLE_STORE_COST",
     "GLIN_PIECEWISE",
     "Boost_Rtree",
     "GEOS_Quadtree",
@@ -33,6 +35,8 @@ COLORS = {
     "DELI_ALEX_HYBRID_BOUNDED": "#D49A2A",
     "DELI_ALEX_HYBRID_LOCAL_BOUNDED": "#E76F51",
     "DELI_ALEX_HYBRID_COST": "#C43C7A",
+    "DELI_ALEX_HYBRID_SINGLE_STORE": "#008B8B",
+    "DELI_ALEX_HYBRID_SINGLE_STORE_COST": "#111111",
     "GLIN_PIECEWISE": "#6D8F3F",
     "Boost_Rtree": "#0066FF",
     "GEOS_Quadtree": "#7C5FB3",
@@ -45,9 +49,15 @@ LABELS = {
     "DELI_ALEX_HYBRID_BOUNDED": "DELI-ALEX-Hybrid-Bounded",
     "DELI_ALEX_HYBRID_LOCAL_BOUNDED": "DELI-ALEX-Hybrid-LocalBounded",
     "DELI_ALEX_HYBRID_COST": "DELI-ALEX-Hybrid-Cost",
+    "DELI_ALEX_HYBRID_SINGLE_STORE": "DELI-SingleStore",
+    "DELI_ALEX_HYBRID_SINGLE_STORE_COST": "DELI-SingleStore-Cost",
     "GLIN_PIECEWISE": "GLIN-piece",
     "Boost_Rtree": "Boost R-tree",
     "GEOS_Quadtree": "GEOS Quadtree",
+}
+MARKERS = {
+    "DELI_ALEX_HYBRID_SINGLE_STORE": "D",
+    "DELI_ALEX_HYBRID_SINGLE_STORE_COST": "X",
 }
 
 
@@ -106,6 +116,9 @@ def linestyle_for_index(index):
 
 
 def marker_for_index(index):
+    base_marker = MARKERS.get(canonical_index(index))
+    if base_marker:
+        return base_marker
     if index.endswith("_NOPRL"):
         return "^"
     if index.endswith("_PRL"):

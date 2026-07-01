@@ -17,6 +17,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   DELI-ALEX-Hybrid-Bounded
   DELI-ALEX-Hybrid-LocalBounded
   DELI-ALEX-Hybrid-Cost
+  DELI-ALEX-Hybrid-SingleStore
+  DELI-ALEX-Hybrid-SingleStore-Cost
   Boost R-tree
   GEOS Quadtree
   GLIN-piece

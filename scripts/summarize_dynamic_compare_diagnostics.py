@@ -55,6 +55,8 @@ def enrich(row, path):
     out = dict(row)
     out["source_file"] = path.name
     out["predicate_shortcuts_mode"] = predicate_mode_from_name(path)
+    if out["predicate_shortcuts_mode"] in {"0", "1"}:
+        out["predicate_shortcuts_enabled"] = out["predicate_shortcuts_mode"]
     out["selectivity"] = selectivity_from_name(path)
     out["selectivity_tag"] = selectivity_tag_from_name(path)
     out["avg_query_ms"] = as_float(out, "avg_query_ns") / 1e6

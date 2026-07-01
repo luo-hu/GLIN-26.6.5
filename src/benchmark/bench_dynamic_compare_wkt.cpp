@@ -4334,14 +4334,20 @@ class DeliAlexHybridLocalBoundedIndex {
   DeliAlexHybridLocalBoundedIndex(
       const Options& options, const std::vector<GeometryPtr>& geometries,
       const std::vector<GeometryMeta>& metadata, bool cost_driven = false,
-      const std::vector<QueryCase>* calibration_queries = nullptr)
+      const std::vector<QueryCase>* calibration_queries = nullptr,
+      bool single_store = false)
       : options_(options),
         geometries_(geometries),
         metadata_(metadata),
+        single_store_(single_store),
         overlay_(options, geometries, metadata, cost_driven,
                  calibration_queries) {}
 
   void bulk_load(const std::vector<ObjectId>& ids) {
+    if (single_store_) {
+      overlay_.bulk_load(ids);
+      return;
+    }
     std::vector<std::pair<double, Geometry*>> values;
     values.reserve(ids.size());
     for (ObjectId oid : ids) {
@@ -4365,6 +4371,9 @@ class DeliAlexHybridLocalBoundedIndex {
     if (oid >= geometries_.size()) {
       return false;
     }
+    if (single_store_) {
+      return overlay_.insert(oid);
+    }
     auto result = base().insert(metadata_[oid].zmin, geometries_[oid].get());
     if (!result.second) {
       return false;
@@ -4375,6 +4384,9 @@ class DeliAlexHybridLocalBoundedIndex {
   bool erase(ObjectId oid) {
     if (oid >= geometries_.size()) {
       return false;
+    }
+    if (single_store_) {
+      return overlay_.erase(oid);
     }
     if (options_.lazy_alex_delete) {
       return overlay_.erase(oid);
@@ -4428,9 +4440,15 @@ class DeliAlexHybridLocalBoundedIndex {
   std::size_t blocks_with_delta() const { return overlay_.blocks_with_delta(); }
   double tombstone_ratio() const { return overlay_.tombstone_ratio(); }
   std::size_t leaf_count() const {
+    if (single_store_) {
+      return 0;
+    }
     return static_cast<std::size_t>(std::max(0, base().num_leaves()));
   }
   std::size_t index_bytes_estimate() const {
+    if (single_store_) {
+      return overlay_.index_bytes_estimate();
+    }
     return static_cast<std::size_t>(
                std::max<long long>(0, base().data_size() + base().model_size())) +
            overlay_.index_bytes_estimate();
@@ -4443,6 +4461,7 @@ class DeliAlexHybridLocalBoundedIndex {
   const Options& options_;
   const std::vector<GeometryPtr>& geometries_;
   const std::vector<GeometryMeta>& metadata_;
+  bool single_store_ = false;
   GlinIndex index_;
   LocalBoundedCompactQueryOverlay overlay_;
 };
@@ -5985,6 +6004,38 @@ int main(int argc, char* argv[]) {
                   "adaptive beta/tau and benefit-cost local compaction.");
             },
             rows);
+      }
+      auto run_single_store_mixed = [&](const std::string& index_name,
+                                        bool cost_driven) {
+        DeliAlexHybridLocalBoundedIndex mixed_index(
+            options, geometries, geometry_metadata, cost_driven,
+            cost_driven ? &queries : nullptr, true);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(initial_ids);
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, index_name, geometries, queries, initial_ids, operations,
+            mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>&) {
+              return mixed_index.query(query_case);
+            },
+            [&](ObjectId oid) { return mixed_index.insert(oid); },
+            [&](ObjectId oid) { return mixed_index.erase(oid); },
+            [&](CompareSummary& row) {
+              annotate_local_bounded_row(
+                  mixed_index, row,
+                  cost_driven
+                      ? "Mixed workload; DELI-SingleStore-Cost keeps only the compact query overlay and uses adaptive beta/tau."
+                      : "Mixed workload; DELI-SingleStore keeps only the compact query overlay and removes the ALEX data copy.");
+            },
+            rows);
+      };
+      if (index_enabled(options, "DELI_ALEX_HYBRID_SINGLE_STORE")) {
+        run_single_store_mixed("DELI_ALEX_HYBRID_SINGLE_STORE", false);
+      }
+      if (index_enabled(options, "DELI_ALEX_HYBRID_SINGLE_STORE_COST")) {
+        run_single_store_mixed("DELI_ALEX_HYBRID_SINGLE_STORE_COST", true);
       }
 
       if (index_enabled(options, "Boost_Rtree")) {
