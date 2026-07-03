@@ -633,6 +633,54 @@ query_file_for_dataset() {
   echo "$QUERY_ROOT/${dataset}_jts_strtree_knn_${tag}.csv"
 }
 
+file_line_count() {
+  local path="$1"
+  if [[ ! -f "$path" ]]; then
+    echo 0
+    return
+  fi
+  wc -l < "$path" | tr -d '[:space:]'
+}
+
+synthetic_file_needs_generation() {
+  local path="$1"
+  if [[ ! -s "$path" ]]; then
+    return 0
+  fi
+  local rows
+  rows="$(file_line_count "$path")"
+  [[ "$rows" -lt "$LIMIT" ]]
+}
+
+ensure_zgap_data_if_needed() {
+  if [[ " $DATASETS " == *" ZGAP_WIDE "* ]]; then
+    local zgap_wkt="$ZGAP_WORK_DIR/ZGAP_WIDE.wkt"
+    if synthetic_file_needs_generation "$zgap_wkt"; then
+      if [[ -s "$zgap_wkt" ]]; then
+        echo "Existing ZGAP_WIDE has $(file_line_count "$zgap_wkt") rows < LIMIT=$LIMIT; regenerating."
+      fi
+      NUM="$LIMIT" OUT_DIR="$ZGAP_WORK_DIR" NAME=ZGAP_WIDE SEED="$SEED" \
+        BUILD_DIR="$BUILD_DIR" AUTO_BUILD=1 scripts/prepare_zrange_gap_dataset.sh
+    fi
+  fi
+
+  if [[ " $DATASETS " == *" ZGAP_MIXED "* ]]; then
+    local mixed_wkt
+    mixed_wkt="$(data_file_for_dataset ZGAP_MIXED)"
+    if synthetic_file_needs_generation "$mixed_wkt"; then
+      if [[ -s "$mixed_wkt" ]]; then
+        echo "Existing ZGAP_MIXED has $(file_line_count "$mixed_wkt") rows < LIMIT=$LIMIT; regenerating."
+      fi
+      local mixed_dir
+      local mixed_name
+      mixed_dir="$(dirname "$mixed_wkt")"
+      mixed_name="$(basename "$mixed_wkt" .wkt)"
+      NUM="$LIMIT" OUT_DIR="$mixed_dir" NAME="$mixed_name" SEED="$SEED" \
+        BUILD_DIR="$BUILD_DIR" AUTO_BUILD=1 scripts/prepare_zrange_mixed_dataset.sh
+    fi
+  fi
+}
+
 selectivity_for_tag() {
   local tag="$1"
   if [[ "$tag" == *pct ]]; then
@@ -741,6 +789,7 @@ generate_queries_if_needed() {
 }
 
 if [[ "$RUN_BENCHMARKS" == "1" ]]; then
+  ensure_zgap_data_if_needed
   prl_mode_count="$(wc -w <<<"$PREDICATE_SHORTCUTS_LIST")"
   for dataset in $DATASETS; do
     data_file="$(data_file_for_dataset "$dataset")"

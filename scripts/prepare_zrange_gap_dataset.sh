@@ -33,6 +33,7 @@ MAX_HEIGHT=${MAX_HEIGHT:-60}
 DIST=${DIST:-uniform}
 AVOID_CLAMP=${AVOID_CLAMP:-1}
 AUTO_BUILD=${AUTO_BUILD:-1}
+BUILD_DIR=${BUILD_DIR:-build}
 
 main() {
   echo "=== Generate Zmin/Zmax gap stress dataset ==="
@@ -41,19 +42,19 @@ main() {
   echo "AVOID_CLAMP=$AVOID_CLAMP"
 
   if [[ "$AUTO_BUILD" == "1" ]]; then
-    cmake -S . -B build
-    cmake --build build --target generate_synthetic_rectangles export_zrange_cdf_wkt -j2
+    cmake -S . -B "$BUILD_DIR"
+    cmake --build "$BUILD_DIR" --target generate_synthetic_rectangles export_zrange_cdf_wkt -j2
   fi
 
-  if [[ ! -x ./build/generate_synthetic_rectangles ]]; then
-    echo "Error: missing ./build/generate_synthetic_rectangles" >&2
+  if [[ ! -x "$BUILD_DIR/generate_synthetic_rectangles" ]]; then
+    echo "Error: missing $BUILD_DIR/generate_synthetic_rectangles" >&2
     exit 1
   fi
 
   mkdir -p "$OUT_DIR"
   local output="${OUT_DIR}/${NAME}.wkt"
   local args=(
-    ./build/generate_synthetic_rectangles
+    "$BUILD_DIR/generate_synthetic_rectangles"
     --dist "$DIST" \
     --num "$NUM" \
     --output_file "$output" \

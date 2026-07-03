@@ -8,6 +8,7 @@
 // old standalone benchmark remains untouched.
 
 #include "../../glin/glin.h"
+#include "rlr_lite/rlr_lite_index.h"
 
 #include <geos/geom/Coordinate.h>
 #include <geos/geom/CoordinateArraySequence.h>
@@ -655,6 +656,12 @@ bool rectangle_query_contains_candidate_envelope(
 BoostBox boost_box_from_envelope(const geos::geom::Envelope& envelope) {
   return BoostBox(BoostPoint(envelope.getMinX(), envelope.getMinY()),
                   BoostPoint(envelope.getMaxX(), envelope.getMaxY()));
+}
+
+rlr_lite::Box2D rlr_box_from_envelope(const geos::geom::Envelope& envelope) {
+  return rlr_lite::normalize(rlr_lite::Box2D{
+      envelope.getMinX(), envelope.getMinY(), envelope.getMaxX(),
+      envelope.getMaxY()});
 }
 
 GeometryPtr make_query_box(geos::geom::GeometryFactory& factory,
@@ -4633,6 +4640,74 @@ SimpleQueryResult query_glin_piece_index(
   return result;
 }
 
+std::vector<std::pair<rlr_lite::Box2D, std::size_t>> rlr_entries_for_ids(
+    const std::vector<GeometryPtr>& geometries,
+    const std::vector<ObjectId>& ids,
+    const std::vector<char>& live) {
+  std::vector<std::pair<rlr_lite::Box2D, std::size_t>> entries;
+  entries.reserve(ids.size());
+  for (ObjectId oid : ids) {
+    if (oid < geometries.size() && oid < live.size() && live[oid]) {
+      entries.emplace_back(
+          rlr_box_from_envelope(*geometries[oid]->getEnvelopeInternal()),
+          static_cast<std::size_t>(oid));
+    }
+  }
+  return entries;
+}
+
+std::vector<rlr_lite::Box2D> rlr_train_queries_for_cases(
+    const std::vector<QueryCase>& queries) {
+  std::vector<rlr_lite::Box2D> boxes;
+  boxes.reserve(queries.size());
+  for (const QueryCase& query : queries) {
+    boxes.push_back(rlr_lite::normalize(
+        rlr_lite::Box2D{query.xmin, query.ymin, query.xmax, query.ymax}));
+  }
+  return boxes;
+}
+
+SimpleQueryResult query_rlr_lite_index(
+    const rlr_lite::RLRLiteIndex& index,
+    const std::vector<GeometryPtr>& geometries,
+    const std::vector<char>& live,
+    const Options& options,
+    bool enable_predicate_shortcuts,
+    const QueryCase& query_case) {
+  auto start = std::chrono::high_resolution_clock::now();
+  SimpleQueryResult result;
+  std::vector<std::size_t> candidates;
+  rlr_lite::QueryStats stats;
+  const geos::geom::Envelope query_envelope =
+      *query_case.geometry->getEnvelopeInternal();
+  index.range_query(rlr_box_from_envelope(query_envelope), candidates, &stats);
+  result.block_checks = stats.visited_nodes;
+  result.visited_blocks = stats.visited_nodes;
+  result.compact_records_scanned = stats.leaf_entries_checked;
+  result.candidates = candidates.size();
+  result.mbr_candidates = stats.mbr_candidates;
+  for (std::size_t raw_oid : candidates) {
+    ObjectId oid = static_cast<ObjectId>(raw_oid);
+    if (oid >= geometries.size() || oid >= live.size() || !live[oid]) {
+      continue;
+    }
+    if (enable_predicate_shortcuts &&
+        rectangle_query_contains_candidate_envelope(
+            options, query_envelope, *geometries[oid]->getEnvelopeInternal())) {
+      ++result.predicate_shortcuts;
+      result.answers.insert(oid);
+      continue;
+    }
+    ++result.exact_calls;
+    if (query_case.geometry->intersects(geometries[oid].get())) {
+      result.answers.insert(oid);
+    }
+  }
+  auto end = std::chrono::high_resolution_clock::now();
+  result.query_ns = ns_count(end - start);
+  return result;
+}
+
 CompareSummary finalize_compare_summary(
     const Options& options,
     const std::string& index_name,
@@ -5745,6 +5820,8 @@ int main(int argc, char* argv[]) {
         build_geometry_to_oid(geometries);
     std::vector<GeometryMeta> geometry_metadata =
         build_geometry_metadata(geometries, options);
+    std::vector<rlr_lite::Box2D> rlr_train_queries =
+        rlr_train_queries_for_cases(queries);
 
     std::cout << "dataset=" << options.dataset_name
               << " benchmark=dynamic_compare"
@@ -6067,6 +6144,42 @@ int main(int argc, char* argv[]) {
             [&](CompareSummary& row) {
               row.index_bytes_estimate = estimate_boost_bytes(row.live_count);
               row.note = "Mixed workload; Boost R-tree.";
+            },
+            rows);
+      }
+
+      if (index_enabled(options, "RLR_LITE_CS")) {
+        rlr_lite::RLRLiteIndex mixed_index(geometries.size(),
+                                           rlr_train_queries);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(
+            rlr_entries_for_ids(geometries, initial_ids, live_bulkload));
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, "RLR_LITE_CS", geometries, queries, initial_ids,
+            operations, mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>& live) {
+              return query_rlr_lite_index(mixed_index, geometries, live,
+                                          options, true, query_case);
+            },
+            [&](ObjectId oid) {
+              return mixed_index.insert(
+                  rlr_box_from_envelope(
+                      *geometries[oid]->getEnvelopeInternal()),
+                  static_cast<std::size_t>(oid));
+            },
+            [&](ObjectId oid) {
+              return mixed_index.erase(static_cast<std::size_t>(oid));
+            },
+            [&](CompareSummary& row) {
+              row.block_count = mixed_index.node_count();
+              row.tree_nodes = mixed_index.node_count();
+              row.tree_depth = mixed_index.height();
+              row.index_bytes_estimate = mixed_index.estimate_bytes();
+              row.stale_block_count = mixed_index.dead_count();
+              row.note =
+                  "Mixed workload; RLR-inspired ChooseSubtree-only lightweight R-tree.";
             },
             rows);
       }
@@ -7113,6 +7226,95 @@ int main(int argc, char* argv[]) {
       rows.back().index_bytes_estimate =
           estimate_boost_bytes(live_after_delete.size());
       rows.back().note = "Boost bytes are rough entry/node estimates.";
+      print_compare_summary(rows.back());
+      }
+
+      // RLR_LITE_CS: RLR-inspired ChooseSubtree-only lightweight R-tree.
+      if (index_enabled(options, "RLR_LITE_CS")) {
+      rlr_lite::RLRLiteIndex rlr_index(geometries.size(), rlr_train_queries);
+      auto rlr_build_start = std::chrono::high_resolution_clock::now();
+      rlr_index.bulk_load(
+          rlr_entries_for_ids(geometries, initial_ids, live_bulkload));
+      auto rlr_build_end = std::chrono::high_resolution_clock::now();
+      long long rlr_build_ns = ns_count(rlr_build_end - rlr_build_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "RLR_LITE_CS", "after_bulkload", 0, geometries, queries,
+          live_after_bulkload, live_bulkload, initial_count, 0, 0,
+          rlr_build_ns, 0, 0,
+          [&](const QueryCase& query_case) {
+            return query_rlr_lite_index(rlr_index, geometries, live_bulkload,
+                                        options, true, query_case);
+          }));
+      rows.back().block_count = rlr_index.node_count();
+      rows.back().tree_nodes = rlr_index.node_count();
+      rows.back().tree_depth = rlr_index.height();
+      rows.back().index_bytes_estimate = rlr_index.estimate_bytes();
+      rows.back().note =
+          "RLR-inspired ChooseSubtree-only lightweight R-tree.";
+      print_compare_summary(rows.back());
+
+      std::size_t rlr_insert_success = 0;
+      std::size_t rlr_insert_failed = 0;
+      auto rlr_insert_start = std::chrono::high_resolution_clock::now();
+      for (ObjectId oid : insert_ids) {
+        if (rlr_index.insert(
+                rlr_box_from_envelope(
+                    *geometries[oid]->getEnvelopeInternal()),
+                static_cast<std::size_t>(oid))) {
+          ++rlr_insert_success;
+        } else {
+          ++rlr_insert_failed;
+        }
+      }
+      auto rlr_insert_end = std::chrono::high_resolution_clock::now();
+      long long rlr_insert_ns = ns_count(rlr_insert_end - rlr_insert_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "RLR_LITE_CS", "after_insert", 1, geometries, queries,
+          live_after_insert, live_insert, initial_count, insert_count, 0,
+          rlr_build_ns, rlr_insert_ns, 0,
+          [&](const QueryCase& query_case) {
+            return query_rlr_lite_index(rlr_index, geometries, live_insert,
+                                        options, true, query_case);
+          }));
+      rows.back().success_count = rlr_insert_success;
+      rows.back().failed_count = rlr_insert_failed;
+      rows.back().block_count = rlr_index.node_count();
+      rows.back().tree_nodes = rlr_index.node_count();
+      rows.back().tree_depth = rlr_index.height();
+      rows.back().index_bytes_estimate = rlr_index.estimate_bytes();
+      rows.back().note =
+          "RLR-inspired ChooseSubtree-only lightweight R-tree.";
+      print_compare_summary(rows.back());
+
+      std::size_t rlr_delete_success = 0;
+      std::size_t rlr_delete_failed = 0;
+      auto rlr_delete_start = std::chrono::high_resolution_clock::now();
+      for (ObjectId oid : delete_ids) {
+        if (rlr_index.erase(static_cast<std::size_t>(oid))) {
+          ++rlr_delete_success;
+        } else {
+          ++rlr_delete_failed;
+        }
+      }
+      auto rlr_delete_end = std::chrono::high_resolution_clock::now();
+      long long rlr_delete_ns = ns_count(rlr_delete_end - rlr_delete_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "RLR_LITE_CS", "after_delete", 2, geometries, queries,
+          live_after_delete, live_delete, initial_count, insert_count,
+          delete_count, rlr_build_ns, rlr_insert_ns, rlr_delete_ns,
+          [&](const QueryCase& query_case) {
+            return query_rlr_lite_index(rlr_index, geometries, live_delete,
+                                        options, true, query_case);
+          }));
+      rows.back().success_count = rlr_delete_success;
+      rows.back().failed_count = rlr_delete_failed;
+      rows.back().block_count = rlr_index.node_count();
+      rows.back().tree_nodes = rlr_index.node_count();
+      rows.back().tree_depth = rlr_index.height();
+      rows.back().stale_block_count = rlr_index.dead_count();
+      rows.back().index_bytes_estimate = rlr_index.estimate_bytes();
+      rows.back().note =
+          "RLR-inspired ChooseSubtree-only lightweight R-tree with lazy delete.";
       print_compare_summary(rows.back());
       }
 
