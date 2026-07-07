@@ -23,6 +23,8 @@ INDEX_ORDER = [
     "DELI_ALEX_HYBRID_COST",
     "DELI_ALEX_HYBRID_SINGLE_STORE",
     "DELI_ALEX_HYBRID_SINGLE_STORE_COST",
+    "RLR_LITE_CS",
+    "RLR_LITE_CS_SPLIT",
     "GLIN_PIECEWISE",
     "Boost_Rtree",
     "GEOS_Quadtree",
@@ -37,6 +39,8 @@ COLORS = {
     "DELI_ALEX_HYBRID_COST": "#C43C7A",
     "DELI_ALEX_HYBRID_SINGLE_STORE": "#008B8B",
     "DELI_ALEX_HYBRID_SINGLE_STORE_COST": "#111111",
+    "RLR_LITE_CS": "#9467BD",
+    "RLR_LITE_CS_SPLIT": "#FF7F0E",
     "GLIN_PIECEWISE": "#6D8F3F",
     "Boost_Rtree": "#0066FF",
     "GEOS_Quadtree": "#7C5FB3",
@@ -51,6 +55,8 @@ LABELS = {
     "DELI_ALEX_HYBRID_COST": "DELI-ALEX-Hybrid-Cost",
     "DELI_ALEX_HYBRID_SINGLE_STORE": "DELI-SingleStore",
     "DELI_ALEX_HYBRID_SINGLE_STORE_COST": "DELI-SingleStore-Cost",
+    "RLR_LITE_CS": "RLR-Lite-CS",
+    "RLR_LITE_CS_SPLIT": "RLR-Lite-CS-Split",
     "GLIN_PIECEWISE": "GLIN-piece",
     "Boost_Rtree": "Boost R-tree",
     "GEOS_Quadtree": "GEOS Quadtree",
@@ -58,6 +64,8 @@ LABELS = {
 MARKERS = {
     "DELI_ALEX_HYBRID_SINGLE_STORE": "D",
     "DELI_ALEX_HYBRID_SINGLE_STORE_COST": "X",
+    "RLR_LITE_CS": "P",
+    "RLR_LITE_CS_SPLIT": "*",
 }
 
 

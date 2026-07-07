@@ -4708,6 +4708,59 @@ SimpleQueryResult query_rlr_lite_index(
   return result;
 }
 
+std::string sibling_csv_path(const std::string& output_csv,
+                             const std::string& filename) {
+  if (output_csv.empty()) {
+    return "";
+  }
+  const std::size_t slash = output_csv.find_last_of("/\\");
+  if (slash == std::string::npos) {
+    return filename;
+  }
+  return output_csv.substr(0, slash + 1) + filename;
+}
+
+void append_rlr_debug_csv(const Options& options,
+                          const std::string& index_name,
+                          const std::string& checkpoint,
+                          std::size_t checkpoint_id,
+                          const rlr_lite::RLRLiteIndex& index,
+                          std::size_t inserted) {
+  const std::string path = sibling_csv_path(options.output_csv,
+                                            "rlr_lite_debug.csv");
+  if (path.empty()) {
+    return;
+  }
+  const bool needs_header = !static_cast<bool>(std::ifstream(path));
+  std::ofstream output(path, std::ios::app);
+  if (!output) {
+    return;
+  }
+  if (needs_header) {
+    output << "dataset,index,phase,checkpoint,checkpoint_id,inserted,"
+              "split_count,split_rl_count,split_random_count,"
+              "split_greedy_count,split_disagree_with_quadratic,"
+              "split_reward_updates,last_reward,avg_reward,"
+              "train_ref_visited,train_rl_visited,train_ref_candidates,"
+              "train_rl_candidates,split_weight_overlap,split_weight_area,"
+              "split_weight_perimeter,split_weight_balance,"
+              "split_weight_query_cross\n";
+  }
+  const rlr_lite::RLRDebugStats& stats = index.debug_stats();
+  output << options.dataset_name << "," << index_name << ","
+         << options.workload_mode << "," << checkpoint << ","
+         << checkpoint_id << "," << inserted << ","
+         << stats.split_count << "," << stats.split_rl_count << ","
+         << stats.split_random_count << "," << stats.split_greedy_count << ","
+         << stats.split_disagree_with_quadratic << ","
+         << stats.split_reward_updates << "," << stats.last_reward << ","
+         << stats.avg_reward() << "," << stats.train_ref_visited << ","
+         << stats.train_rl_visited << "," << stats.train_ref_candidates << ","
+         << stats.train_rl_candidates << "," << stats.split_weights[0] << ","
+         << stats.split_weights[1] << "," << stats.split_weights[2] << ","
+         << stats.split_weights[3] << "," << stats.split_weights[4] << "\n";
+}
+
 CompareSummary finalize_compare_summary(
     const Options& options,
     const std::string& index_name,
@@ -6184,6 +6237,45 @@ int main(int argc, char* argv[]) {
             rows);
       }
 
+      if (index_enabled(options, "RLR_LITE_CS_SPLIT")) {
+        rlr_lite::RLRLiteIndex mixed_index(geometries.size(),
+                                           rlr_train_queries, true);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(
+            rlr_entries_for_ids(geometries, initial_ids, live_bulkload));
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, "RLR_LITE_CS_SPLIT", geometries, queries, initial_ids,
+            operations, mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>& live) {
+              return query_rlr_lite_index(mixed_index, geometries, live,
+                                          options, true, query_case);
+            },
+            [&](ObjectId oid) {
+              return mixed_index.insert(
+                  rlr_box_from_envelope(
+                      *geometries[oid]->getEnvelopeInternal()),
+                  static_cast<std::size_t>(oid));
+            },
+            [&](ObjectId oid) {
+              return mixed_index.erase(static_cast<std::size_t>(oid));
+            },
+            [&](CompareSummary& row) {
+              row.block_count = mixed_index.node_count();
+              row.tree_nodes = mixed_index.node_count();
+              row.tree_depth = mixed_index.height();
+              row.index_bytes_estimate = mixed_index.estimate_bytes();
+              row.stale_block_count = mixed_index.dead_count();
+              row.note =
+                  "Mixed workload; RLR-inspired ChooseSubtree+Split lightweight R-tree.";
+              append_rlr_debug_csv(options, row.index, row.checkpoint,
+                                   row.checkpoint_id, mixed_index,
+                                   row.insert_count);
+            },
+            rows);
+      }
+
       if (index_enabled(options, "GEOS_Quadtree")) {
         Quadtree mixed_index;
         auto start = std::chrono::high_resolution_clock::now();
@@ -7315,6 +7407,112 @@ int main(int argc, char* argv[]) {
       rows.back().index_bytes_estimate = rlr_index.estimate_bytes();
       rows.back().note =
           "RLR-inspired ChooseSubtree-only lightweight R-tree with lazy delete.";
+      print_compare_summary(rows.back());
+      }
+
+      // RLR_LITE_CS_SPLIT: RLR-inspired ChooseSubtree+Split lightweight R-tree.
+      if (index_enabled(options, "RLR_LITE_CS_SPLIT")) {
+      rlr_lite::RLRLiteIndex rlr_split_index(geometries.size(),
+                                             rlr_train_queries, true);
+      auto rlr_split_build_start = std::chrono::high_resolution_clock::now();
+      rlr_split_index.bulk_load(
+          rlr_entries_for_ids(geometries, initial_ids, live_bulkload));
+      auto rlr_split_build_end = std::chrono::high_resolution_clock::now();
+      long long rlr_split_build_ns =
+          ns_count(rlr_split_build_end - rlr_split_build_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "RLR_LITE_CS_SPLIT", "after_bulkload", 0, geometries,
+          queries, live_after_bulkload, live_bulkload, initial_count, 0, 0,
+          rlr_split_build_ns, 0, 0,
+          [&](const QueryCase& query_case) {
+            return query_rlr_lite_index(rlr_split_index, geometries,
+                                        live_bulkload, options, true,
+                                        query_case);
+          }));
+      rows.back().block_count = rlr_split_index.node_count();
+      rows.back().tree_nodes = rlr_split_index.node_count();
+      rows.back().tree_depth = rlr_split_index.height();
+      rows.back().index_bytes_estimate = rlr_split_index.estimate_bytes();
+      rows.back().note =
+          "RLR-inspired ChooseSubtree+Split lightweight R-tree.";
+      append_rlr_debug_csv(options, rows.back().index, rows.back().checkpoint,
+                           rows.back().checkpoint_id, rlr_split_index,
+                           rows.back().insert_count);
+      print_compare_summary(rows.back());
+
+      std::size_t rlr_split_insert_success = 0;
+      std::size_t rlr_split_insert_failed = 0;
+      auto rlr_split_insert_start = std::chrono::high_resolution_clock::now();
+      for (ObjectId oid : insert_ids) {
+        if (rlr_split_index.insert(
+                rlr_box_from_envelope(
+                    *geometries[oid]->getEnvelopeInternal()),
+                static_cast<std::size_t>(oid))) {
+          ++rlr_split_insert_success;
+        } else {
+          ++rlr_split_insert_failed;
+        }
+      }
+      auto rlr_split_insert_end = std::chrono::high_resolution_clock::now();
+      long long rlr_split_insert_ns =
+          ns_count(rlr_split_insert_end - rlr_split_insert_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "RLR_LITE_CS_SPLIT", "after_insert", 1, geometries,
+          queries, live_after_insert, live_insert, initial_count, insert_count,
+          0, rlr_split_build_ns, rlr_split_insert_ns, 0,
+          [&](const QueryCase& query_case) {
+            return query_rlr_lite_index(rlr_split_index, geometries,
+                                        live_insert, options, true,
+                                        query_case);
+          }));
+      rows.back().success_count = rlr_split_insert_success;
+      rows.back().failed_count = rlr_split_insert_failed;
+      rows.back().block_count = rlr_split_index.node_count();
+      rows.back().tree_nodes = rlr_split_index.node_count();
+      rows.back().tree_depth = rlr_split_index.height();
+      rows.back().index_bytes_estimate = rlr_split_index.estimate_bytes();
+      rows.back().note =
+          "RLR-inspired ChooseSubtree+Split lightweight R-tree.";
+      append_rlr_debug_csv(options, rows.back().index, rows.back().checkpoint,
+                           rows.back().checkpoint_id, rlr_split_index,
+                           rows.back().insert_count);
+      print_compare_summary(rows.back());
+
+      std::size_t rlr_split_delete_success = 0;
+      std::size_t rlr_split_delete_failed = 0;
+      auto rlr_split_delete_start = std::chrono::high_resolution_clock::now();
+      for (ObjectId oid : delete_ids) {
+        if (rlr_split_index.erase(static_cast<std::size_t>(oid))) {
+          ++rlr_split_delete_success;
+        } else {
+          ++rlr_split_delete_failed;
+        }
+      }
+      auto rlr_split_delete_end = std::chrono::high_resolution_clock::now();
+      long long rlr_split_delete_ns =
+          ns_count(rlr_split_delete_end - rlr_split_delete_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "RLR_LITE_CS_SPLIT", "after_delete", 2, geometries,
+          queries, live_after_delete, live_delete, initial_count, insert_count,
+          delete_count, rlr_split_build_ns, rlr_split_insert_ns,
+          rlr_split_delete_ns,
+          [&](const QueryCase& query_case) {
+            return query_rlr_lite_index(rlr_split_index, geometries,
+                                        live_delete, options, true,
+                                        query_case);
+          }));
+      rows.back().success_count = rlr_split_delete_success;
+      rows.back().failed_count = rlr_split_delete_failed;
+      rows.back().block_count = rlr_split_index.node_count();
+      rows.back().tree_nodes = rlr_split_index.node_count();
+      rows.back().tree_depth = rlr_split_index.height();
+      rows.back().stale_block_count = rlr_split_index.dead_count();
+      rows.back().index_bytes_estimate = rlr_split_index.estimate_bytes();
+      rows.back().note =
+          "RLR-inspired ChooseSubtree+Split lightweight R-tree with lazy delete.";
+      append_rlr_debug_csv(options, rows.back().index, rows.back().checkpoint,
+                           rows.back().checkpoint_id, rlr_split_index,
+                           rows.back().insert_count);
       print_compare_summary(rows.back());
       }
 
