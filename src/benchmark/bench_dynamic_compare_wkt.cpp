@@ -8,6 +8,7 @@
 // old standalone benchmark remains untouched.
 
 #include "../../glin/glin.h"
+#include "hire_sfc_lite_index.h"
 #include "rlr_lite/rlr_lite_index.h"
 
 #include <geos/geom/Coordinate.h>
@@ -660,6 +661,13 @@ BoostBox boost_box_from_envelope(const geos::geom::Envelope& envelope) {
 
 rlr_lite::Box2D rlr_box_from_envelope(const geos::geom::Envelope& envelope) {
   return rlr_lite::normalize(rlr_lite::Box2D{
+      envelope.getMinX(), envelope.getMinY(), envelope.getMaxX(),
+      envelope.getMaxY()});
+}
+
+hire_sfc_lite::Box2D hire_box_from_envelope(
+    const geos::geom::Envelope& envelope) {
+  return hire_sfc_lite::normalize(hire_sfc_lite::Box2D{
       envelope.getMinX(), envelope.getMinY(), envelope.getMaxX(),
       envelope.getMaxY()});
 }
@@ -4656,6 +4664,26 @@ std::vector<std::pair<rlr_lite::Box2D, std::size_t>> rlr_entries_for_ids(
   return entries;
 }
 
+std::vector<hire_sfc_lite::RecordInput> hire_entries_for_ids(
+    const std::vector<GeometryMeta>& metadata,
+    const std::vector<ObjectId>& ids,
+    const std::vector<char>& live) {
+  std::vector<hire_sfc_lite::RecordInput> entries;
+  entries.reserve(ids.size());
+  for (ObjectId oid : ids) {
+    if (oid < metadata.size() && oid < live.size() && live[oid]) {
+      const GeometryMeta& meta = metadata[oid];
+      hire_sfc_lite::RecordInput input;
+      input.id = static_cast<std::size_t>(oid);
+      input.zmin = meta.zmin;
+      input.zmax = meta.zmax;
+      input.box = hire_box_from_envelope(meta.envelope);
+      entries.push_back(input);
+    }
+  }
+  return entries;
+}
+
 std::vector<rlr_lite::Box2D> rlr_train_queries_for_cases(
     const std::vector<QueryCase>& queries) {
   std::vector<rlr_lite::Box2D> boxes;
@@ -4665,6 +4693,55 @@ std::vector<rlr_lite::Box2D> rlr_train_queries_for_cases(
         rlr_lite::Box2D{query.xmin, query.ymin, query.xmax, query.ymax}));
   }
   return boxes;
+}
+
+SimpleQueryResult query_hire_sfc_lite_index(
+    const hire_sfc_lite::HireSfcLiteIndex& index,
+    const std::vector<GeometryPtr>& geometries,
+    const std::vector<char>& live,
+    const Options& options,
+    bool enable_predicate_shortcuts,
+    const QueryCase& query_case) {
+  auto start = std::chrono::high_resolution_clock::now();
+  SimpleQueryResult result;
+  double query_zmin = 0.0;
+  double query_zmax = 0.0;
+  curve_shape_projection(query_case.geometry, "z", options.cell_xmin,
+                         options.cell_ymin, options.cell_size,
+                         options.cell_size, query_zmin, query_zmax);
+  const geos::geom::Envelope query_envelope =
+      *query_case.geometry->getEnvelopeInternal();
+  std::vector<std::size_t> candidates;
+  hire_sfc_lite::QueryStats stats;
+  index.range_query(query_zmin, query_zmax,
+                    hire_box_from_envelope(query_envelope), candidates,
+                    &stats);
+  result.block_checks = stats.block_checks;
+  result.visited_blocks = stats.visited_leaves;
+  result.compact_records_scanned = stats.records_scanned;
+  result.delta_records_scanned = stats.buffer_records_scanned;
+  result.candidates = candidates.size();
+  result.mbr_candidates = stats.mbr_candidates;
+  for (std::size_t raw_oid : candidates) {
+    ObjectId oid = static_cast<ObjectId>(raw_oid);
+    if (oid >= geometries.size() || oid >= live.size() || !live[oid]) {
+      continue;
+    }
+    if (enable_predicate_shortcuts &&
+        rectangle_query_contains_candidate_envelope(
+            options, query_envelope, *geometries[oid]->getEnvelopeInternal())) {
+      ++result.predicate_shortcuts;
+      result.answers.insert(oid);
+      continue;
+    }
+    ++result.exact_calls;
+    if (query_case.geometry->intersects(geometries[oid].get())) {
+      result.answers.insert(oid);
+    }
+  }
+  auto end = std::chrono::high_resolution_clock::now();
+  result.query_ns = ns_count(end - start);
+  return result;
 }
 
 SimpleQueryResult query_rlr_lite_index(
@@ -4759,6 +4836,52 @@ void append_rlr_debug_csv(const Options& options,
          << stats.train_rl_candidates << "," << stats.split_weights[0] << ","
          << stats.split_weights[1] << "," << stats.split_weights[2] << ","
          << stats.split_weights[3] << "," << stats.split_weights[4] << "\n";
+}
+
+void append_hire_sfc_debug_csv(
+    const Options& options,
+    const std::string& index_name,
+    const std::string& checkpoint,
+    std::size_t checkpoint_id,
+    const hire_sfc_lite::HireSfcLiteIndex& index,
+    std::size_t inserted) {
+  const std::string path = sibling_csv_path(options.output_csv,
+                                            "hire_sfc_debug.csv");
+  if (path.empty()) {
+    return;
+  }
+  const bool needs_header = !static_cast<bool>(std::ifstream(path));
+  std::ofstream output(path, std::ios::app);
+  if (!output) {
+    return;
+  }
+  if (needs_header) {
+    output << "dataset,index,phase,checkpoint,checkpoint_id,inserted,"
+              "leaf_count,model_leaf_count,legacy_leaf_count,"
+              "avg_model_error,max_model_error,buffer_records,"
+              "tombstone_records,local_rebuild_count,directory_log_entries,"
+              "directory_rebuild_count,deleted_slot_reuse_count,"
+              "cost_retrain_trigger_count,legacy_transform_count,"
+              "pending_rebuild_count,background_recalibration_count,"
+              "live_count,"
+              "index_bytes_estimate\n";
+  }
+  const hire_sfc_lite::DebugStats stats = index.debug_stats();
+  output << options.dataset_name << "," << index_name << ","
+         << options.workload_mode << "," << checkpoint << ","
+         << checkpoint_id << "," << inserted << ","
+         << stats.leaf_count << "," << stats.model_leaf_count << ","
+         << stats.legacy_leaf_count << "," << stats.avg_model_error << ","
+         << stats.max_model_error << "," << stats.buffer_records << ","
+         << stats.tombstone_records << "," << stats.local_rebuild_count << ","
+         << stats.directory_log_entries << ","
+         << stats.directory_rebuild_count << ","
+         << stats.deleted_slot_reuse_count << ","
+         << stats.cost_retrain_trigger_count << ","
+         << stats.legacy_transform_count << ","
+         << stats.pending_rebuild_count << ","
+         << stats.background_recalibration_count << ","
+         << index.live_count() << "," << index.estimate_bytes() << "\n";
 }
 
 CompareSummary finalize_compare_summary(
@@ -6276,6 +6399,53 @@ int main(int argc, char* argv[]) {
             rows);
       }
 
+      if (index_enabled(options, "HIRE_SFC_LITE")) {
+        hire_sfc_lite::HireSfcLiteIndex mixed_index(geometries.size());
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(
+            hire_entries_for_ids(geometry_metadata, initial_ids, live_bulkload));
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, "HIRE_SFC_LITE", geometries, queries, initial_ids,
+            operations, mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>& live) {
+              return query_hire_sfc_lite_index(mixed_index, geometries, live,
+                                               options, true, query_case);
+            },
+            [&](ObjectId oid) {
+              if (oid >= geometry_metadata.size()) {
+                return false;
+              }
+              const GeometryMeta& meta = geometry_metadata[oid];
+              hire_sfc_lite::RecordInput input;
+              input.id = static_cast<std::size_t>(oid);
+              input.zmin = meta.zmin;
+              input.zmax = meta.zmax;
+              input.box = hire_box_from_envelope(meta.envelope);
+              return mixed_index.insert(input);
+            },
+            [&](ObjectId oid) {
+              return mixed_index.erase(static_cast<std::size_t>(oid));
+            },
+            [&](CompareSummary& row) {
+              row.block_count = mixed_index.leaf_count();
+              row.tree_nodes = mixed_index.node_count();
+              row.tree_depth = mixed_index.height();
+              row.index_bytes_estimate = mixed_index.estimate_bytes();
+              row.stale_block_count =
+                  mixed_index.debug_stats().tombstone_records;
+              row.local_compaction_count_stage =
+                  mixed_index.local_rebuild_count();
+              row.note =
+                  "Mixed workload; HIRE-inspired SFC+1D learned index with conservative extent filtering.";
+              append_hire_sfc_debug_csv(options, row.index, row.checkpoint,
+                                        row.checkpoint_id, mixed_index,
+                                        row.insert_count);
+            },
+            rows);
+      }
+
       if (index_enabled(options, "GEOS_Quadtree")) {
         Quadtree mixed_index;
         auto start = std::chrono::high_resolution_clock::now();
@@ -7513,6 +7683,132 @@ int main(int argc, char* argv[]) {
       append_rlr_debug_csv(options, rows.back().index, rows.back().checkpoint,
                            rows.back().checkpoint_id, rlr_split_index,
                            rows.back().insert_count);
+      print_compare_summary(rows.back());
+      }
+
+      // HIRE_SFC_LITE: HIRE-inspired one-dimensional learned index over
+      // space-filling-curve extents with conservative spatial refinement.
+      if (index_enabled(options, "HIRE_SFC_LITE")) {
+      hire_sfc_lite::HireSfcLiteIndex hire_index(geometries.size());
+      auto hire_build_start = std::chrono::high_resolution_clock::now();
+      hire_index.bulk_load(
+          hire_entries_for_ids(geometry_metadata, initial_ids, live_bulkload));
+      auto hire_build_end = std::chrono::high_resolution_clock::now();
+      long long hire_build_ns =
+          ns_count(hire_build_end - hire_build_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "HIRE_SFC_LITE", "after_bulkload", 0, geometries,
+          queries, live_after_bulkload, live_bulkload, initial_count, 0, 0,
+          hire_build_ns, 0, 0,
+          [&](const QueryCase& query_case) {
+            return query_hire_sfc_lite_index(hire_index, geometries,
+                                             live_bulkload, options, true,
+                                             query_case);
+          }));
+      rows.back().block_count = hire_index.leaf_count();
+      rows.back().tree_nodes = hire_index.node_count();
+      rows.back().tree_depth = hire_index.height();
+      rows.back().index_bytes_estimate = hire_index.estimate_bytes();
+      rows.back().stale_block_count =
+          hire_index.debug_stats().tombstone_records;
+      rows.back().local_compaction_count_stage =
+          hire_index.local_rebuild_count();
+      rows.back().note =
+          "HIRE-inspired SFC+1D learned index with conservative extent filtering.";
+      append_hire_sfc_debug_csv(options, rows.back().index,
+                                rows.back().checkpoint,
+                                rows.back().checkpoint_id, hire_index,
+                                rows.back().insert_count);
+      print_compare_summary(rows.back());
+
+      std::size_t hire_insert_success = 0;
+      std::size_t hire_insert_failed = 0;
+      auto hire_insert_start = std::chrono::high_resolution_clock::now();
+      for (ObjectId oid : insert_ids) {
+        if (oid >= geometry_metadata.size()) {
+          ++hire_insert_failed;
+          continue;
+        }
+        const GeometryMeta& meta = geometry_metadata[oid];
+        hire_sfc_lite::RecordInput input;
+        input.id = static_cast<std::size_t>(oid);
+        input.zmin = meta.zmin;
+        input.zmax = meta.zmax;
+        input.box = hire_box_from_envelope(meta.envelope);
+        if (hire_index.insert(input)) {
+          ++hire_insert_success;
+        } else {
+          ++hire_insert_failed;
+        }
+      }
+      auto hire_insert_end = std::chrono::high_resolution_clock::now();
+      long long hire_insert_ns =
+          ns_count(hire_insert_end - hire_insert_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "HIRE_SFC_LITE", "after_insert", 1, geometries,
+          queries, live_after_insert, live_insert, initial_count, insert_count,
+          0, hire_build_ns, hire_insert_ns, 0,
+          [&](const QueryCase& query_case) {
+            return query_hire_sfc_lite_index(hire_index, geometries,
+                                             live_insert, options, true,
+                                             query_case);
+          }));
+      rows.back().success_count = hire_insert_success;
+      rows.back().failed_count = hire_insert_failed;
+      rows.back().block_count = hire_index.leaf_count();
+      rows.back().tree_nodes = hire_index.node_count();
+      rows.back().tree_depth = hire_index.height();
+      rows.back().index_bytes_estimate = hire_index.estimate_bytes();
+      rows.back().stale_block_count =
+          hire_index.debug_stats().tombstone_records;
+      rows.back().local_compaction_count_stage =
+          hire_index.local_rebuild_count();
+      rows.back().note =
+          "HIRE-inspired SFC+1D learned index with conservative extent filtering.";
+      append_hire_sfc_debug_csv(options, rows.back().index,
+                                rows.back().checkpoint,
+                                rows.back().checkpoint_id, hire_index,
+                                rows.back().insert_count);
+      print_compare_summary(rows.back());
+
+      std::size_t hire_delete_success = 0;
+      std::size_t hire_delete_failed = 0;
+      auto hire_delete_start = std::chrono::high_resolution_clock::now();
+      for (ObjectId oid : delete_ids) {
+        if (hire_index.erase(static_cast<std::size_t>(oid))) {
+          ++hire_delete_success;
+        } else {
+          ++hire_delete_failed;
+        }
+      }
+      auto hire_delete_end = std::chrono::high_resolution_clock::now();
+      long long hire_delete_ns =
+          ns_count(hire_delete_end - hire_delete_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "HIRE_SFC_LITE", "after_delete", 2, geometries,
+          queries, live_after_delete, live_delete, initial_count, insert_count,
+          delete_count, hire_build_ns, hire_insert_ns, hire_delete_ns,
+          [&](const QueryCase& query_case) {
+            return query_hire_sfc_lite_index(hire_index, geometries,
+                                             live_delete, options, true,
+                                             query_case);
+          }));
+      rows.back().success_count = hire_delete_success;
+      rows.back().failed_count = hire_delete_failed;
+      rows.back().block_count = hire_index.leaf_count();
+      rows.back().tree_nodes = hire_index.node_count();
+      rows.back().tree_depth = hire_index.height();
+      rows.back().index_bytes_estimate = hire_index.estimate_bytes();
+      rows.back().stale_block_count =
+          hire_index.debug_stats().tombstone_records;
+      rows.back().local_compaction_count_stage =
+          hire_index.local_rebuild_count();
+      rows.back().note =
+          "HIRE-inspired SFC+1D learned index with conservative extent filtering and lazy delete.";
+      append_hire_sfc_debug_csv(options, rows.back().index,
+                                rows.back().checkpoint,
+                                rows.back().checkpoint_id, hire_index,
+                                rows.back().insert_count);
       print_compare_summary(rows.back());
       }
 
