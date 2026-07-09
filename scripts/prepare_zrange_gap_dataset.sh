@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/cmake_build_helpers.sh"
+
 # Generate a synthetic rectangle dataset where Zmin and Zmax are deliberately far apart.
 #
 # The default dataset uses large rectangles over the normal longitude/latitude
@@ -42,7 +46,7 @@ main() {
   echo "AVOID_CLAMP=$AVOID_CLAMP"
 
   if [[ "$AUTO_BUILD" == "1" ]]; then
-    cmake -S . -B "$BUILD_DIR"
+    cmake_configure_build_dir "$BUILD_DIR"
     cmake --build "$BUILD_DIR" --target generate_synthetic_rectangles export_zrange_cdf_wkt -j2
   fi
 
