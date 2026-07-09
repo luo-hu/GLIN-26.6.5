@@ -3053,6 +3053,10 @@ struct FusionDebugStats {
   std::size_t global_guard_probe_count = 0;
   std::size_t global_guard_candidates = 0;
   std::size_t global_guard_live_count = 0;
+  std::size_t global_guard_stale_count = 0;
+  std::size_t global_guard_delta_count = 0;
+  std::size_t global_guard_delta_guarded_count = 0;
+  std::size_t global_guard_delta_rebuild_count = 0;
   int global_guard_fast_path = 0;
   std::size_t pending_rebuild_count = 0;
   std::size_t background_recalibration_count = 0;
@@ -3173,6 +3177,16 @@ class LocalBoundedCompactQueryOverlay {
     if (block == nullptr) {
       block = create_empty_block();
     }
+    if (should_use_fusion_global_guard_fast_path()) {
+      block->delta_ids.push_back(oid);
+      live_[oid] = 1;
+      in_delta_[oid] = 1;
+      object_to_block_[oid] = block;
+      expand_summary_on_insert(block, metadata_[oid]);
+      ++block->live_delta_count;
+      fusion_global_guard_insert(oid);
+      return true;
+    }
     observe_insert_hit(block);
     observe_fusion_insert(block);
     if (try_reuse_deleted_slot(block, oid)) {
@@ -3201,6 +3215,26 @@ class LocalBoundedCompactQueryOverlay {
     ++operation_clock_;
     ++delete_ops_;
     LocalBoundedOverlayBlock* block = object_to_block_[oid];
+    if (should_use_fusion_global_guard_fast_path()) {
+      fusion_global_guard_remove(oid);
+      live_[oid] = 0;
+      object_to_block_[oid] = nullptr;
+      const bool was_delta = oid < in_delta_.size() && in_delta_[oid];
+      if (was_delta) {
+        in_delta_[oid] = 0;
+        if (block != nullptr && block->live_delta_count > 0) {
+          --block->live_delta_count;
+        }
+      }
+      if (block != nullptr) {
+        if (block->live_count > 0) {
+          --block->live_count;
+        }
+        ++block->dead_count;
+        block->stale = true;
+      }
+      return true;
+    }
     const GeometryMeta& meta = metadata_[oid];
     const bool summary_critical =
         block != nullptr && is_summary_critical(*block, meta);
@@ -3544,6 +3578,12 @@ class LocalBoundedCompactQueryOverlay {
     stats.global_guard_probe_count = fusion_global_guard_probe_count_;
     stats.global_guard_candidates = fusion_global_guard_candidates_;
     stats.global_guard_live_count = fusion_global_guard_live_count_;
+    stats.global_guard_stale_count = fusion_global_guard_stale_count_;
+    stats.global_guard_delta_count = fusion_global_delta_ids_.size();
+    stats.global_guard_delta_guarded_count =
+        fusion_global_delta_guarded_count_;
+    stats.global_guard_delta_rebuild_count =
+        fusion_global_delta_rebuild_count_;
     stats.global_guard_fast_path = fusion_global_fast_path_ ? 1 : 0;
     return stats;
   }
@@ -3563,6 +3603,9 @@ class LocalBoundedCompactQueryOverlay {
     }
     if (fusion_global_guard_) {
       bytes += fusion_global_guard_live_count_ * sizeof(RTreeValue) * 2;
+    }
+    if (fusion_global_delta_guard_) {
+      bytes += fusion_global_delta_guarded_count_ * sizeof(RTreeValue) * 2;
     }
     return bytes;
   }
@@ -4169,19 +4212,51 @@ class LocalBoundedCompactQueryOverlay {
                           oid);
     }
     fusion_global_guard_.reset(new RTree(values.begin(), values.end()));
+    fusion_global_delta_guard_.reset();
+    fusion_global_delta_ids_.clear();
     fusion_global_guard_live_count_ = values.size();
+    fusion_global_guard_stale_count_ = 0;
+    fusion_global_delta_guarded_count_ = 0;
+    fusion_global_delta_rebuild_count_ = 0;
     fusion_global_fast_path_ = false;
     fusion_global_probe_count_ = 0;
     fusion_global_probe_ns_ = 0;
     fusion_learned_probe_ns_ = 0;
   }
 
+  void rebuild_fusion_global_delta_guard() {
+    if (!fusion_policy_) {
+      return;
+    }
+    std::vector<RTreeValue> values;
+    values.reserve(fusion_global_delta_ids_.size());
+    for (ObjectId oid : fusion_global_delta_ids_) {
+      if (oid >= live_.size() || !live_[oid]) {
+        continue;
+      }
+      values.emplace_back(boost_box_from_envelope(metadata_[oid].envelope),
+                          oid);
+    }
+    if (values.empty()) {
+      fusion_global_delta_guard_.reset();
+    } else {
+      fusion_global_delta_guard_.reset(new RTree(values.begin(), values.end()));
+    }
+    fusion_global_delta_guarded_count_ = fusion_global_delta_ids_.size();
+    ++fusion_global_delta_rebuild_count_;
+  }
+
   void fusion_global_guard_insert(ObjectId oid) {
     if (!fusion_policy_ || !fusion_global_guard_ || oid >= metadata_.size()) {
       return;
     }
-    fusion_global_guard_->insert(
+    fusion_global_delta_ids_.push_back(oid);
+    if (!fusion_global_delta_guard_) {
+      fusion_global_delta_guard_.reset(new RTree());
+    }
+    fusion_global_delta_guard_->insert(
         std::make_pair(boost_box_from_envelope(metadata_[oid].envelope), oid));
+    fusion_global_delta_guarded_count_ = fusion_global_delta_ids_.size();
     ++fusion_global_guard_live_count_;
   }
 
@@ -4189,10 +4264,11 @@ class LocalBoundedCompactQueryOverlay {
     if (!fusion_policy_ || !fusion_global_guard_ || oid >= metadata_.size()) {
       return;
     }
-    const std::size_t removed = fusion_global_guard_->remove(
-        std::make_pair(boost_box_from_envelope(metadata_[oid].envelope), oid));
-    if (removed > 0 && fusion_global_guard_live_count_ > 0) {
-      --fusion_global_guard_live_count_;
+    // RLR-style lazy deletion: avoid expensive dynamic R-tree removal on the
+    // update path. Queries already filter through live_, so stale guard entries
+    // affect only candidate count until the next full rebuild.
+    if (oid < live_.size() && live_[oid]) {
+      ++fusion_global_guard_stale_count_;
     }
   }
 
@@ -4222,27 +4298,52 @@ class LocalBoundedCompactQueryOverlay {
     const geos::geom::Envelope query_envelope =
         *query_case.geometry->getEnvelopeInternal();
     std::vector<RTreeValue> hits;
-    fusion_global_guard_->query(
-        bgi::intersects(boost_box_from_envelope(query_envelope)),
-        std::back_inserter(hits));
-    result.candidates = hits.size();
     const bool enable_shortcuts = options_.predicate_shortcuts;
-    for (const RTreeValue& hit : hits) {
-      const ObjectId oid = hit.second;
+    auto refine_oid = [&](ObjectId oid) {
       if (oid >= live_.size() || !live_[oid]) {
-        continue;
+        return;
       }
       const GeometryMeta& meta = metadata_[oid];
       ++result.mbr_candidates;
       if (enable_shortcuts && envelope_contains(query_envelope, meta.envelope)) {
         ++result.predicate_shortcuts;
         result.answers.insert(oid);
-        continue;
+        return;
       }
       ++result.exact_calls;
       if (query_case.geometry->intersects(geometries_[oid].get())) {
         result.answers.insert(oid);
       }
+    };
+
+    fusion_global_guard_->query(
+        bgi::intersects(boost_box_from_envelope(query_envelope)),
+        std::back_inserter(hits));
+    result.candidates += hits.size();
+    for (const RTreeValue& hit : hits) {
+      refine_oid(hit.second);
+    }
+    if (fusion_global_delta_guard_) {
+      hits.clear();
+      fusion_global_delta_guard_->query(
+          bgi::intersects(boost_box_from_envelope(query_envelope)),
+          std::back_inserter(hits));
+      result.candidates += hits.size();
+      for (const RTreeValue& hit : hits) {
+        refine_oid(hit.second);
+      }
+    }
+    for (std::size_t i = fusion_global_delta_guarded_count_;
+         i < fusion_global_delta_ids_.size(); ++i) {
+      const ObjectId oid = fusion_global_delta_ids_[i];
+      if (oid >= live_.size() || !live_[oid]) {
+        continue;
+      }
+      if (!envelopes_intersect(metadata_[oid].envelope, query_envelope)) {
+        continue;
+      }
+      ++result.candidates;
+      refine_oid(oid);
     }
     auto end = std::chrono::high_resolution_clock::now();
     result.query_ns = ns_count(end - start);
@@ -4357,6 +4458,9 @@ class LocalBoundedCompactQueryOverlay {
   bool try_reuse_deleted_slot(LocalBoundedOverlayBlock* block, ObjectId oid) {
     if (!fusion_policy_ || block == nullptr || block->dead_count == 0 ||
         oid >= live_.size() || live_[oid]) {
+      return false;
+    }
+    if (fusion_global_fast_path_ || block->dead_count < 8) {
       return false;
     }
     if (delta_contains_id(*block, oid)) {
@@ -4860,7 +4964,12 @@ class LocalBoundedCompactQueryOverlay {
   std::vector<LocalBoundedOverlayBlock*> directory_;
   std::vector<LocalBoundedOverlayBlock*> fusion_rebuild_queue_;
   std::unique_ptr<RTree> fusion_global_guard_;
+  std::unique_ptr<RTree> fusion_global_delta_guard_;
+  std::vector<ObjectId> fusion_global_delta_ids_;
   std::size_t fusion_global_guard_live_count_ = 0;
+  std::size_t fusion_global_guard_stale_count_ = 0;
+  std::size_t fusion_global_delta_guarded_count_ = 0;
+  std::size_t fusion_global_delta_rebuild_count_ = 0;
   std::size_t fusion_global_guard_query_count_ = 0;
   std::size_t fusion_global_guard_probe_count_ = 0;
   std::size_t fusion_global_guard_candidates_ = 0;
@@ -5482,7 +5591,10 @@ void append_deli_fusion_debug_csv(
               "spatial_guard_query_count,spatial_guard_blocks,"
               "spatial_guard_candidates,global_guard_query_count,"
               "global_guard_probe_count,global_guard_candidates,"
-              "global_guard_live_count,global_guard_fast_path,"
+              "global_guard_live_count,global_guard_stale_count,"
+              "global_guard_delta_count,global_guard_delta_guarded_count,"
+              "global_guard_delta_rebuild_count,"
+              "global_guard_fast_path,"
               "pending_rebuild_count,"
               "background_recalibration_count,index_bytes_estimate\n";
   }
@@ -5515,6 +5627,10 @@ void append_deli_fusion_debug_csv(
          << stats.global_guard_probe_count << ","
          << stats.global_guard_candidates << ","
          << stats.global_guard_live_count << ","
+         << stats.global_guard_stale_count << ","
+         << stats.global_guard_delta_count << ","
+         << stats.global_guard_delta_guarded_count << ","
+         << stats.global_guard_delta_rebuild_count << ","
          << stats.global_guard_fast_path << ","
          << stats.pending_rebuild_count << ","
          << stats.background_recalibration_count << ","

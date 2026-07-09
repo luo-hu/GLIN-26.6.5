@@ -176,6 +176,156 @@ update:
   因此查询收益会带来额外更新维护成本。
 ```
 
+### 3.3.2 Update-Light Global Guard
+
+Stage F 引入 update-light 策略，把 RLR 的 lazy deletion 和 SingleStore 的 append-first 思路并入 global guard：
+
+```text
+delete:
+  不再对 global guard 执行 RTree::remove。
+  只更新 live mask，并累加 global_guard_stale_count。
+  query 从 global guard 取到候选后继续用 live mask 过滤 stale entry。
+
+insert:
+  旧版本仍同步写入 overlay delta 和 global guard，保证 fast path 可以立即看到新对象。
+  当 global_guard_fast_path 已经打开时，跳过 deleted-slot reuse 的 compact slot 扫描。
+  这样 insert 更接近 SingleStore append 路径，避免每次为复用 tombstone 扫一个 block。
+
+query:
+  继续使用 global guard fast path。
+  stale entry 只增加少量候选过滤成本，不影响正确性。
+```
+
+当前 smoke 结果：
+
+```text
+results/smoke_fusion_update_light
+
+CHECK_CORRECTNESS=1, answers_match_boost 全部为 1。
+
+read_heavy / mixed_20000:
+  AW 0p01pct: q=0.0622 ms, insert_tps=465K, delete_tps=1.39M
+  AW 0p1pct:  q=0.0854 ms, insert_tps=380K, delete_tps=1.16M
+  LW 0p01pct: q=0.0183 ms, insert_tps=444K, delete_tps=1.51M
+  LW 0p1pct:  q=0.0307 ms, insert_tps=492K, delete_tps=1.45M
+
+write_heavy / mixed_20000:
+  AW 0p01pct: q=0.0913 ms, insert_tps=542K, delete_tps=1.91M
+  AW 0p1pct:  q=0.1063 ms, insert_tps=552K, delete_tps=1.92M
+  LW 0p01pct: q=0.0175 ms, insert_tps=646K, delete_tps=2.14M
+  LW 0p1pct:  q=0.0307 ms, insert_tps=733K, delete_tps=2.53M
+```
+
+结论：
+
+```text
+Update-Light Global Guard 明显改善 Fusion 的 insert/delete latency。
+RLR-Lite-CS-Split 的 delete 仍然更强，因为它几乎只做 mask update；
+SingleStore-Cost 的 insert 仍然更强，因为它没有同步维护 global guard。
+Fusion 的折中点是：保留 global guard 查询优势，同时把 delete 从同步树删除降为 lazy mask。
+
+后续可选增强：
+  当 global_guard_stale_count / global_guard_live_count 超过阈值时，
+  在 checkpoint 外或单独 ablation 中测试 global guard rebuild。
+  注意不要把 rebuild 直接塞进普通 query/update latency，否则会污染 tail latency。
+```
+
+### 3.3.3 Single Delta Guard + Fast-Path Light Updates
+
+Stage G/H 继续把 global guard 的 update path 降低到更接近 SingleStore/RLR：
+
+```text
+base global guard:
+  bulk-load 后冻结，不再对每次 insert 做 RTree::insert。
+
+insert:
+  新对象追加到 fusion_global_delta_ids。
+  同时插入一个独立的 mutable delta R-tree。
+  delta tree 只包含新增对象，规模远小于 base global guard，
+  因此避免了直接向 25 万级 base R-tree 做 per-insert 更新。
+
+delete:
+  继续只更新 live mask 和 stale counter。
+
+query:
+  base global guard query
+  + single delta guard query
+  + live mask / PRL shortcut / GEOS refine
+
+fast-path light update:
+  global_guard_fast_path 打开后，insert/delete 只维护 correctness 必需状态：
+    live mask
+    object_to_block
+    local delta/dead/live counters
+    conservative block summary
+    global delta guard metadata
+  跳过局部 compaction、mode stats、pending rebuild 和 background recalibration。
+```
+
+这样做的动机：
+
+```text
+SingleStore-Cost 的 insert 快，是因为它不维护全局空间树。
+RLR 的 delete 快，是因为它基本只做 mask/lazy delete。
+Fusion 若想保住 global guard 的 query 优势，就不能完全变成二者；
+但可以把全局树更新从同步更新大 base R-tree 变成更新小 delta R-tree，
+并在 fast path 后停止为几乎不用的 learned overlay 支付前台维护成本。
+```
+
+反例记录：
+
+```text
+不要每隔 N 次 insert 就把全部 delta ids 重新 bulk-load 成一个 delta R-tree。
+
+在 results/dynamic_compare_mixed_0.5m_cost_dp_prl_zgapmixed34 中：
+  AW/write_heavy/0p01pct/mixed_200000
+  global_guard_delta_count ~= 50K
+  global_guard_delta_rebuild_count = 49
+  insert_tps 只有约 118K
+
+原因是累计重建成本接近 1K + 2K + ... + 50K，规模上来后退化成近似二次成本。
+
+第二个反例：
+
+不要把 delta 切成过多 immutable chunks。
+
+在 0.5M read-heavy/balanced/write-heavy 下，delta chunk 数可达到 19/29/49。
+低选择性 query 本身候选很少，固定 probe 多个小 R-tree 的成本会主导 latency。
+因此最终采用 single mutable delta guard：query 只 probe base + delta 两棵树。
+```
+
+当前 smoke 结果：
+
+```text
+results/smoke_fusion_single_delta_correctness
+results/smoke_fusion_single_delta_0.5m_aw_read_low
+results/smoke_fusion_single_delta_0.5m_aw_write
+
+CHECK_CORRECTNESS=1, answers_match_boost 全部为 1。
+
+0.5M AW / read_heavy / 0p001pct / mixed_100000:
+  Fusion: q=0.045 ms, insert_tps=427K, delete_tps=1.50M, overall=24.5K
+  Boost:  q=0.047 ms, insert_tps=384K, delete_tps=0.43M, overall=23.3K
+  SingleStore-Cost: q=0.050 ms, insert_tps=1.20M, delete_tps=1.51M, overall=22.1K
+
+0.5M AW / write_heavy / 0p01pct / mixed_100000:
+  Fusion: q=0.071 ms, insert_tps=524K, delete_tps=1.84M, overall=27.6K
+  Boost:  q=0.093 ms, insert_tps=408K, delete_tps=0.42M, overall=20.9K
+  SingleStore-Cost: q=0.090 ms, insert_tps=1.32M, delete_tps=1.87M, overall=22.1K
+```
+
+结论：
+
+```text
+Single delta guard 优先恢复低选择性 query latency，并保留较高 overall throughput。
+SingleStore-Cost 仍可能在 insert 上领先，因为它不维护任何空间 guard。
+RLR 仍会在 delete 上领先，因为 Fusion 仍维护 block-level correctness counters 和全局 stale accounting。
+后续若要继续追 update，可以做一个更激进的 ablation：
+  guard-dominant mode 下允许 object_to_block/local counters 延迟修复，
+  只用 live mask + global guard 保证查询正确性。
+但这会影响 validate/debug 指标，应单独作为 ablation，不应直接替换主版本。
+```
+
 当前 smoke 结果：
 
 ```text
