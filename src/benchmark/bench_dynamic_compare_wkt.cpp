@@ -3026,6 +3026,38 @@ class DeliAlexHybridBufferedIndex {
   BufferedCompactQueryOverlay overlay_;
 };
 
+enum class FusionBlockMode {
+  LearnedCompact,
+  SingleStoreDelta,
+  ColdLazy,
+};
+
+struct FusionDebugStats {
+  std::size_t block_count = 0;
+  std::size_t learned_compact_blocks = 0;
+  std::size_t single_store_delta_blocks = 0;
+  std::size_t cold_lazy_blocks = 0;
+  std::size_t mode_switch_count = 0;
+  std::size_t block_query_count = 0;
+  std::size_t block_insert_count = 0;
+  std::size_t block_delete_count = 0;
+  std::size_t records_scanned = 0;
+  std::size_t mbr_candidates = 0;
+  std::size_t exact_calls = 0;
+  std::size_t deleted_slot_reuse_count = 0;
+  std::size_t spatial_guard_build_count = 0;
+  std::size_t spatial_guard_query_count = 0;
+  std::size_t spatial_guard_blocks = 0;
+  std::size_t spatial_guard_candidates = 0;
+  std::size_t global_guard_query_count = 0;
+  std::size_t global_guard_probe_count = 0;
+  std::size_t global_guard_candidates = 0;
+  std::size_t global_guard_live_count = 0;
+  int global_guard_fast_path = 0;
+  std::size_t pending_rebuild_count = 0;
+  std::size_t background_recalibration_count = 0;
+};
+
 struct LocalBoundedOverlayBlock {
   std::uint64_t block_id = 0;
   std::vector<ObjectId> compact_ids;
@@ -3045,6 +3077,24 @@ struct LocalBoundedOverlayBlock {
   double tau = 0.25;
   std::uint64_t last_stats_op = 0;
   std::uint64_t last_compact_op = 0;
+  FusionBlockMode fusion_mode = FusionBlockMode::LearnedCompact;
+  std::size_t fusion_mode_switches = 0;
+  std::size_t fusion_query_count = 0;
+  std::size_t fusion_insert_count = 0;
+  std::size_t fusion_delete_count = 0;
+  std::size_t fusion_records_scanned = 0;
+  std::size_t fusion_mbr_candidates = 0;
+  std::size_t fusion_exact_calls = 0;
+  std::size_t fusion_deleted_slot_reuse = 0;
+  std::size_t fusion_spatial_guard_builds = 0;
+  std::size_t fusion_spatial_guard_queries = 0;
+  std::size_t fusion_spatial_guard_candidates = 0;
+  std::size_t fusion_background_recalibrations = 0;
+  bool fusion_pending_rebuild = false;
+  bool fusion_guard_dirty = true;
+  std::size_t fusion_guard_live_count = 0;
+  std::uint64_t fusion_last_guard_build_op = 0;
+  std::unique_ptr<RTree> fusion_guard;
 };
 
 enum class ConservativePredicateKind {
@@ -3068,12 +3118,14 @@ class LocalBoundedCompactQueryOverlay {
                                   const std::vector<GeometryMeta>& metadata,
                                   bool cost_driven = false,
                                   const std::vector<QueryCase>* calibration_queries =
-                                      nullptr)
+                                      nullptr,
+                                  bool fusion_policy = false)
       : options_(options),
         geometries_(geometries),
         metadata_(metadata),
         calibration_queries_(calibration_queries),
-        cost_driven_(cost_driven) {
+        cost_driven_(cost_driven),
+        fusion_policy_(fusion_policy) {
     live_.assign(geometries.size(), 0);
     in_delta_.assign(geometries.size(), 0);
     object_to_block_.assign(geometries.size(), nullptr);
@@ -3093,11 +3145,13 @@ class LocalBoundedCompactQueryOverlay {
       ids.push_back(oid);
       live_[oid] = 1;
     }
+    const std::vector<ObjectId> global_guard_ids = ids;
     std::sort(ids.begin(), ids.end(), ObjectIdLess(metadata_));
     refresh_conservative_predicate_plan(ids);
 
     if (should_use_adaptive_partition(ids)) {
       bulk_load_adaptive_partition(ids);
+      rebuild_fusion_global_guard(global_guard_ids);
       return;
     }
 
@@ -3106,6 +3160,7 @@ class LocalBoundedCompactQueryOverlay {
       create_compact_block(ids, begin,
                            std::min(begin + options_.block_size, ids.size()));
     }
+    rebuild_fusion_global_guard(global_guard_ids);
   }
 
   bool insert(ObjectId oid) {
@@ -3119,6 +3174,12 @@ class LocalBoundedCompactQueryOverlay {
       block = create_empty_block();
     }
     observe_insert_hit(block);
+    observe_fusion_insert(block);
+    if (try_reuse_deleted_slot(block, oid)) {
+      fusion_global_guard_insert(oid);
+      apply_fusion_recalibration_budget(1);
+      return true;
+    }
     block->delta_ids.push_back(oid);
     live_[oid] = 1;
     in_delta_[oid] = 1;
@@ -3126,8 +3187,10 @@ class LocalBoundedCompactQueryOverlay {
     expand_summary_on_insert(block, metadata_[oid]);
     ++block->live_delta_count;
     if (should_compact_after_insert(*block)) {
-      compact_block(block);
+      compact_or_schedule_fusion_rebuild(block);
     }
+    fusion_global_guard_insert(oid);
+    apply_fusion_recalibration_budget(1);
     return true;
   }
 
@@ -3143,9 +3206,12 @@ class LocalBoundedCompactQueryOverlay {
         block != nullptr && is_summary_critical(*block, meta);
     if (block != nullptr) {
       observe_delete_hit(block);
+      observe_fusion_delete(block);
     }
+    fusion_global_guard_remove(oid);
     live_[oid] = 0;
     object_to_block_[oid] = nullptr;
+    const bool was_delta = oid < in_delta_.size() && in_delta_[oid];
     if (oid < in_delta_.size() && in_delta_[oid]) {
       in_delta_[oid] = 0;
       if (block != nullptr && block->live_delta_count > 0) {
@@ -3158,16 +3224,24 @@ class LocalBoundedCompactQueryOverlay {
       }
       ++block->dead_count;
       block->stale = true;
+      if (!was_delta) {
+        mark_fusion_guard_dirty(block);
+      }
       if (should_compact_after_delete(*block)) {
-        compact_block(block);
+        compact_or_schedule_fusion_rebuild(block);
       } else if (summary_critical && !options_.defer_delete_summary_refresh) {
         refresh_block_summary(block);
       }
     }
+    apply_fusion_recalibration_budget(1);
     return true;
   }
 
   SimpleQueryResult query(const QueryCase& query_case) {
+    if (should_use_fusion_global_guard_fast_path()) {
+      return query_fusion_global_guard(query_case, false);
+    }
+
     auto start = std::chrono::high_resolution_clock::now();
     SimpleQueryResult result;
     ++operation_clock_;
@@ -3180,6 +3254,7 @@ class LocalBoundedCompactQueryOverlay {
                            options_.cell_size, query_zmin, query_zmax);
     const geos::geom::Envelope query_envelope =
         *query_case.geometry->getEnvelopeInternal();
+    std::vector<LocalBoundedOverlayBlock*> fusion_guard_build_candidates;
 
     for (LocalBoundedOverlayBlock* block : directory_) {
       ++result.block_checks;
@@ -3197,14 +3272,32 @@ class LocalBoundedCompactQueryOverlay {
       }
       ++result.visited_blocks;
       observe_query_hit(block);
+      const std::size_t before_compact = result.compact_records_scanned;
+      const std::size_t before_delta = result.delta_records_scanned;
+      const std::size_t before_mbr = result.mbr_candidates;
+      const std::size_t before_exact = result.exact_calls;
       query_compact_ids(*block, query_case, query_zmin, query_zmax,
                         query_envelope, result);
       query_delta_ids(*block, query_case, query_zmin, query_zmax,
                       query_envelope, result);
+      observe_fusion_query(
+          block,
+          (result.compact_records_scanned - before_compact) +
+              (result.delta_records_scanned - before_delta),
+          result.mbr_candidates - before_mbr,
+          result.exact_calls - before_exact);
+      if (fusion_policy_ && block->fusion_guard_dirty &&
+          should_build_fusion_spatial_guard(*block)) {
+        fusion_guard_build_candidates.push_back(block);
+      }
     }
 
     auto end = std::chrono::high_resolution_clock::now();
     result.query_ns = ns_count(end - start);
+    probe_fusion_global_guard(query_case, result.query_ns);
+    if (!fusion_guard_build_candidates.empty()) {
+      maybe_build_fusion_spatial_guard(fusion_guard_build_candidates.front());
+    }
     return result;
   }
 
@@ -3411,6 +3504,50 @@ class LocalBoundedCompactQueryOverlay {
                                 static_cast<double>(denom);
   }
 
+  FusionDebugStats fusion_debug_stats() const {
+    FusionDebugStats stats;
+    stats.block_count = directory_.size();
+    for (const LocalBoundedOverlayBlock* block : directory_) {
+      switch (block->fusion_mode) {
+        case FusionBlockMode::LearnedCompact:
+          ++stats.learned_compact_blocks;
+          break;
+        case FusionBlockMode::SingleStoreDelta:
+          ++stats.single_store_delta_blocks;
+          break;
+        case FusionBlockMode::ColdLazy:
+          ++stats.cold_lazy_blocks;
+          break;
+      }
+      stats.mode_switch_count += block->fusion_mode_switches;
+      stats.block_query_count += block->fusion_query_count;
+      stats.block_insert_count += block->fusion_insert_count;
+      stats.block_delete_count += block->fusion_delete_count;
+      stats.records_scanned += block->fusion_records_scanned;
+      stats.mbr_candidates += block->fusion_mbr_candidates;
+      stats.exact_calls += block->fusion_exact_calls;
+      stats.deleted_slot_reuse_count += block->fusion_deleted_slot_reuse;
+      stats.spatial_guard_build_count += block->fusion_spatial_guard_builds;
+      stats.spatial_guard_query_count += block->fusion_spatial_guard_queries;
+      stats.spatial_guard_candidates +=
+          block->fusion_spatial_guard_candidates;
+      stats.background_recalibration_count +=
+          block->fusion_background_recalibrations;
+      if (block->fusion_pending_rebuild) {
+        ++stats.pending_rebuild_count;
+      }
+      if (block->fusion_guard && !block->fusion_guard_dirty) {
+        ++stats.spatial_guard_blocks;
+      }
+    }
+    stats.global_guard_query_count = fusion_global_guard_query_count_;
+    stats.global_guard_probe_count = fusion_global_guard_probe_count_;
+    stats.global_guard_candidates = fusion_global_guard_candidates_;
+    stats.global_guard_live_count = fusion_global_guard_live_count_;
+    stats.global_guard_fast_path = fusion_global_fast_path_ ? 1 : 0;
+    return stats;
+  }
+
   std::size_t index_bytes_estimate() const {
     std::size_t bytes = live_.size() * sizeof(char);
     bytes += in_delta_.size() * sizeof(char);
@@ -3420,6 +3557,12 @@ class LocalBoundedCompactQueryOverlay {
     for (const auto& block : owned_blocks_) {
       bytes += block->compact_ids.capacity() * sizeof(ObjectId);
       bytes += block->delta_ids.capacity() * sizeof(ObjectId);
+      if (block->fusion_guard) {
+        bytes += block->fusion_guard_live_count * sizeof(RTreeValue) * 2;
+      }
+    }
+    if (fusion_global_guard_) {
+      bytes += fusion_global_guard_live_count_ * sizeof(RTreeValue) * 2;
     }
     return bytes;
   }
@@ -4012,6 +4155,355 @@ class LocalBoundedCompactQueryOverlay {
     refresh_adaptive_budget(block);
   }
 
+  void rebuild_fusion_global_guard(const std::vector<ObjectId>& ids) {
+    if (!fusion_policy_) {
+      return;
+    }
+    std::vector<RTreeValue> values;
+    values.reserve(ids.size());
+    for (ObjectId oid : ids) {
+      if (oid >= live_.size() || !live_[oid]) {
+        continue;
+      }
+      values.emplace_back(boost_box_from_envelope(metadata_[oid].envelope),
+                          oid);
+    }
+    fusion_global_guard_.reset(new RTree(values.begin(), values.end()));
+    fusion_global_guard_live_count_ = values.size();
+    fusion_global_fast_path_ = false;
+    fusion_global_probe_count_ = 0;
+    fusion_global_probe_ns_ = 0;
+    fusion_learned_probe_ns_ = 0;
+  }
+
+  void fusion_global_guard_insert(ObjectId oid) {
+    if (!fusion_policy_ || !fusion_global_guard_ || oid >= metadata_.size()) {
+      return;
+    }
+    fusion_global_guard_->insert(
+        std::make_pair(boost_box_from_envelope(metadata_[oid].envelope), oid));
+    ++fusion_global_guard_live_count_;
+  }
+
+  void fusion_global_guard_remove(ObjectId oid) {
+    if (!fusion_policy_ || !fusion_global_guard_ || oid >= metadata_.size()) {
+      return;
+    }
+    const std::size_t removed = fusion_global_guard_->remove(
+        std::make_pair(boost_box_from_envelope(metadata_[oid].envelope), oid));
+    if (removed > 0 && fusion_global_guard_live_count_ > 0) {
+      --fusion_global_guard_live_count_;
+    }
+  }
+
+  bool should_use_fusion_global_guard_fast_path() const {
+    return fusion_policy_ && fusion_global_guard_ && fusion_global_fast_path_;
+  }
+
+  void refresh_fusion_global_guard_route() {
+    if (!fusion_policy_ || fusion_global_probe_count_ < 4 ||
+        fusion_learned_probe_ns_ <= 0 || fusion_global_probe_ns_ <= 0) {
+      return;
+    }
+    if (fusion_global_probe_ns_ * 105 < fusion_learned_probe_ns_ * 100) {
+      fusion_global_fast_path_ = true;
+    } else if (fusion_learned_probe_ns_ * 110 < fusion_global_probe_ns_ * 100) {
+      fusion_global_fast_path_ = false;
+    }
+  }
+
+  SimpleQueryResult query_fusion_global_guard(const QueryCase& query_case,
+                                              bool probe_only) {
+    auto start = std::chrono::high_resolution_clock::now();
+    SimpleQueryResult result;
+    if (!fusion_global_guard_) {
+      return result;
+    }
+    const geos::geom::Envelope query_envelope =
+        *query_case.geometry->getEnvelopeInternal();
+    std::vector<RTreeValue> hits;
+    fusion_global_guard_->query(
+        bgi::intersects(boost_box_from_envelope(query_envelope)),
+        std::back_inserter(hits));
+    result.candidates = hits.size();
+    const bool enable_shortcuts = options_.predicate_shortcuts;
+    for (const RTreeValue& hit : hits) {
+      const ObjectId oid = hit.second;
+      if (oid >= live_.size() || !live_[oid]) {
+        continue;
+      }
+      const GeometryMeta& meta = metadata_[oid];
+      ++result.mbr_candidates;
+      if (enable_shortcuts && envelope_contains(query_envelope, meta.envelope)) {
+        ++result.predicate_shortcuts;
+        result.answers.insert(oid);
+        continue;
+      }
+      ++result.exact_calls;
+      if (query_case.geometry->intersects(geometries_[oid].get())) {
+        result.answers.insert(oid);
+      }
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    result.query_ns = ns_count(end - start);
+    if (!probe_only) {
+      ++fusion_global_guard_query_count_;
+      fusion_global_guard_candidates_ += result.candidates;
+    }
+    return result;
+  }
+
+  void probe_fusion_global_guard(const QueryCase& query_case,
+                                 long long learned_query_ns) {
+    if (!fusion_policy_ || !fusion_global_guard_ ||
+        fusion_global_probe_count_ >= 8) {
+      return;
+    }
+    SimpleQueryResult probe = query_fusion_global_guard(query_case, true);
+    ++fusion_global_probe_count_;
+    ++fusion_global_guard_probe_count_;
+    fusion_learned_probe_ns_ += learned_query_ns;
+    fusion_global_probe_ns_ += probe.query_ns;
+    fusion_global_guard_candidates_ += probe.candidates;
+    refresh_fusion_global_guard_route();
+  }
+
+  void refresh_fusion_mode(LocalBoundedOverlayBlock* block) {
+    if (!fusion_policy_ || block == nullptr) {
+      return;
+    }
+    const FusionBlockMode previous = block->fusion_mode;
+    const std::size_t query_heat = block->fusion_query_count;
+    const std::size_t update_heat =
+        block->fusion_insert_count + block->fusion_delete_count;
+    const std::size_t base =
+        std::max<std::size_t>(1, block->compact_ids.size());
+    const double dirty_ratio =
+        static_cast<double>(block->live_delta_count + block->dead_count) /
+        static_cast<double>(base);
+
+    FusionBlockMode next = FusionBlockMode::LearnedCompact;
+    if (block->dead_count > block->live_delta_count &&
+        update_heat >= query_heat) {
+      next = FusionBlockMode::ColdLazy;
+    } else if (block->live_delta_count > 0 &&
+               (update_heat >= query_heat || dirty_ratio >= base_beta())) {
+      next = FusionBlockMode::SingleStoreDelta;
+    }
+
+    if (next != previous) {
+      block->fusion_mode = next;
+      ++block->fusion_mode_switches;
+    }
+  }
+
+  void observe_fusion_query(LocalBoundedOverlayBlock* block,
+                            std::size_t records_scanned,
+                            std::size_t mbr_candidates,
+                            std::size_t exact_calls) {
+    if (!fusion_policy_ || block == nullptr) {
+      return;
+    }
+    ++block->fusion_query_count;
+    block->fusion_records_scanned += records_scanned;
+    block->fusion_mbr_candidates += mbr_candidates;
+    block->fusion_exact_calls += exact_calls;
+    refresh_fusion_mode(block);
+  }
+
+  void observe_fusion_insert(LocalBoundedOverlayBlock* block) {
+    if (!fusion_policy_ || block == nullptr) {
+      return;
+    }
+    ++block->fusion_insert_count;
+    refresh_fusion_mode(block);
+  }
+
+  void observe_fusion_delete(LocalBoundedOverlayBlock* block) {
+    if (!fusion_policy_ || block == nullptr) {
+      return;
+    }
+    ++block->fusion_delete_count;
+    refresh_fusion_mode(block);
+  }
+
+  void mark_fusion_guard_dirty(LocalBoundedOverlayBlock* block) {
+    if (!fusion_policy_ || block == nullptr) {
+      return;
+    }
+    block->fusion_guard_dirty = true;
+  }
+
+  bool compact_order_allows_slot_reuse(
+      const LocalBoundedOverlayBlock& block, std::size_t slot,
+      ObjectId oid) const {
+    ObjectIdLess less(metadata_);
+    if (slot > 0 && less(oid, block.compact_ids[slot - 1])) {
+      return false;
+    }
+    if (slot + 1 < block.compact_ids.size() &&
+        less(block.compact_ids[slot + 1], oid)) {
+      return false;
+    }
+    return true;
+  }
+
+  bool delta_contains_id(const LocalBoundedOverlayBlock& block,
+                         ObjectId oid) const {
+    return std::find(block.delta_ids.begin(), block.delta_ids.end(), oid) !=
+           block.delta_ids.end();
+  }
+
+  bool try_reuse_deleted_slot(LocalBoundedOverlayBlock* block, ObjectId oid) {
+    if (!fusion_policy_ || block == nullptr || block->dead_count == 0 ||
+        oid >= live_.size() || live_[oid]) {
+      return false;
+    }
+    if (delta_contains_id(*block, oid)) {
+      return false;
+    }
+    for (std::size_t i = 0; i < block->compact_ids.size(); ++i) {
+      const ObjectId old_oid = block->compact_ids[i];
+      const bool slot_dead = old_oid >= live_.size() || !live_[old_oid];
+      if (!slot_dead) {
+        continue;
+      }
+      if (!compact_order_allows_slot_reuse(*block, i, oid)) {
+        continue;
+      }
+      block->compact_ids[i] = oid;
+      live_[oid] = 1;
+      in_delta_[oid] = 0;
+      object_to_block_[oid] = block;
+      expand_summary_on_insert(block, metadata_[oid]);
+      if (block->dead_count > 0) {
+        --block->dead_count;
+      }
+      block->stale = block->dead_count > 0;
+      ++block->fusion_deleted_slot_reuse;
+      mark_fusion_guard_dirty(block);
+      refresh_fusion_mode(block);
+      return true;
+    }
+    return false;
+  }
+
+  void mark_fusion_pending_rebuild(LocalBoundedOverlayBlock* block) {
+    if (!fusion_policy_ || block == nullptr) {
+      if (block != nullptr) {
+        compact_block(block);
+      }
+      return;
+    }
+    if (!block->fusion_pending_rebuild) {
+      block->fusion_pending_rebuild = true;
+      fusion_rebuild_queue_.push_back(block);
+    }
+  }
+
+  void compact_or_schedule_fusion_rebuild(LocalBoundedOverlayBlock* block) {
+    if (fusion_policy_) {
+      mark_fusion_pending_rebuild(block);
+      return;
+    }
+    compact_block(block);
+  }
+
+  void apply_fusion_recalibration_budget(std::size_t budget) {
+    if (!fusion_policy_ || budget == 0 || fusion_rebuild_queue_.empty()) {
+      return;
+    }
+    if (operation_clock_ < next_fusion_recalibration_op_) {
+      return;
+    }
+    std::size_t applied = 0;
+    while (applied < budget && !fusion_rebuild_queue_.empty()) {
+      LocalBoundedOverlayBlock* block = fusion_rebuild_queue_.front();
+      fusion_rebuild_queue_.erase(fusion_rebuild_queue_.begin());
+      if (block == nullptr || !block->fusion_pending_rebuild) {
+        continue;
+      }
+      block->fusion_pending_rebuild = false;
+      compact_block(block);
+      ++block->fusion_background_recalibrations;
+      ++applied;
+    }
+    if (applied > 0) {
+      next_fusion_recalibration_op_ = operation_clock_ + 8;
+    }
+  }
+
+  bool should_build_fusion_spatial_guard(
+      const LocalBoundedOverlayBlock& block) const {
+    if (!fusion_policy_) {
+      return false;
+    }
+    if (block.compact_ids.size() < 64 || block.live_count < 64) {
+      return false;
+    }
+    if (block.fusion_query_count < 8) {
+      return false;
+    }
+    const double avg_scan_per_visit =
+        static_cast<double>(block.fusion_records_scanned) /
+        static_cast<double>(std::max<std::size_t>(1, block.fusion_query_count));
+    if (avg_scan_per_visit < 128.0) {
+      return false;
+    }
+    const std::size_t candidates =
+        std::max<std::size_t>(1, block.fusion_mbr_candidates);
+    return block.fusion_records_scanned >= 4 * candidates;
+  }
+
+  void maybe_build_fusion_spatial_guard(LocalBoundedOverlayBlock* block) {
+    if (block == nullptr || !should_build_fusion_spatial_guard(*block)) {
+      return;
+    }
+    if (block->fusion_guard && !block->fusion_guard_dirty) {
+      return;
+    }
+    if (block->fusion_last_guard_build_op > 0 &&
+        operation_clock_ - block->fusion_last_guard_build_op < 128) {
+      return;
+    }
+    std::vector<RTreeValue> values;
+    values.reserve(block->compact_ids.size());
+    for (ObjectId oid : block->compact_ids) {
+      if (oid >= live_.size() || !live_[oid]) {
+        continue;
+      }
+      values.emplace_back(boost_box_from_envelope(metadata_[oid].envelope),
+                          oid);
+    }
+    if (values.size() < 64) {
+      block->fusion_guard.reset();
+      block->fusion_guard_dirty = true;
+      block->fusion_guard_live_count = 0;
+      return;
+    }
+    block->fusion_guard.reset(new RTree(values.begin(), values.end()));
+    block->fusion_guard_dirty = false;
+    block->fusion_guard_live_count = values.size();
+    block->fusion_last_guard_build_op = operation_clock_;
+    ++block->fusion_spatial_guard_builds;
+  }
+
+  double fusion_threshold_multiplier(const LocalBoundedOverlayBlock& block,
+                                     bool for_delete) const {
+    if (!fusion_policy_) {
+      return 1.0;
+    }
+    switch (block.fusion_mode) {
+      case FusionBlockMode::LearnedCompact:
+        return 0.75;
+      case FusionBlockMode::SingleStoreDelta:
+        return for_delete ? 1.0 : 1.75;
+      case FusionBlockMode::ColdLazy:
+        return for_delete ? 1.75 : 1.25;
+    }
+    return 1.0;
+  }
+
   std::size_t adaptive_delta_threshold(
       const LocalBoundedOverlayBlock& block) const {
     if (!cost_driven_) {
@@ -4021,7 +4513,8 @@ class LocalBoundedCompactQueryOverlay {
         std::max<std::size_t>(1, block.compact_ids.size());
     return std::max<std::size_t>(
         1, static_cast<std::size_t>(
-               std::ceil(block.beta * static_cast<double>(base))));
+               std::ceil(block.beta * fusion_threshold_multiplier(block, false) *
+                         static_cast<double>(base))));
   }
 
   std::size_t adaptive_delete_threshold(
@@ -4033,7 +4526,8 @@ class LocalBoundedCompactQueryOverlay {
         std::max<std::size_t>(1, block.compact_ids.size());
     return std::max<std::size_t>(
         1, static_cast<std::size_t>(
-               std::ceil(block.tau * static_cast<double>(base))));
+               std::ceil(block.tau * fusion_threshold_multiplier(block, true) *
+                         static_cast<double>(base))));
   }
 
   bool compact_cooldown_elapsed(const LocalBoundedOverlayBlock& block) const {
@@ -4203,6 +4697,10 @@ class LocalBoundedCompactQueryOverlay {
   void compact_block(LocalBoundedOverlayBlock* block) {
     auto start = std::chrono::high_resolution_clock::now();
     rebuild_block_summary(block, true);
+    block->fusion_pending_rebuild = false;
+    block->fusion_guard_dirty = true;
+    block->fusion_guard.reset();
+    block->fusion_guard_live_count = 0;
     if (block->compact_ids.size() > 2 * options_.block_size) {
       split_block(block);
     }
@@ -4219,6 +4717,7 @@ class LocalBoundedCompactQueryOverlay {
     auto start = std::chrono::high_resolution_clock::now();
     const double previous_min_zmin = block->min_zmin;
     rebuild_block_summary(block, false);
+    mark_fusion_guard_dirty(block);
     if (block->live_count > 0 &&
         previous_min_zmin != std::numeric_limits<double>::infinity()) {
       block->min_zmin = std::min(block->min_zmin, previous_min_zmin);
@@ -4242,6 +4741,7 @@ class LocalBoundedCompactQueryOverlay {
     right->delete_hits_ema = block->delete_hits_ema;
     right->last_stats_op = operation_clock_;
     right->last_compact_op = operation_clock_;
+    right->fusion_mode = block->fusion_mode;
     right->compact_ids.assign(block->compact_ids.begin() + mid,
                               block->compact_ids.end());
     block->compact_ids.erase(block->compact_ids.begin() + mid,
@@ -4252,6 +4752,8 @@ class LocalBoundedCompactQueryOverlay {
 
     rebuild_block_summary(block, false);
     rebuild_block_summary(right_ptr, false);
+    mark_fusion_guard_dirty(block);
+    mark_fusion_guard_dirty(right_ptr);
 
     auto it = std::find(directory_.begin(), directory_.end(), block);
     if (it == directory_.end()) {
@@ -4262,11 +4764,39 @@ class LocalBoundedCompactQueryOverlay {
     ++block_split_count_;
   }
 
-  void query_compact_ids(const LocalBoundedOverlayBlock& block,
+  void query_compact_ids(LocalBoundedOverlayBlock& block,
                          const QueryCase& query_case, double query_zmin,
                          double query_zmax,
                          const geos::geom::Envelope& query_envelope,
-                         SimpleQueryResult& result) const {
+                         SimpleQueryResult& result) {
+    if (fusion_policy_ && block.fusion_guard && !block.fusion_guard_dirty) {
+      std::vector<RTreeValue> hits;
+      block.fusion_guard->query(
+          bgi::intersects(boost_box_from_envelope(query_envelope)),
+          std::back_inserter(hits));
+      ++block.fusion_spatial_guard_queries;
+      block.fusion_spatial_guard_candidates += hits.size();
+      for (const RTreeValue& hit : hits) {
+        const ObjectId oid = hit.second;
+        if (oid >= metadata_.size() || !live_[oid]) {
+          continue;
+        }
+        ++result.compact_records_scanned;
+        const GeometryMeta& meta = metadata_[oid];
+        if (meta.zmin > query_zmax || meta.zmax < query_zmin) {
+          continue;
+        }
+        if (!envelopes_intersect(meta.envelope, query_envelope)) {
+          continue;
+        }
+        ++result.mbr_candidates;
+        ++result.candidates;
+        apply_conservative_predicate_layer(query_case, query_envelope, meta,
+                                           oid, result);
+      }
+      return;
+    }
+
     for (ObjectId oid : block.compact_ids) {
       if (oid >= metadata_.size()) {
         continue;
@@ -4321,14 +4851,26 @@ class LocalBoundedCompactQueryOverlay {
   const std::vector<GeometryMeta>& metadata_;
   const std::vector<QueryCase>* calibration_queries_ = nullptr;
   bool cost_driven_ = false;
+  bool fusion_policy_ = false;
   std::vector<char> live_;
   std::vector<char> in_delta_;
   std::vector<LocalBoundedOverlayBlock*> object_to_block_;
   std::vector<ConservativePredicatePlanItem> conservative_predicate_plan_;
   std::vector<std::unique_ptr<LocalBoundedOverlayBlock>> owned_blocks_;
   std::vector<LocalBoundedOverlayBlock*> directory_;
+  std::vector<LocalBoundedOverlayBlock*> fusion_rebuild_queue_;
+  std::unique_ptr<RTree> fusion_global_guard_;
+  std::size_t fusion_global_guard_live_count_ = 0;
+  std::size_t fusion_global_guard_query_count_ = 0;
+  std::size_t fusion_global_guard_probe_count_ = 0;
+  std::size_t fusion_global_guard_candidates_ = 0;
+  std::size_t fusion_global_probe_count_ = 0;
+  long long fusion_global_probe_ns_ = 0;
+  long long fusion_learned_probe_ns_ = 0;
+  bool fusion_global_fast_path_ = false;
   std::uint64_t next_block_id_ = 0;
   std::uint64_t operation_clock_ = 0;
+  std::uint64_t next_fusion_recalibration_op_ = 0;
   std::uint64_t query_ops_ = 0;
   std::uint64_t insert_ops_ = 0;
   std::uint64_t delete_ops_ = 0;
@@ -4350,13 +4892,14 @@ class DeliAlexHybridLocalBoundedIndex {
       const Options& options, const std::vector<GeometryPtr>& geometries,
       const std::vector<GeometryMeta>& metadata, bool cost_driven = false,
       const std::vector<QueryCase>* calibration_queries = nullptr,
-      bool single_store = false)
+      bool single_store = false,
+      bool fusion_policy = false)
       : options_(options),
         geometries_(geometries),
         metadata_(metadata),
         single_store_(single_store),
         overlay_(options, geometries, metadata, cost_driven,
-                 calibration_queries) {}
+                 calibration_queries, fusion_policy) {}
 
   void bulk_load(const std::vector<ObjectId>& ids) {
     if (single_store_) {
@@ -4454,6 +4997,9 @@ class DeliAlexHybridLocalBoundedIndex {
   }
   std::size_t blocks_with_delta() const { return overlay_.blocks_with_delta(); }
   double tombstone_ratio() const { return overlay_.tombstone_ratio(); }
+  FusionDebugStats fusion_debug_stats() const {
+    return overlay_.fusion_debug_stats();
+  }
   std::size_t leaf_count() const {
     if (single_store_) {
       return 0;
@@ -4797,6 +5343,26 @@ std::string sibling_csv_path(const std::string& output_csv,
   return output_csv.substr(0, slash + 1) + filename;
 }
 
+std::string path_basename(const std::string& path) {
+  const std::size_t slash = path.find_last_of("/\\");
+  if (slash == std::string::npos) {
+    return path;
+  }
+  return path.substr(slash + 1);
+}
+
+std::string infer_selectivity_tag_from_path(const std::string& path) {
+  const std::string name = path_basename(path);
+  static const std::vector<std::string> tags = {
+      "0p001pct", "0p01pct", "0p1pct", "1pct"};
+  for (const std::string& tag : tags) {
+    if (name.find(tag) != std::string::npos) {
+      return tag;
+    }
+  }
+  return "";
+}
+
 void append_rlr_debug_csv(const Options& options,
                           const std::string& index_name,
                           const std::string& checkpoint,
@@ -4882,6 +5448,77 @@ void append_hire_sfc_debug_csv(
          << stats.pending_rebuild_count << ","
          << stats.background_recalibration_count << ","
          << index.live_count() << "," << index.estimate_bytes() << "\n";
+}
+
+void append_deli_fusion_debug_csv(
+    const Options& options,
+    const std::string& index_name,
+    const std::string& checkpoint,
+    std::size_t checkpoint_id,
+    const DeliAlexHybridLocalBoundedIndex& index,
+    std::size_t inserted,
+    std::size_t deleted) {
+  const std::string path =
+      sibling_csv_path(options.output_csv, "deli_fusion_debug.csv");
+  if (path.empty()) {
+    return;
+  }
+  const bool needs_header = !static_cast<bool>(std::ifstream(path));
+  std::ofstream output(path, std::ios::app);
+  if (!output) {
+    return;
+  }
+  if (needs_header) {
+    output << "dataset,selectivity_tag,query_file,index,phase,mixed_profile,"
+              "checkpoint,checkpoint_id,inserted,deleted,block_count,"
+              "learned_compact_blocks,"
+              "single_store_delta_blocks,cold_lazy_blocks,mode_switch_count,"
+              "block_query_count,block_insert_count,block_delete_count,"
+              "records_scanned,mbr_candidates,exact_calls,avg_beta,avg_tau,"
+              "avg_adaptive_delta_bound,avg_adaptive_delete_bound,"
+              "max_local_delta_size,avg_local_delta_size,blocks_with_delta,"
+              "tombstone_ratio,local_compaction_count,"
+              "deleted_slot_reuse_count,spatial_guard_build_count,"
+              "spatial_guard_query_count,spatial_guard_blocks,"
+              "spatial_guard_candidates,global_guard_query_count,"
+              "global_guard_probe_count,global_guard_candidates,"
+              "global_guard_live_count,global_guard_fast_path,"
+              "pending_rebuild_count,"
+              "background_recalibration_count,index_bytes_estimate\n";
+  }
+  const FusionDebugStats stats = index.fusion_debug_stats();
+  output << options.dataset_name << ","
+         << infer_selectivity_tag_from_path(options.query_file) << ","
+         << path_basename(options.query_file) << "," << index_name << ","
+         << options.workload_mode << "," << options.mixed_profile << ","
+         << checkpoint << "," << checkpoint_id << "," << inserted << ","
+         << deleted << "," << stats.block_count << ","
+         << stats.learned_compact_blocks << ","
+         << stats.single_store_delta_blocks << ","
+         << stats.cold_lazy_blocks << "," << stats.mode_switch_count << ","
+         << stats.block_query_count << "," << stats.block_insert_count << ","
+         << stats.block_delete_count << "," << stats.records_scanned << ","
+         << stats.mbr_candidates << "," << stats.exact_calls << ","
+         << index.avg_beta() << "," << index.avg_tau() << ","
+         << index.avg_adaptive_delta_bound() << ","
+         << index.avg_adaptive_delete_bound() << ","
+         << index.max_local_delta_size() << ","
+         << index.avg_local_delta_size() << ","
+         << index.blocks_with_delta() << "," << index.tombstone_ratio() << ","
+         << index.local_compaction_count() << ","
+         << stats.deleted_slot_reuse_count << ","
+         << stats.spatial_guard_build_count << ","
+         << stats.spatial_guard_query_count << ","
+         << stats.spatial_guard_blocks << ","
+         << stats.spatial_guard_candidates << ","
+         << stats.global_guard_query_count << ","
+         << stats.global_guard_probe_count << ","
+         << stats.global_guard_candidates << ","
+         << stats.global_guard_live_count << ","
+         << stats.global_guard_fast_path << ","
+         << stats.pending_rebuild_count << ","
+         << stats.background_recalibration_count << ","
+         << index.index_bytes_estimate() << "\n";
 }
 
 CompareSummary finalize_compare_summary(
@@ -6290,6 +6927,34 @@ int main(int argc, char* argv[]) {
       if (index_enabled(options, "DELI_ALEX_HYBRID_SINGLE_STORE_COST")) {
         run_single_store_mixed("DELI_ALEX_HYBRID_SINGLE_STORE_COST", true);
       }
+      if (index_enabled(options, "DELI_ADAPTIVE_PRL_FUSION")) {
+        DeliAlexHybridLocalBoundedIndex mixed_index(
+            options, geometries, geometry_metadata, true, &queries, true,
+            true);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(initial_ids);
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, "DELI_ADAPTIVE_PRL_FUSION", geometries, queries,
+            initial_ids, operations, mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>&) {
+              return mixed_index.query(query_case);
+            },
+            [&](ObjectId oid) { return mixed_index.insert(oid); },
+            [&](ObjectId oid) { return mixed_index.erase(oid); },
+            [&](CompareSummary& row) {
+              annotate_local_bounded_row(
+                  mixed_index, row,
+                  "Mixed workload; DELI-Adaptive-PRL-Fusion uses "
+                  "SingleStore-Cost as the base and switches block policy "
+                  "between LearnedCompact, SingleStoreDelta, and ColdLazy.");
+              append_deli_fusion_debug_csv(
+                  options, row.index, row.checkpoint, row.checkpoint_id,
+                  mixed_index, row.insert_count, row.delete_count);
+            },
+            rows);
+      }
 
       if (index_enabled(options, "Boost_Rtree")) {
         auto start = std::chrono::high_resolution_clock::now();
@@ -7417,6 +8082,83 @@ int main(int argc, char* argv[]) {
                              cost_delete_ns);
         rows.back().success_count = cost_delete_success;
         rows.back().failed_count = cost_delete_failed;
+      }
+
+      if (index_enabled(options, "DELI_ADAPTIVE_PRL_FUSION")) {
+        DeliAlexHybridLocalBoundedIndex fusion_index(
+            options, geometries, geometry_metadata, true, &queries, true,
+            true);
+        auto fusion_build_start = std::chrono::high_resolution_clock::now();
+        fusion_index.bulk_load(initial_ids);
+        auto fusion_build_end = std::chrono::high_resolution_clock::now();
+        long long fusion_build_ns =
+            ns_count(fusion_build_end - fusion_build_start);
+
+        auto emit_fusion_checkpoint =
+            [&](const std::string& checkpoint, std::size_t checkpoint_id,
+                const std::vector<ObjectId>& live_ids,
+                const std::vector<char>& live_bits, std::size_t inserted,
+                std::size_t deleted, long long insert_ns,
+                long long delete_ns) {
+              rows.push_back(run_generic_checkpoint(
+                  options, "DELI_ADAPTIVE_PRL_FUSION", checkpoint,
+                  checkpoint_id, geometries, queries, live_ids, live_bits,
+                  initial_count, inserted, deleted, fusion_build_ns, insert_ns,
+                  delete_ns, [&](const QueryCase& query_case) {
+                    return fusion_index.query(query_case);
+                  }));
+              annotate_local_bounded_row(
+                  fusion_index, rows.back(),
+                  "DELI-Adaptive-PRL-Fusion uses SingleStore-Cost as the "
+                  "base and switches block policy between LearnedCompact, "
+                  "SingleStoreDelta, and ColdLazy.");
+              append_deli_fusion_debug_csv(
+                  options, rows.back().index, rows.back().checkpoint,
+                  rows.back().checkpoint_id, fusion_index,
+                  rows.back().insert_count, rows.back().delete_count);
+              print_compare_summary(rows.back());
+            };
+
+        emit_fusion_checkpoint("after_bulkload", 0, live_after_bulkload,
+                               live_bulkload, 0, 0, 0, 0);
+
+        auto fusion_insert_start = std::chrono::high_resolution_clock::now();
+        std::size_t fusion_insert_success = 0;
+        std::size_t fusion_insert_failed = 0;
+        for (ObjectId oid : insert_ids) {
+          if (fusion_index.insert(oid)) {
+            ++fusion_insert_success;
+          } else {
+            ++fusion_insert_failed;
+          }
+        }
+        auto fusion_insert_end = std::chrono::high_resolution_clock::now();
+        long long fusion_insert_ns =
+            ns_count(fusion_insert_end - fusion_insert_start);
+        emit_fusion_checkpoint("after_insert", 1, live_after_insert,
+                               live_insert, insert_count, 0,
+                               fusion_insert_ns, 0);
+        rows.back().success_count = fusion_insert_success;
+        rows.back().failed_count = fusion_insert_failed;
+
+        auto fusion_delete_start = std::chrono::high_resolution_clock::now();
+        std::size_t fusion_delete_success = 0;
+        std::size_t fusion_delete_failed = 0;
+        for (ObjectId oid : delete_ids) {
+          if (fusion_index.erase(oid)) {
+            ++fusion_delete_success;
+          } else {
+            ++fusion_delete_failed;
+          }
+        }
+        auto fusion_delete_end = std::chrono::high_resolution_clock::now();
+        long long fusion_delete_ns =
+            ns_count(fusion_delete_end - fusion_delete_start);
+        emit_fusion_checkpoint("after_delete", 2, live_after_delete,
+                               live_delete, insert_count, delete_count,
+                               fusion_insert_ns, fusion_delete_ns);
+        rows.back().success_count = fusion_delete_success;
+        rows.back().failed_count = fusion_delete_failed;
       }
 
       // Boost R-tree.
