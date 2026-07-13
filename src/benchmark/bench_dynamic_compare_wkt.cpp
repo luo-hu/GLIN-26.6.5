@@ -214,6 +214,7 @@ struct CheckpointSummary {
   long long p50_query_ns = 0;
   long long p95_query_ns = 0;
   long long p99_query_ns = 0;
+  long long p999_query_ns = 0;
   std::size_t records_scanned = 0;
   std::size_t visited_blocks = 0;
   std::size_t skipped_zmax_blocks = 0;
@@ -1333,8 +1334,10 @@ struct CompareSummary {
   long long delete_ns = 0;
   long long p95_insert_ns = 0;
   long long p99_insert_ns = 0;
+  long long p999_insert_ns = 0;
   long long p95_delete_ns = 0;
   long long p99_delete_ns = 0;
+  long long p999_delete_ns = 0;
   double insert_tps = 0.0;
   double delete_tps = 0.0;
   double query_tps = 0.0;
@@ -1343,6 +1346,7 @@ struct CompareSummary {
   long long p50_query_ns = 0;
   long long p95_query_ns = 0;
   long long p99_query_ns = 0;
+  long long p999_query_ns = 0;
   std::size_t block_checks = 0;
   std::size_t visited_blocks = 0;
   std::size_t compact_records_scanned = 0;
@@ -5375,6 +5379,7 @@ SimpleQueryResult query_hire_sfc_lite_index(
   result.visited_blocks = stats.visited_leaves;
   result.compact_records_scanned = stats.records_scanned;
   result.delta_records_scanned = stats.buffer_records_scanned;
+  result.block_checks += stats.internal_nodes_visited;
   result.candidates = candidates.size();
   result.mbr_candidates = stats.mbr_candidates;
   for (std::size_t raw_oid : candidates) {
@@ -5538,6 +5543,55 @@ void append_hire_sfc_debug_csv(
               "directory_rebuild_count,deleted_slot_reuse_count,"
               "cost_retrain_trigger_count,legacy_transform_count,"
               "pending_rebuild_count,background_recalibration_count,"
+              "internal_node_count,internal_levels,internal_primary_entries,"
+              "internal_gap_slots,internal_log_entries,"
+              "internal_log_compactions,internal_boundary_updates,"
+              "internal_split_count,internal_merge_count,"
+              "internal_redistribution_count,internal_gap_insert_count,"
+              "internal_log_insert_count,internal_masked_delete_count,"
+              "leaf_split_count,leaf_merge_count,"
+              "leaf_redistribution_count,"
+              "buffer_hash_entries,buffer_swap_delete_count,"
+              "legacy_slots_used,legacy_slot_capacity,"
+              "sibling_link_count,broken_sibling_link_count,"
+              "unsorted_main_leaf_count,out_of_order_leaf_count,"
+              "stale_leaf_summary_count,"
+              "active_retrain_trigger_count,passive_retrain_trigger_count,"
+              "cost_retrain_rejected_count,query_window_total,"
+              "query_window_max,buffer_scan_sample_count,"
+              "model_scan_sample_count,merge_sample_count,fit_sample_count,"
+              "buffer_scan_ns_per_entry_ema,"
+              "model_scan_ns_per_entry_ema,merge_ns_per_record_ema,"
+              "fit_ns_per_record_ema,last_estimated_gain_ns,"
+              "last_estimated_retrain_ns,last_rejected_gain_ns,"
+              "last_rejected_retrain_ns,last_actual_retrain_ns,"
+              "last_retrain_error_before,last_retrain_error_after,"
+              "last_retrain_trigger_reason,"
+              "pap_snapshot_count,pap_max_levels,mls_install_count,"
+              "mls_update_log_entries,mls_update_replay_count,"
+              "mls_final_validation_repair_count,"
+              "rcu_snapshot_publish_count,rcu_retired_snapshot_count,"
+              "rcu_reclaimed_snapshot_count,rcu_active_reader_count,"
+              "background_job_count,background_job_abort_count,"
+              "last_pap_levels,last_pap_sigma,last_mls_covered_leaves,"
+              "legacy_forward_attempt_count,legacy_forward_success_count,"
+              "legacy_backward_attempt_count,legacy_backward_success_count,"
+              "model_downgrade_count,legacy_transform_abort_count,"
+              "legacy_coefficient_reject_count,"
+              "last_transform_input_leaves,last_transform_input_records,"
+              "last_recalibration_job_kind,"
+              "inter_level_bulk_enabled,"
+              "bulk_leaf_boundaries_considered,"
+              "bulk_leaf_boundaries_shifted,"
+              "bulk_leaf_candidate_evaluations,bulk_leaf_rls_updates,"
+              "bulk_leaf_max_shift,bulk_internal_optimized_levels,"
+              "bulk_internal_boundaries_considered,"
+              "bulk_internal_boundaries_shifted,"
+              "bulk_internal_candidate_evaluations,"
+              "bulk_internal_rls_updates,bulk_internal_max_shift,"
+              "bulk_load_ns,bulk_internal_build_ns,"
+              "avg_internal_model_error,"
+              "max_internal_model_error,"
               "live_count,"
               "index_bytes_estimate\n";
   }
@@ -5556,6 +5610,87 @@ void append_hire_sfc_debug_csv(
          << stats.legacy_transform_count << ","
          << stats.pending_rebuild_count << ","
          << stats.background_recalibration_count << ","
+         << stats.internal_node_count << "," << stats.internal_levels << ","
+         << stats.internal_primary_entries << ","
+         << stats.internal_gap_slots << "," << stats.internal_log_entries
+         << "," << stats.internal_log_compactions << ","
+         << stats.internal_boundary_updates << ","
+         << stats.internal_split_count << ","
+         << stats.internal_merge_count << ","
+         << stats.internal_redistribution_count << ","
+         << stats.internal_gap_insert_count << ","
+         << stats.internal_log_insert_count << ","
+         << stats.internal_masked_delete_count << ","
+         << stats.leaf_split_count << "," << stats.leaf_merge_count << ","
+         << stats.leaf_redistribution_count << ","
+         << stats.buffer_hash_entries << ","
+         << stats.buffer_swap_delete_count << ","
+         << stats.legacy_slots_used << ","
+         << stats.legacy_slot_capacity << ","
+         << stats.sibling_link_count << ","
+         << stats.broken_sibling_link_count << ","
+         << stats.unsorted_main_leaf_count << ","
+         << stats.out_of_order_leaf_count << ","
+         << stats.stale_leaf_summary_count << ","
+         << stats.active_retrain_trigger_count << ","
+         << stats.passive_retrain_trigger_count << ","
+         << stats.cost_retrain_rejected_count << ","
+         << stats.query_window_total << ","
+         << stats.query_window_max << ","
+         << stats.buffer_scan_sample_count << ","
+         << stats.model_scan_sample_count << ","
+         << stats.merge_sample_count << "," << stats.fit_sample_count << ","
+         << stats.buffer_scan_ns_per_entry_ema << ","
+         << stats.model_scan_ns_per_entry_ema << ","
+         << stats.merge_ns_per_record_ema << ","
+         << stats.fit_ns_per_record_ema << ","
+         << stats.last_estimated_gain_ns << ","
+         << stats.last_estimated_retrain_ns << ","
+         << stats.last_rejected_gain_ns << ","
+         << stats.last_rejected_retrain_ns << ","
+         << stats.last_actual_retrain_ns << ","
+         << stats.last_retrain_error_before << ","
+         << stats.last_retrain_error_after << ","
+         << stats.last_retrain_trigger_reason << ","
+         << stats.pap_snapshot_count << "," << stats.pap_max_levels << ","
+         << stats.mls_install_count << ","
+         << stats.mls_update_log_entries << ","
+         << stats.mls_update_replay_count << ","
+         << stats.mls_final_validation_repair_count << ","
+         << stats.rcu_snapshot_publish_count << ","
+         << stats.rcu_retired_snapshot_count << ","
+         << stats.rcu_reclaimed_snapshot_count << ","
+         << stats.rcu_active_reader_count << ","
+         << stats.background_job_count << ","
+         << stats.background_job_abort_count << ","
+         << stats.last_pap_levels << "," << stats.last_pap_sigma << ","
+         << stats.last_mls_covered_leaves << ","
+         << stats.legacy_forward_attempt_count << ","
+         << stats.legacy_forward_success_count << ","
+         << stats.legacy_backward_attempt_count << ","
+         << stats.legacy_backward_success_count << ","
+         << stats.model_downgrade_count << ","
+         << stats.legacy_transform_abort_count << ","
+         << stats.legacy_coefficient_reject_count << ","
+         << stats.last_transform_input_leaves << ","
+         << stats.last_transform_input_records << ","
+         << stats.last_recalibration_job_kind << ","
+         << (stats.inter_level_bulk_enabled ? 1 : 0) << ","
+         << stats.bulk_leaf_boundaries_considered << ","
+         << stats.bulk_leaf_boundaries_shifted << ","
+         << stats.bulk_leaf_candidate_evaluations << ","
+         << stats.bulk_leaf_rls_updates << ","
+         << stats.bulk_leaf_max_shift << ","
+         << stats.bulk_internal_optimized_levels << ","
+         << stats.bulk_internal_boundaries_considered << ","
+         << stats.bulk_internal_boundaries_shifted << ","
+         << stats.bulk_internal_candidate_evaluations << ","
+         << stats.bulk_internal_rls_updates << ","
+         << stats.bulk_internal_max_shift << ","
+         << stats.bulk_load_ns << ","
+         << stats.bulk_internal_build_ns << ","
+         << stats.avg_internal_model_error << ","
+         << stats.max_internal_model_error << ","
          << index.live_count() << "," << index.estimate_bytes() << "\n";
 }
 
@@ -5694,6 +5829,7 @@ CompareSummary finalize_compare_summary(
   summary.p50_query_ns = percentile_value(aggregate.latencies_ns, 0.50);
   summary.p95_query_ns = percentile_value(aggregate.latencies_ns, 0.95);
   summary.p99_query_ns = percentile_value(aggregate.latencies_ns, 0.99);
+  summary.p999_query_ns = percentile_value(aggregate.latencies_ns, 0.999);
   summary.query_tps =
       aggregate.latencies_ns.empty() || total_query_ns == 0
           ? 0.0
@@ -5849,6 +5985,7 @@ CompareSummary convert_deli_summary(const CheckpointSummary& source,
   summary.p50_query_ns = source.p50_query_ns;
   summary.p95_query_ns = source.p95_query_ns;
   summary.p99_query_ns = source.p99_query_ns;
+  summary.p999_query_ns = source.p999_query_ns;
   summary.mbr_candidates = source.mbr_candidates;
   summary.predicate_shortcuts_enabled = 0;
   summary.candidates = source.exact_calls;
@@ -5975,6 +6112,7 @@ CheckpointSummary run_checkpoint(const Options& options,
   summary.p50_query_ns = percentile_value(aggregate.latencies_ns, 0.50);
   summary.p95_query_ns = percentile_value(aggregate.latencies_ns, 0.95);
   summary.p99_query_ns = percentile_value(aggregate.latencies_ns, 0.99);
+  summary.p999_query_ns = percentile_value(aggregate.latencies_ns, 0.999);
   summary.records_scanned = aggregate.records_scanned;
   summary.visited_blocks = aggregate.visited_blocks;
   summary.skipped_zmax_blocks = aggregate.skipped_zmax_blocks;
@@ -6035,7 +6173,7 @@ void write_csv(const std::string& path, const Options& options,
          "dead_entry_ratio,query_count,block_size,block_count,stale_threshold_fraction,"
          "stale_block_count,summary_rebuild_count,summary_rebuild_ns,"
          "block_split_count,avg_query_ns,p50_query_ns,p95_query_ns,"
-         "p99_query_ns,records_scanned,visited_blocks,skipped_zmax_blocks,"
+         "p99_query_ns,p999_query_ns,records_scanned,visited_blocks,skipped_zmax_blocks,"
          "skipped_mbr_blocks,skipped_block_ratio,interval_candidates,"
          "mbr_candidates,exact_calls,answers,candidate_answer_ratio,"
          "zero_answer_queries,answers_match_boost,missing_count,extra_count,"
@@ -6058,7 +6196,7 @@ void write_csv(const std::string& path, const Options& options,
            << summary.summary_rebuild_ns << "," << summary.block_split_count
            << "," << summary.avg_query_ns << "," << summary.p50_query_ns
            << "," << summary.p95_query_ns << "," << summary.p99_query_ns
-           << "," << summary.records_scanned << ","
+           << "," << summary.p999_query_ns << "," << summary.records_scanned << ","
            << summary.visited_blocks << ","
            << summary.skipped_zmax_blocks << ","
            << summary.skipped_mbr_blocks << ","
@@ -6223,7 +6361,20 @@ void print_compare_summary(const CompareSummary& summary) {
             << " missing=" << summary.missing_count
             << " extra=" << summary.extra_count
             << " index_bytes_estimate=" << summary.index_bytes_estimate
-            << "\n";
+            << std::endl;
+}
+
+void print_index_phase(const std::string& index, const std::string& phase,
+                       long long build_ns = -1,
+                       std::size_t operation_count = 0) {
+  std::cout << "progress index=" << index << " phase=" << phase;
+  if (build_ns >= 0) {
+    std::cout << " build_ms=" << static_cast<double>(build_ns) / 1e6;
+  }
+  if (operation_count > 0) {
+    std::cout << " operations=" << operation_count;
+  }
+  std::cout << std::endl;
 }
 
 struct MaintenanceSnapshot {
@@ -6296,9 +6447,9 @@ void write_compare_csv(const std::string& path,
          "mixed_query_ratio,mixed_insert_ratio,mixed_delete_ratio,"
 	         "index,checkpoint,checkpoint_id,loaded_count,initial_count,"
 	         "insert_count,delete_count,live_count,query_count,build_ns,insert_ns,"
-         "delete_ns,p95_insert_ns,p99_insert_ns,p95_delete_ns,p99_delete_ns,"
+         "delete_ns,p95_insert_ns,p99_insert_ns,p999_insert_ns,p95_delete_ns,p99_delete_ns,p999_delete_ns,"
          "insert_tps,delete_tps,query_tps,overall_ops_tps,avg_query_ns,p50_query_ns,"
-         "p95_query_ns,p99_query_ns,block_checks,visited_blocks,"
+         "p95_query_ns,p99_query_ns,p999_query_ns,block_checks,visited_blocks,"
          "compact_records_scanned,delta_records_scanned,mbr_candidates,"
          "predicate_shortcuts,predicate_shortcuts_enabled,candidates,exact_calls,answers,"
          "candidate_answer_ratio,zero_answer_queries,answers_match_boost,"
@@ -6330,11 +6481,13 @@ void write_compare_csv(const std::string& path,
 	           << row.live_count << "," << row.query_count << ","
 	           << row.build_ns << "," << row.insert_ns << "," << row.delete_ns
            << "," << row.p95_insert_ns << "," << row.p99_insert_ns
-           << "," << row.p95_delete_ns << "," << row.p99_delete_ns
+           << "," << row.p999_insert_ns << "," << row.p95_delete_ns
+           << "," << row.p99_delete_ns << "," << row.p999_delete_ns
            << "," << row.insert_tps << "," << row.delete_tps << ","
            << row.query_tps << "," << row.overall_ops_tps << ","
            << row.avg_query_ns << "," << row.p50_query_ns << ","
            << row.p95_query_ns << "," << row.p99_query_ns << ","
+           << row.p999_query_ns << ","
            << row.block_checks << "," << row.visited_blocks << ","
            << row.compact_records_scanned << ","
            << row.delta_records_scanned << "," << row.mbr_candidates << ","
@@ -6563,6 +6716,8 @@ void run_mixed_workload_for_index(
     DeleteFn delete_fn,
     AnnotateFn annotate_fn,
     std::vector<CompareSummary>& rows) {
+  print_index_phase(index_name, "workload_start", build_ns,
+                    operations.size());
   LiveReplayState state(geometries.size(), initial_ids);
   SimpleQueryAggregate aggregate;
   long long interval_insert_ns = 0;
@@ -6602,8 +6757,12 @@ void run_mixed_workload_for_index(
 	    row.failed_count = interval_failed;
     row.p95_insert_ns = percentile_value(interval_insert_latencies_ns, 0.95);
     row.p99_insert_ns = percentile_value(interval_insert_latencies_ns, 0.99);
+    row.p999_insert_ns =
+        percentile_value(interval_insert_latencies_ns, 0.999);
     row.p95_delete_ns = percentile_value(interval_delete_latencies_ns, 0.95);
     row.p99_delete_ns = percentile_value(interval_delete_latencies_ns, 0.99);
+    row.p999_delete_ns =
+        percentile_value(interval_delete_latencies_ns, 0.999);
     const long long foreground_ns =
         row.query_count == 0 ? 0 : row.avg_query_ns *
                                    static_cast<long long>(row.query_count);
@@ -6667,12 +6826,17 @@ void run_mixed_workload_for_index(
       emit_checkpoint(completed_ops);
     }
   }
+  print_index_phase(index_name, "workload_done", build_ns,
+                    operations.size());
 }
 
 }  // namespace
 
 int main(int argc, char* argv[]) {
   try {
+    // Keep progress visible when the benchmark is launched through tee or an IDE.
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
     Options options = parse_args(argc, argv);
 
     auto factory = geos::geom::GeometryFactory::create();
@@ -6776,7 +6940,7 @@ int main(int argc, char* argv[]) {
                                              static_cast<double>(
                                                  options.block_size)))))
               << " load_ms=" << ns_count(load_end - load_start) / 1e6
-              << "\n";
+              << std::endl;
 
     std::vector<CompareSummary> rows;
     auto annotate_local_bounded_row = [&](auto& index, CompareSummary& row,
@@ -7044,6 +7208,7 @@ int main(int argc, char* argv[]) {
         run_single_store_mixed("DELI_ALEX_HYBRID_SINGLE_STORE_COST", true);
       }
       if (index_enabled(options, "DELI_ADAPTIVE_PRL_FUSION")) {
+        print_index_phase("DELI_ADAPTIVE_PRL_FUSION", "build_start");
         DeliAlexHybridLocalBoundedIndex mixed_index(
             options, geometries, geometry_metadata, true, &queries, true,
             true);
@@ -7073,6 +7238,7 @@ int main(int argc, char* argv[]) {
       }
 
       if (index_enabled(options, "Boost_Rtree")) {
+        print_index_phase("Boost_Rtree", "build_start");
         auto start = std::chrono::high_resolution_clock::now();
         RTree mixed_index =
             build_rtree_for_ids(geometries, initial_ids, live_bulkload, nullptr);
@@ -7181,6 +7347,7 @@ int main(int argc, char* argv[]) {
       }
 
       if (index_enabled(options, "HIRE_SFC_LITE")) {
+        print_index_phase("HIRE_SFC_LITE", "build_start");
         hire_sfc_lite::HireSfcLiteIndex mixed_index(geometries.size());
         auto start = std::chrono::high_resolution_clock::now();
         mixed_index.bulk_load(
@@ -7220,6 +7387,54 @@ int main(int argc, char* argv[]) {
                   mixed_index.local_rebuild_count();
               row.note =
                   "Mixed workload; HIRE-inspired SFC+1D learned index with conservative extent filtering.";
+              append_hire_sfc_debug_csv(options, row.index, row.checkpoint,
+                                        row.checkpoint_id, mixed_index,
+                                        row.insert_count);
+            },
+            rows);
+      }
+
+      if (index_enabled(options, "HIRE_SFC_FULL")) {
+        print_index_phase("HIRE_SFC_FULL", "build_start");
+        hire_sfc_lite::HireSfcLiteIndex mixed_index(geometries.size(), true);
+        auto start = std::chrono::high_resolution_clock::now();
+        mixed_index.bulk_load(
+            hire_entries_for_ids(geometry_metadata, initial_ids, live_bulkload));
+        auto end = std::chrono::high_resolution_clock::now();
+        const long long mixed_build_ns = ns_count(end - start);
+        run_mixed_workload_for_index(
+            options, "HIRE_SFC_FULL", geometries, queries, initial_ids,
+            operations, mixed_build_ns,
+            [&](const QueryCase& query_case, const std::vector<char>& live) {
+              return query_hire_sfc_lite_index(mixed_index, geometries, live,
+                                               options, true, query_case);
+            },
+            [&](ObjectId oid) {
+              if (oid >= geometry_metadata.size()) {
+                return false;
+              }
+              const GeometryMeta& meta = geometry_metadata[oid];
+              hire_sfc_lite::RecordInput input;
+              input.id = static_cast<std::size_t>(oid);
+              input.zmin = meta.zmin;
+              input.zmax = meta.zmax;
+              input.box = hire_box_from_envelope(meta.envelope);
+              return mixed_index.insert(input);
+            },
+            [&](ObjectId oid) {
+              return mixed_index.erase(static_cast<std::size_t>(oid));
+            },
+            [&](CompareSummary& row) {
+              row.block_count = mixed_index.leaf_count();
+              row.tree_nodes = mixed_index.node_count();
+              row.tree_depth = mixed_index.height();
+              row.index_bytes_estimate = mixed_index.estimate_bytes();
+              row.stale_block_count =
+                  mixed_index.debug_stats().tombstone_records;
+              row.local_compaction_count_stage =
+                  mixed_index.local_rebuild_count();
+              row.note =
+                  "Mixed workload; HIRE SFC full-reproduction Stage 7 with final-validated RCU and inter-level optimized bulk loading.";
               append_hire_sfc_debug_csv(options, row.index, row.checkpoint,
                                         row.checkpoint_id, mixed_index,
                                         row.insert_count);
@@ -8663,6 +8878,132 @@ int main(int argc, char* argv[]) {
           hire_index.local_rebuild_count();
       rows.back().note =
           "HIRE-inspired SFC+1D learned index with conservative extent filtering and lazy delete.";
+      append_hire_sfc_debug_csv(options, rows.back().index,
+                                rows.back().checkpoint,
+                                rows.back().checkpoint_id, hire_index,
+                                rows.back().insert_count);
+      print_compare_summary(rows.back());
+      }
+
+      // HIRE_SFC_FULL: staged full reproduction with a real multi-level
+      // learned internal directory. RCU recalibration is added in later stages.
+      if (index_enabled(options, "HIRE_SFC_FULL")) {
+      hire_sfc_lite::HireSfcLiteIndex hire_index(geometries.size(), true);
+      auto hire_build_start = std::chrono::high_resolution_clock::now();
+      hire_index.bulk_load(
+          hire_entries_for_ids(geometry_metadata, initial_ids, live_bulkload));
+      auto hire_build_end = std::chrono::high_resolution_clock::now();
+      long long hire_build_ns =
+          ns_count(hire_build_end - hire_build_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "HIRE_SFC_FULL", "after_bulkload", 0, geometries,
+          queries, live_after_bulkload, live_bulkload, initial_count, 0, 0,
+          hire_build_ns, 0, 0,
+          [&](const QueryCase& query_case) {
+            return query_hire_sfc_lite_index(hire_index, geometries,
+                                             live_bulkload, options, true,
+                                             query_case);
+          }));
+      rows.back().block_count = hire_index.leaf_count();
+      rows.back().tree_nodes = hire_index.node_count();
+      rows.back().tree_depth = hire_index.height();
+      rows.back().index_bytes_estimate = hire_index.estimate_bytes();
+      rows.back().stale_block_count =
+          hire_index.debug_stats().tombstone_records;
+      rows.back().local_compaction_count_stage =
+          hire_index.local_rebuild_count();
+      rows.back().note =
+          "HIRE full-reproduction Stage 7: validated hybrid leaves with inter-level optimized bulk loading.";
+      append_hire_sfc_debug_csv(options, rows.back().index,
+                                rows.back().checkpoint,
+                                rows.back().checkpoint_id, hire_index,
+                                rows.back().insert_count);
+      print_compare_summary(rows.back());
+
+      std::size_t hire_insert_success = 0;
+      std::size_t hire_insert_failed = 0;
+      auto hire_insert_start = std::chrono::high_resolution_clock::now();
+      for (ObjectId oid : insert_ids) {
+        if (oid >= geometry_metadata.size()) {
+          ++hire_insert_failed;
+          continue;
+        }
+        const GeometryMeta& meta = geometry_metadata[oid];
+        hire_sfc_lite::RecordInput input;
+        input.id = static_cast<std::size_t>(oid);
+        input.zmin = meta.zmin;
+        input.zmax = meta.zmax;
+        input.box = hire_box_from_envelope(meta.envelope);
+        if (hire_index.insert(input)) {
+          ++hire_insert_success;
+        } else {
+          ++hire_insert_failed;
+        }
+      }
+      auto hire_insert_end = std::chrono::high_resolution_clock::now();
+      long long hire_insert_ns =
+          ns_count(hire_insert_end - hire_insert_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "HIRE_SFC_FULL", "after_insert", 1, geometries, queries,
+          live_after_insert, live_insert, initial_count, insert_count, 0,
+          hire_build_ns, hire_insert_ns, 0,
+          [&](const QueryCase& query_case) {
+            return query_hire_sfc_lite_index(hire_index, geometries,
+                                             live_insert, options, true,
+                                             query_case);
+          }));
+      rows.back().success_count = hire_insert_success;
+      rows.back().failed_count = hire_insert_failed;
+      rows.back().block_count = hire_index.leaf_count();
+      rows.back().tree_nodes = hire_index.node_count();
+      rows.back().tree_depth = hire_index.height();
+      rows.back().index_bytes_estimate = hire_index.estimate_bytes();
+      rows.back().stale_block_count =
+          hire_index.debug_stats().tombstone_records;
+      rows.back().local_compaction_count_stage =
+          hire_index.local_rebuild_count();
+      rows.back().note =
+          "HIRE full-reproduction Stage 7 with final-validated RCU recalibration and optimized bulk loading.";
+      append_hire_sfc_debug_csv(options, rows.back().index,
+                                rows.back().checkpoint,
+                                rows.back().checkpoint_id, hire_index,
+                                rows.back().insert_count);
+      print_compare_summary(rows.back());
+
+      std::size_t hire_delete_success = 0;
+      std::size_t hire_delete_failed = 0;
+      auto hire_delete_start = std::chrono::high_resolution_clock::now();
+      for (ObjectId oid : delete_ids) {
+        if (hire_index.erase(static_cast<std::size_t>(oid))) {
+          ++hire_delete_success;
+        } else {
+          ++hire_delete_failed;
+        }
+      }
+      auto hire_delete_end = std::chrono::high_resolution_clock::now();
+      long long hire_delete_ns =
+          ns_count(hire_delete_end - hire_delete_start);
+      rows.push_back(run_generic_checkpoint(
+          options, "HIRE_SFC_FULL", "after_delete", 2, geometries, queries,
+          live_after_delete, live_delete, initial_count, insert_count,
+          delete_count, hire_build_ns, hire_insert_ns, hire_delete_ns,
+          [&](const QueryCase& query_case) {
+            return query_hire_sfc_lite_index(hire_index, geometries,
+                                             live_delete, options, true,
+                                             query_case);
+          }));
+      rows.back().success_count = hire_delete_success;
+      rows.back().failed_count = hire_delete_failed;
+      rows.back().block_count = hire_index.leaf_count();
+      rows.back().tree_nodes = hire_index.node_count();
+      rows.back().tree_depth = hire_index.height();
+      rows.back().index_bytes_estimate = hire_index.estimate_bytes();
+      rows.back().stale_block_count =
+          hire_index.debug_stats().tombstone_records;
+      rows.back().local_compaction_count_stage =
+          hire_index.local_rebuild_count();
+      rows.back().note =
+          "HIRE full-reproduction Stage 7 with validated adaptive leaves and inter-level bulk optimization.";
       append_hire_sfc_debug_csv(options, rows.back().index,
                                 rows.back().checkpoint,
                                 rows.back().checkpoint_id, hire_index,

@@ -27,6 +27,7 @@ INDEX_ORDER = [
     "RLR_LITE_CS",
     "RLR_LITE_CS_SPLIT",
     "HIRE_SFC_LITE",
+    "HIRE_SFC_FULL",
     "GLIN_PIECEWISE",
     "Boost_Rtree",
     "GEOS_Quadtree",
@@ -45,6 +46,7 @@ COLORS = {
     "RLR_LITE_CS": "#9467BD",
     "RLR_LITE_CS_SPLIT": "#FF7F0E",
     "HIRE_SFC_LITE": "#2CA02C",
+    "HIRE_SFC_FULL": "#00A6A6",
     "GLIN_PIECEWISE": "#6D8F3F",
     "Boost_Rtree": "#0066FF",
     "GEOS_Quadtree": "#7C5FB3",
@@ -63,6 +65,7 @@ LABELS = {
     "RLR_LITE_CS": "RLR-Lite-CS",
     "RLR_LITE_CS_SPLIT": "RLR-Lite-CS-Split",
     "HIRE_SFC_LITE": "HIRE-SFC-Lite",
+    "HIRE_SFC_FULL": "HIRE-SFC-Full (Stage 6)",
     "GLIN_PIECEWISE": "GLIN-piece",
     "Boost_Rtree": "Boost R-tree",
     "GEOS_Quadtree": "GEOS Quadtree",
@@ -74,6 +77,7 @@ MARKERS = {
     "RLR_LITE_CS": "P",
     "RLR_LITE_CS_SPLIT": "*",
     "HIRE_SFC_LITE": "v",
+    "HIRE_SFC_FULL": "d",
 }
 
 
@@ -235,7 +239,9 @@ def plot_metric(rows, output_dir, prefix, checkpoint, metric, ylabel, filename, 
     ax.grid(axis="y", linestyle="--", alpha=0.32)
     if log_y:
         ax.set_yscale("log")
-    ax.legend(frameon=False, ncol=min(4, len(indexes)))
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(handles, labels, frameon=False, ncol=min(4, len(indexes)))
     fig.tight_layout()
     path = output_dir / f"{prefix}_{checkpoint}_{filename}.png"
     fig.savefig(path, dpi=dpi)
@@ -304,6 +310,10 @@ def plot_mixed_metric(rows, output_dir, prefix, metric, ylabel, filename, dpi,
                     markeredgecolor=color_for_index(index), markeredgewidth=1.0,
                     linestyle=linestyle_for_index(index),
                     color=color_for_index(index), label=label_for_index(index))
+        handles, labels = ax.get_legend_handles_labels()
+        if not handles:
+            plt.close(fig)
+            continue
         ax.set_xlabel("Operations")
         ax.set_ylabel(ylabel)
         rolling_suffix = (
@@ -313,7 +323,7 @@ def plot_mixed_metric(rows, output_dir, prefix, metric, ylabel, filename, dpi,
         ax.grid(axis="both", linestyle="--", alpha=0.32)
         if log_y:
             ax.set_yscale("log")
-        ax.legend(frameon=False, ncol=2, fontsize=8)
+        ax.legend(handles, labels, frameon=False, ncol=2, fontsize=8)
         fig.tight_layout()
         path = output_dir / (
             f"{prefix}_mixed_{safe_name(profile)}_{safe_name(dataset)}_"
@@ -388,11 +398,15 @@ def plot_mixed_cumulative_throughput(rows, output_dir, prefix, metric, ylabel,
                     markeredgecolor=color_for_index(index), markeredgewidth=1.0,
                     linestyle=linestyle_for_index(index),
                     color=color_for_index(index), label=label_for_index(index))
+        handles, labels = ax.get_legend_handles_labels()
+        if not handles:
+            plt.close(fig)
+            continue
         ax.set_xlabel("Operations")
         ax.set_ylabel(ylabel)
         ax.set_title(f"{profile} {dataset} {selectivity}: cumulative {ylabel}")
         ax.grid(axis="both", linestyle="--", alpha=0.32)
-        ax.legend(frameon=False, ncol=2, fontsize=8)
+        ax.legend(handles, labels, frameon=False, ncol=2, fontsize=8)
         fig.tight_layout()
         path = output_dir / (
             f"{prefix}_mixed_{safe_name(profile)}_{safe_name(dataset)}_"
@@ -410,11 +424,11 @@ def write_notes(rows, output_dir, prefix):
         handle.write("统一动态对比说明\n\n")
         handle.write("所有方法使用同一套 bulk-load / insert / delete / query workload。\n")
         handle.write("当 workload_mode=mixed 时，横轴 operation_count 表示单线程交错操作进度。\n")
-        handle.write("mixed workload 的 avg/p95/p99 query latency 来自交错执行中真实发生的 query；correctness 在 checkpoint final state 上用固定 query set 与 Boost exact oracle 对齐。\n")
+        handle.write("mixed workload 的 avg/p95/p99/p99.9 query latency 来自交错执行中真实发生的 query；correctness 在 checkpoint final state 上用固定 query set 与 Boost exact oracle 对齐。\n")
         handle.write("query_tps 只统计 query 自身耗时；overall_ops_tps 统计 checkpoint 内 query+insert+delete 的前台总耗时，不包含 correctness oracle。\n")
         handle.write("interval throughput 使用每个 checkpoint 区间内的操作数/耗时；窗口越短，越容易被少量 local compaction 放大抖动。\n")
         handle.write("rolling average 只平滑可视化曲线，不改变原始 CSV；cumulative throughput 展示从 mixed workload 开始到当前 checkpoint 的累计平均吞吐。\n")
-        handle.write("p95_insert_ms/p99_insert_ms 和 p95_delete_ms/p99_delete_ms 表示 mixed interval 内单次更新操作的尾延迟。\n")
+        handle.write("p95/p99/p99.9 insert/delete latency 表示 mixed interval 内单次更新操作的尾延迟。\n")
         handle.write("answers_match_boost=1 表示该方法在该 checkpoint 的答案集合与 Boost exact oracle 一致。\n")
         handle.write("answers_match_boost=-1 表示本次 checkpoint 按 CHECK_CORRECTNESS/CORRECTNESS_EVERY_N 设置跳过了 oracle 检查，不代表答案错误。\n")
         handle.write("index_mb_estimate 是粗略估算，不等价于精确内存 profiler；用于先判断数量级。\n\n")
@@ -463,12 +477,15 @@ def main():
     paths.append(plot_metric(rows, output_dir, args.figure_prefix, "after_delete", "p95_query_ms", "P95 query latency after delete (ms)", "p95_query_ms", args.dpi))
     paths.append(plot_metric(rows, output_dir, args.figure_prefix, "after_insert", "p99_query_ms", "P99 query latency after insert (ms)", "p99_query_ms", args.dpi))
     paths.append(plot_metric(rows, output_dir, args.figure_prefix, "after_delete", "p99_query_ms", "P99 query latency after delete (ms)", "p99_query_ms", args.dpi))
+    paths.append(plot_metric(rows, output_dir, args.figure_prefix, "after_insert", "p999_query_ms", "P99.9 query latency after insert (ms)", "p999_query_ms", args.dpi))
+    paths.append(plot_metric(rows, output_dir, args.figure_prefix, "after_delete", "p999_query_ms", "P99.9 query latency after delete (ms)", "p999_query_ms", args.dpi))
     paths.append(plot_metric(rows, output_dir, args.figure_prefix, "after_delete", "index_mb_estimate", "Estimated index size (MB)", "index_mb_estimate", args.dpi))
     paths.append(plot_metric(rows, output_dir, args.figure_prefix, "after_delete", "answers_match_boost", "Answers match Boost oracle", "correctness", args.dpi))
     rolling_window = max(1, args.mixed_rolling_window)
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_query_ms", "Average query latency in mixed workload (ms)", "avg_query_ms", args.dpi, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p95_query_ms", "P95 query latency in mixed workload (ms)", "p95_query_ms", args.dpi, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p99_query_ms", "P99 query latency in mixed workload (ms)", "p99_query_ms", args.dpi, rolling_window=rolling_window))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p999_query_ms", "P99.9 query latency in mixed workload (ms)", "p999_query_ms", args.dpi, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "answers_match_boost", "Answers match Boost oracle", "answers_match_boost", args.dpi, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "block_checks", "Block summary checks per interval", "block_checks", args.dpi, skip_zero_series=True, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "visited_blocks", "Visited blocks per interval", "visited_blocks", args.dpi, skip_zero_series=True, rolling_window=rolling_window))
@@ -484,8 +501,10 @@ def main():
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "overall_ops_tps", "Overall foreground throughput (ops/s)", "overall_ops_tps", args.dpi, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p95_insert_ms", "P95 insert latency in mixed workload (ms)", "p95_insert_ms", args.dpi, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p99_insert_ms", "P99 insert latency in mixed workload (ms)", "p99_insert_ms", args.dpi, rolling_window=rolling_window))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p999_insert_ms", "P99.9 insert latency in mixed workload (ms)", "p999_insert_ms", args.dpi, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p95_delete_ms", "P95 delete latency in mixed workload (ms)", "p95_delete_ms", args.dpi, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p99_delete_ms", "P99 delete latency in mixed workload (ms)", "p99_delete_ms", args.dpi, rolling_window=rolling_window))
+    paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "p999_delete_ms", "P99.9 delete latency in mixed workload (ms)", "p999_delete_ms", args.dpi, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "local_compaction_count_stage", "Local compactions per interval", "local_compaction_count_stage", args.dpi, skip_zero_series=True, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "local_compaction_ns_stage", "Local compaction time per interval (ns)", "local_compaction_ns_stage", args.dpi, skip_zero_series=True, rolling_window=rolling_window))
     paths.extend(plot_mixed_metric(rows, output_dir, args.figure_prefix, "avg_local_delta_size", "Average local delta size", "avg_local_delta_size", args.dpi, skip_zero_series=True, rolling_window=rolling_window))

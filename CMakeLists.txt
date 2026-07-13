@@ -10,6 +10,7 @@ set(Boost_USE_MULTITHREADED ON)
 # FindGEOS.cmake is copied from https://github.com/valhalla/valhalla/blob/master/cmake/FindGEOS.cmake
 find_package(GEOS REQUIRED)# if not find geo, cannot compile find geos.cmake
 find_package(Boost REQUIRED)
+find_package(Threads REQUIRED)
 set(CMAKE_CXX_STANDARD 14)
 
 set(GLIN_DEP_INCLUDE_DIRS
@@ -25,12 +26,12 @@ set(GLIN_WKT_INCLUDE_DIRS
 
 # SIMD
 if(MSVC)
-    set(CMAKE_CXX_FLAGS "/O2 /arch:AVX2 /W1 /EHsc")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /arch:AVX2 /W1 /EHsc")
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Intel")
-    set(CMAKE_CXX_FLAGS "-O3 -xHost")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -xHost")
 else()
     # clang and gcc
-    set(CMAKE_CXX_FLAGS "-O3 -march=native -Wall -Wextra")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -Wall -Wextra")
 endif()
 
 
@@ -42,6 +43,44 @@ add_executable(test_glin_piece test/unittest_main.cpp glin/hilbert/hilbert.h gli
 target_compile_definitions(test_glin_piece PRIVATE PIECE)
 target_link_libraries(test_glin_piece PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
 target_include_directories(test_glin_piece PUBLIC ${GLIN_CORE_INCLUDE_DIRS})
+
+add_executable(test_hire_internal_directory
+    test/hire_internal_directory_test.cpp)
+target_include_directories(test_hire_internal_directory PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/benchmark)
+
+add_executable(test_hire_sfc_stage2 test/hire_sfc_stage2_test.cpp)
+target_include_directories(test_hire_sfc_stage2 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/benchmark)
+
+add_executable(test_hire_sfc_stage3_cost
+    test/hire_sfc_stage3_cost_test.cpp)
+target_include_directories(test_hire_sfc_stage3_cost PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/benchmark)
+
+add_executable(test_hire_sfc_stage4_rcu
+    test/hire_sfc_stage4_rcu_test.cpp)
+target_include_directories(test_hire_sfc_stage4_rcu PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/benchmark)
+target_link_libraries(test_hire_sfc_stage4_rcu PRIVATE Threads::Threads)
+
+add_executable(test_hire_sfc_stage5_transform
+    test/hire_sfc_stage5_transform_test.cpp)
+target_include_directories(test_hire_sfc_stage5_transform PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/benchmark)
+target_link_libraries(test_hire_sfc_stage5_transform PRIVATE Threads::Threads)
+
+add_executable(test_hire_sfc_stage6_bulk
+    test/hire_sfc_stage6_bulk_test.cpp)
+target_include_directories(test_hire_sfc_stage6_bulk PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/benchmark)
+target_link_libraries(test_hire_sfc_stage6_bulk PRIVATE Threads::Threads)
+
+add_executable(test_hire_sfc_stage7_acceptance
+    test/hire_sfc_stage7_acceptance_test.cpp)
+target_include_directories(test_hire_sfc_stage7_acceptance PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/benchmark)
+target_link_libraries(test_hire_sfc_stage7_acceptance PRIVATE Threads::Threads)
 
 add_executable(bench_glin_wkt src/benchmark/bench_glin_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_link_libraries(bench_glin_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
@@ -108,6 +147,13 @@ target_include_directories(bench_hybrid_wkt_piece PUBLIC ${GLIN_WKT_INCLUDE_DIRS
 enable_testing()
 add_test(NAME test_glin COMMAND test_glin)
 add_test(NAME test_glin_piece COMMAND test_glin_piece)
+add_test(NAME test_hire_internal_directory COMMAND test_hire_internal_directory)
+add_test(NAME test_hire_sfc_stage2 COMMAND test_hire_sfc_stage2)
+add_test(NAME test_hire_sfc_stage3_cost COMMAND test_hire_sfc_stage3_cost)
+add_test(NAME test_hire_sfc_stage4_rcu COMMAND test_hire_sfc_stage4_rcu)
+add_test(NAME test_hire_sfc_stage5_transform COMMAND test_hire_sfc_stage5_transform)
+add_test(NAME test_hire_sfc_stage6_bulk COMMAND test_hire_sfc_stage6_bulk)
+add_test(NAME test_hire_sfc_stage7_acceptance COMMAND test_hire_sfc_stage7_acceptance)
 
 if(UNIX AND NOT APPLE)
   set(GLIN_TEST_LIBRARY_PATHS /usr/lib/x86_64-linux-gnu)
@@ -119,9 +165,9 @@ if(UNIX AND NOT APPLE)
   if(DEFINED ENV{LD_LIBRARY_PATH})
     list(APPEND GLIN_TEST_LIBRARY_PATHS "$ENV{LD_LIBRARY_PATH}")
   endif()
-  set_target_properties(test_glin test_glin_piece bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries generate_synthetic_points convert_binary_points_to_wkt generate_synthetic_rectangles bench_boost_rtree_wkt bench_geos_quadtree_wkt bench_interval_overlap_wkt bench_dynamic_extent_wkt bench_dynamic_compare_wkt bench_index_size_wkt export_zrange_cdf_wkt bench_update_wkt bench_update_wkt_piece bench_hybrid_wkt_piece
+  set_target_properties(test_glin test_glin_piece test_hire_internal_directory test_hire_sfc_stage2 test_hire_sfc_stage3_cost test_hire_sfc_stage4_rcu test_hire_sfc_stage5_transform test_hire_sfc_stage6_bulk test_hire_sfc_stage7_acceptance bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries generate_synthetic_points convert_binary_points_to_wkt generate_synthetic_rectangles bench_boost_rtree_wkt bench_geos_quadtree_wkt bench_interval_overlap_wkt bench_dynamic_extent_wkt bench_dynamic_compare_wkt bench_index_size_wkt export_zrange_cdf_wkt bench_update_wkt bench_update_wkt_piece bench_hybrid_wkt_piece
     PROPERTIES BUILD_RPATH "${GLIN_TEST_LIBRARY_PATHS}")
   list(JOIN GLIN_TEST_LIBRARY_PATHS ":" GLIN_TEST_LIBRARY_PATH)
-  set_tests_properties(test_glin test_glin_piece
+  set_tests_properties(test_glin test_glin_piece test_hire_internal_directory test_hire_sfc_stage2 test_hire_sfc_stage3_cost test_hire_sfc_stage4_rcu test_hire_sfc_stage5_transform test_hire_sfc_stage6_bulk test_hire_sfc_stage7_acceptance
     PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${GLIN_TEST_LIBRARY_PATH}")
 endif()

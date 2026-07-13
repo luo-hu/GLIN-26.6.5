@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# Keep a silent shell-level stdout redirection from looking like a stalled run.
+stdout_target="$(readlink "/proc/$$/fd/1" 2>/dev/null || true)"
+if [[ "$stdout_target" == "/dev/null" ]]; then
+  echo "Warning: runner stdout points to /dev/null; progress output is hidden." >&2
+  echo 'Run `exec >/dev/tty 2>&1` in this terminal, then start the runner again.' >&2
+fi
+
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'USAGE'
 用法：
@@ -19,6 +26,11 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   DELI-ALEX-Hybrid-Cost
   DELI-ALEX-Hybrid-SingleStore
   DELI-ALEX-Hybrid-SingleStore-Cost
+  DELI_ADAPTIVE_PRL_FUSION
+  RLR_LITE_CS
+  RLR_LITE_CS_SPLIT
+  HIRE_SFC_LITE
+  HIRE_SFC_FULL
   Boost R-tree
   GEOS Quadtree
   GLIN-piece
@@ -844,7 +856,11 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
         raw_csv="$RESULT_DIR/${dataset}_${tag}_${raw_suffix_for_prl}.csv"
         if should_run_file "$raw_csv"; then
           echo "Running dynamic compare dataset=$dataset selectivity=$tag workload=$WORKLOAD_MODE profile=$profile predicate_shortcuts=$predicate_shortcuts_value"
-          "$BUILD_DIR/bench_dynamic_compare_wkt" \
+          benchmark_prefix=()
+          if command -v stdbuf >/dev/null 2>&1; then
+            benchmark_prefix=(stdbuf -oL -eL)
+          fi
+          "${benchmark_prefix[@]}" "$BUILD_DIR/bench_dynamic_compare_wkt" \
           --data_file "$data_file" \
           --query_file "$query_file" \
           --dataset_name "$dataset" \
