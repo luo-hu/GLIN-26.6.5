@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/cmake_build_helpers.sh"
 
 # Keep a silent shell-level stdout redirection from looking like a stalled run.
 stdout_target="$(readlink "/proc/$$/fd/1" 2>/dev/null || true)"
@@ -610,6 +611,7 @@ if [[ "$RESET_RESULTS" == "1" ]]; then
 fi
 
 if [[ "$AUTO_BUILD" == "1" && "$RUN_BENCHMARKS" == "1" ]]; then
+  cmake_configure_build_dir "$BUILD_DIR"
   cmake --build "$BUILD_DIR" --target bench_dynamic_compare_wkt -j2
 fi
 
