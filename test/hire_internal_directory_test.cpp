@@ -55,6 +55,23 @@ void erase_leaf(std::vector<LeafEntry>& entries, std::size_t id) {
       entries.end());
 }
 
+Directory::LeafSummary spatial_leaf(std::size_t id, double min_key,
+                                    double max_key, double max_zmax,
+                                    double xmin, double ymin, double xmax,
+                                    double ymax) {
+  Directory::LeafSummary summary;
+  summary.leaf_id = id;
+  summary.min_key = min_key;
+  summary.max_key = max_key;
+  summary.max_zmax = max_zmax;
+  summary.xmin = xmin;
+  summary.ymin = ymin;
+  summary.xmax = xmax;
+  summary.ymax = ymax;
+  summary.spatial_valid = true;
+  return summary;
+}
+
 }  // namespace
 
 int main() {
@@ -120,6 +137,40 @@ int main() {
     left_max = new_max;
   }
   verify_routes(directory, entries);
+
+  Directory spatial_directory;
+  std::vector<Directory::LeafSummary> spatial_entries{
+      spatial_leaf(201, 0.0, 10.0, 8.0, 0.0, 0.0, 1.0, 1.0),
+      spatial_leaf(202, 11.0, 20.0, 18.0, 10.0, 10.0, 11.0, 11.0),
+      spatial_leaf(203, 21.0, 30.0, 28.0, 20.0, 20.0, 21.0, 21.0),
+      spatial_leaf(204, 31.0, 40.0, 38.0, 30.0, 30.0, 31.0, 31.0),
+      spatial_leaf(205, 41.0, 50.0, 48.0, 40.0, 40.0, 41.0, 41.0),
+  };
+  spatial_directory.bulk_load(spatial_entries);
+  std::vector<std::size_t> candidates;
+  Directory::SearchStats spatial_stats;
+  spatial_directory.find_spatial_candidate_leaves(
+      12.0, 23.0, 9.5, 9.5, 11.5, 11.5, candidates, &spatial_stats);
+  require(candidates == std::vector<std::size_t>{202},
+          "subtree spatial summary did not prune disjoint leaves");
+  require(spatial_stats.visited_nodes > 0,
+          "spatial traversal did not visit the directory");
+
+  spatial_entries[2] =
+      spatial_leaf(203, 21.0, 30.0, 28.0, 10.5, 10.5, 21.0, 21.0);
+  spatial_directory.update_leaf_summary(spatial_entries[2]);
+  spatial_directory.find_spatial_candidate_leaves(
+      12.0, 23.0, 9.5, 9.5, 11.5, 11.5, candidates, nullptr);
+  require(candidates == std::vector<std::size_t>({202, 203}),
+          "updated spatial summary was not propagated to the root");
+
+  Directory duplicate_directory;
+  duplicate_directory.bulk_load(
+      std::vector<LeafEntry>{{301, 10.0}, {302, 10.0}, {303, 20.0}});
+  require(duplicate_directory.find_leaf(10.0) == 301,
+          "read routing lost its left-biased duplicate boundary");
+  require(duplicate_directory.find_leaf_for_insert(10.0) == 302,
+          "insert routing lost its right-biased duplicate boundary");
 
   const Directory::DebugStats stats = directory.debug_stats();
   require(stats.internal_split_count > 0, "internal split was not triggered");

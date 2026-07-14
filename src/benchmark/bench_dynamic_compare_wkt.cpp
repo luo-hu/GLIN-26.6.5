@@ -103,6 +103,7 @@ struct Options {
   std::size_t cost_partition_step = 0;
   std::size_t cost_partition_query_sample = 128;
   bool predicate_shortcuts = true;
+  bool representative_point_shortcuts = true;
   bool lazy_alex_delete = true;
   bool defer_delete_summary_refresh = true;
   double piece_limit = 10000.0;
@@ -167,6 +168,7 @@ struct QueryResult {
   std::size_t interval_candidates = 0;
   std::size_t mbr_candidates = 0;
   std::size_t exact_calls = 0;
+  long long geos_exact_ns = 0;
   std::unordered_set<ObjectId> answers;
 };
 
@@ -187,6 +189,7 @@ struct QueryAggregate {
   std::size_t interval_candidates = 0;
   std::size_t mbr_candidates = 0;
   std::size_t exact_calls = 0;
+  long long geos_exact_ns = 0;
   std::size_t answers = 0;
   std::size_t zero_answer_queries = 0;
 };
@@ -223,6 +226,9 @@ struct CheckpointSummary {
   std::size_t interval_candidates = 0;
   std::size_t mbr_candidates = 0;
   std::size_t exact_calls = 0;
+  long long geos_exact_ns = 0;
+  double avg_geos_exact_ns = 0.0;
+  double geos_exact_query_fraction = 0.0;
   std::size_t answers = 0;
   double candidate_answer_ratio = 0.0;
   std::size_t zero_answer_queries = 0;
@@ -286,6 +292,7 @@ void print_usage(const char* program) {
       << "  --cost_partition_step N          DELI-Cost DP candidate split step; 0 uses block_size/8\n"
       << "  --cost_partition_query_sample N  DELI-Cost query samples for partition cost (default: 128)\n"
       << "  --predicate_shortcuts 0|1        Enable exact-safe rectangle-query envelope shortcuts before GEOS (default: 1)\n"
+      << "  --representative_point_shortcuts 0|1  Use a candidate coordinate as an exact-safe positive witness (default: 1)\n"
       << "  --lazy_alex_delete 0|1           DELI-LB/Cost delete only tombstones overlay and skips redundant ALEX erase (default: 1)\n"
       << "  --defer_delete_summary_refresh 0|1  Keep stale-large block summaries after delete until local compaction (default: 1)\n"
       << "  --piece_limit N                  GLIN-piece records per piece (default: 10000)\n"
@@ -403,6 +410,9 @@ Options parse_args(int argc, char* argv[]) {
           static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--predicate_shortcuts") {
       options.predicate_shortcuts = std::stoi(require_value(key)) != 0;
+    } else if (key == "--representative_point_shortcuts") {
+      options.representative_point_shortcuts =
+          std::stoi(require_value(key)) != 0;
     } else if (key == "--lazy_alex_delete") {
       options.lazy_alex_delete = std::stoi(require_value(key)) != 0;
     } else if (key == "--defer_delete_summary_refresh") {
@@ -655,6 +665,63 @@ bool rectangle_query_contains_candidate_envelope(
          envelope_contains(query_envelope, candidate_envelope);
 }
 
+enum class RectangleShortcutKind {
+  None = 0,
+  EnvelopeContains = 1,
+  RepresentativePoint = 2
+};
+
+RectangleShortcutKind rectangle_query_candidate_shortcut(
+    const Options& options, bool enabled,
+    const geos::geom::Envelope& query_envelope,
+    const Geometry& candidate) {
+  if (!enabled || !options.predicate_shortcuts) {
+    return RectangleShortcutKind::None;
+  }
+  if (envelope_contains(query_envelope,
+                        *candidate.getEnvelopeInternal())) {
+    return RectangleShortcutKind::EnvelopeContains;
+  }
+  const geos::geom::Coordinate* coordinate =
+      options.representative_point_shortcuts
+          ? candidate.getCoordinate()
+          : nullptr;
+  if (coordinate != nullptr && coordinate->x >= query_envelope.getMinX() &&
+      coordinate->x <= query_envelope.getMaxX() &&
+      coordinate->y >= query_envelope.getMinY() &&
+      coordinate->y <= query_envelope.getMaxY()) {
+    return RectangleShortcutKind::RepresentativePoint;
+  }
+  return RectangleShortcutKind::None;
+}
+
+bool account_rectangle_shortcut(RectangleShortcutKind kind,
+                                std::size_t& predicate_shortcuts,
+                                std::size_t& envelope_shortcuts,
+                                std::size_t& representative_shortcuts) {
+  if (kind == RectangleShortcutKind::None) {
+    return false;
+  }
+  ++predicate_shortcuts;
+  if (kind == RectangleShortcutKind::EnvelopeContains) {
+    ++envelope_shortcuts;
+  } else {
+    ++representative_shortcuts;
+  }
+  return true;
+}
+
+bool timed_geos_intersects(const Geometry* query, const Geometry* candidate,
+                           std::size_t& exact_calls,
+                           long long& geos_exact_ns) {
+  ++exact_calls;
+  const auto start = std::chrono::high_resolution_clock::now();
+  const bool result = query->intersects(candidate);
+  const auto end = std::chrono::high_resolution_clock::now();
+  geos_exact_ns += ns_count(end - start);
+  return result;
+}
+
 BoostBox boost_box_from_envelope(const geos::geom::Envelope& envelope) {
   return BoostBox(BoostPoint(envelope.getMinX(), envelope.getMinY()),
                   BoostPoint(envelope.getMaxX(), envelope.getMaxY()));
@@ -899,8 +966,9 @@ class DynamicExtentIndex {
           continue;
         }
         ++result.mbr_candidates;
-        ++result.exact_calls;
-        if (query_case.geometry->intersects(record.geometry)) {
+        if (timed_geos_intersects(query_case.geometry, record.geometry,
+                                  result.exact_calls,
+                                  result.geos_exact_ns)) {
           result.answers.insert(record.object_id);
         }
       }
@@ -1291,6 +1359,7 @@ void add_query_result(QueryAggregate& aggregate, const QueryResult& result) {
   aggregate.interval_candidates += result.interval_candidates;
   aggregate.mbr_candidates += result.mbr_candidates;
   aggregate.exact_calls += result.exact_calls;
+  aggregate.geos_exact_ns += result.geos_exact_ns;
   aggregate.answers += result.answers.size();
   if (result.answers.empty()) {
     ++aggregate.zero_answer_queries;
@@ -1353,9 +1422,15 @@ struct CompareSummary {
   std::size_t delta_records_scanned = 0;
   std::size_t mbr_candidates = 0;
   std::size_t predicate_shortcuts = 0;
+  std::size_t envelope_shortcuts = 0;
+  std::size_t representative_point_shortcuts = 0;
   int predicate_shortcuts_enabled = 0;
+  int representative_point_shortcuts_enabled = 0;
   std::size_t candidates = 0;
   std::size_t exact_calls = 0;
+  long long geos_exact_ns = 0;
+  double avg_geos_exact_ns = 0.0;
+  double geos_exact_query_fraction = 0.0;
   std::size_t answers = 0;
   double candidate_answer_ratio = 0.0;
   std::size_t zero_answer_queries = 0;
@@ -1412,8 +1487,11 @@ struct SimpleQueryResult {
   std::size_t delta_records_scanned = 0;
   std::size_t mbr_candidates = 0;
   std::size_t predicate_shortcuts = 0;
+  std::size_t envelope_shortcuts = 0;
+  std::size_t representative_point_shortcuts = 0;
   std::size_t candidates = 0;
   std::size_t exact_calls = 0;
+  long long geos_exact_ns = 0;
   std::unordered_set<ObjectId> answers;
 };
 
@@ -1425,8 +1503,11 @@ struct SimpleQueryAggregate {
   std::size_t delta_records_scanned = 0;
   std::size_t mbr_candidates = 0;
   std::size_t predicate_shortcuts = 0;
+  std::size_t envelope_shortcuts = 0;
+  std::size_t representative_point_shortcuts = 0;
   std::size_t candidates = 0;
   std::size_t exact_calls = 0;
+  long long geos_exact_ns = 0;
   std::size_t answers = 0;
   std::size_t zero_answer_queries = 0;
 };
@@ -1440,8 +1521,12 @@ void add_simple_query_result(SimpleQueryAggregate& aggregate,
   aggregate.delta_records_scanned += result.delta_records_scanned;
   aggregate.mbr_candidates += result.mbr_candidates;
   aggregate.predicate_shortcuts += result.predicate_shortcuts;
+  aggregate.envelope_shortcuts += result.envelope_shortcuts;
+  aggregate.representative_point_shortcuts +=
+      result.representative_point_shortcuts;
   aggregate.candidates += result.candidates;
   aggregate.exact_calls += result.exact_calls;
+  aggregate.geos_exact_ns += result.geos_exact_ns;
   aggregate.answers += result.answers.size();
   if (result.answers.empty()) {
     ++aggregate.zero_answer_queries;
@@ -1607,8 +1692,9 @@ class DeliAlexIndex {
             continue;
           }
           ++result.candidates;
-          ++result.exact_calls;
-          if (query_case.geometry->intersects(geometry)) {
+          if (timed_geos_intersects(query_case.geometry, geometry,
+                                    result.exact_calls,
+                                    result.geos_exact_ns)) {
             result.answers.insert(meta->object_id);
           }
         }
@@ -2027,8 +2113,10 @@ class CompactQueryOverlay {
           continue;
         }
         ++result.candidates;
-        ++result.exact_calls;
-        if (query_case.geometry->intersects(geometries_[oid].get())) {
+        if (timed_geos_intersects(query_case.geometry,
+                                  geometries_[oid].get(),
+                                  result.exact_calls,
+                                  result.geos_exact_ns)) {
           result.answers.insert(oid);
         }
       }
@@ -2822,8 +2910,10 @@ class BufferedCompactQueryOverlay {
         continue;
       }
       ++result.candidates;
-      ++result.exact_calls;
-      if (query_case.geometry->intersects(geometries_[oid].get())) {
+      if (timed_geos_intersects(query_case.geometry,
+                                geometries_[oid].get(),
+                                result.exact_calls,
+                                result.geos_exact_ns)) {
         result.answers.insert(oid);
       }
     }
@@ -2850,8 +2940,10 @@ class BufferedCompactQueryOverlay {
         continue;
       }
       ++result.candidates;
-      ++result.exact_calls;
-      if (query_case.geometry->intersects(geometries_[oid].get())) {
+      if (timed_geos_intersects(query_case.geometry,
+                                geometries_[oid].get(),
+                                result.exact_calls,
+                                result.geos_exact_ns)) {
         result.answers.insert(oid);
       }
     }
@@ -3822,6 +3914,7 @@ class LocalBoundedCompactQueryOverlay {
           if (query_rectangle_contains_object_envelope(query_envelope,
                                                        meta.envelope)) {
             ++result.predicate_shortcuts;
+            ++result.envelope_shortcuts;
             result.answers.insert(oid);
             return;
           }
@@ -3829,8 +3922,19 @@ class LocalBoundedCompactQueryOverlay {
       }
     }
 
-    ++result.exact_calls;
-    if (query_case.geometry->intersects(geometries_[oid].get())) {
+    if (account_rectangle_shortcut(
+            rectangle_query_candidate_shortcut(
+                options_, options_.predicate_shortcuts, query_envelope,
+                *geometries_[oid]),
+            result.predicate_shortcuts, result.envelope_shortcuts,
+            result.representative_point_shortcuts)) {
+      result.answers.insert(oid);
+      return;
+    }
+
+    if (timed_geos_intersects(query_case.geometry, geometries_[oid].get(),
+                              result.exact_calls,
+                              result.geos_exact_ns)) {
       result.answers.insert(oid);
     }
   }
@@ -4307,15 +4411,20 @@ class LocalBoundedCompactQueryOverlay {
       if (oid >= live_.size() || !live_[oid]) {
         return;
       }
-      const GeometryMeta& meta = metadata_[oid];
       ++result.mbr_candidates;
-      if (enable_shortcuts && envelope_contains(query_envelope, meta.envelope)) {
-        ++result.predicate_shortcuts;
+      if (account_rectangle_shortcut(
+              rectangle_query_candidate_shortcut(
+                  options_, enable_shortcuts, query_envelope,
+                  *geometries_[oid]),
+              result.predicate_shortcuts, result.envelope_shortcuts,
+              result.representative_point_shortcuts)) {
         result.answers.insert(oid);
         return;
       }
-      ++result.exact_calls;
-      if (query_case.geometry->intersects(geometries_[oid].get())) {
+      if (timed_geos_intersects(query_case.geometry,
+                                geometries_[oid].get(),
+                                result.exact_calls,
+                                result.geos_exact_ns)) {
         result.answers.insert(oid);
       }
     };
@@ -5208,15 +5317,18 @@ SimpleQueryResult query_boost_index(const RTree& rtree,
       continue;
     }
     ++result.mbr_candidates;
-    if (enable_predicate_shortcuts &&
-        rectangle_query_contains_candidate_envelope(
-            options, query_envelope, *geometries[oid]->getEnvelopeInternal())) {
-      ++result.predicate_shortcuts;
+    if (account_rectangle_shortcut(
+            rectangle_query_candidate_shortcut(
+                options, enable_predicate_shortcuts, query_envelope,
+                *geometries[oid]),
+            result.predicate_shortcuts, result.envelope_shortcuts,
+            result.representative_point_shortcuts)) {
       result.answers.insert(oid);
       continue;
     }
-    ++result.exact_calls;
-    if (query_case.geometry->intersects(geometries[oid].get())) {
+    if (timed_geos_intersects(query_case.geometry, geometries[oid].get(),
+                              result.exact_calls,
+                              result.geos_exact_ns)) {
       result.answers.insert(oid);
     }
   }
@@ -5251,15 +5363,18 @@ SimpleQueryResult query_quadtree_index(
       continue;
     }
     ++result.mbr_candidates;
-    if (enable_predicate_shortcuts &&
-        rectangle_query_contains_candidate_envelope(
-            options, query_envelope, *geometries[oid]->getEnvelopeInternal())) {
-      ++result.predicate_shortcuts;
+    if (account_rectangle_shortcut(
+            rectangle_query_candidate_shortcut(
+                options, enable_predicate_shortcuts, query_envelope,
+                *geometries[oid]),
+            result.predicate_shortcuts, result.envelope_shortcuts,
+            result.representative_point_shortcuts)) {
       result.answers.insert(oid);
       continue;
     }
-    ++result.exact_calls;
-    if (query_case.geometry->intersects(geometries[oid].get())) {
+    if (timed_geos_intersects(query_case.geometry, geometries[oid].get(),
+                              result.exact_calls,
+                              result.geos_exact_ns)) {
       result.answers.insert(oid);
     }
   }
@@ -5288,6 +5403,7 @@ SimpleQueryResult query_glin_piece_index(
   result.mbr_candidates = result.candidates;
   result.predicate_shortcuts =
       static_cast<std::size_t>(std::max(0, predicate_shortcut_count));
+  result.envelope_shortcuts = result.predicate_shortcuts;
   result.exact_calls =
       result.candidates >= result.predicate_shortcuts
           ? result.candidates - result.predicate_shortcuts
@@ -5387,15 +5503,18 @@ SimpleQueryResult query_hire_sfc_lite_index(
     if (oid >= geometries.size() || oid >= live.size() || !live[oid]) {
       continue;
     }
-    if (enable_predicate_shortcuts &&
-        rectangle_query_contains_candidate_envelope(
-            options, query_envelope, *geometries[oid]->getEnvelopeInternal())) {
-      ++result.predicate_shortcuts;
+    if (account_rectangle_shortcut(
+            rectangle_query_candidate_shortcut(
+                options, enable_predicate_shortcuts, query_envelope,
+                *geometries[oid]),
+            result.predicate_shortcuts, result.envelope_shortcuts,
+            result.representative_point_shortcuts)) {
       result.answers.insert(oid);
       continue;
     }
-    ++result.exact_calls;
-    if (query_case.geometry->intersects(geometries[oid].get())) {
+    if (timed_geos_intersects(query_case.geometry, geometries[oid].get(),
+                              result.exact_calls,
+                              result.geos_exact_ns)) {
       result.answers.insert(oid);
     }
   }
@@ -5428,15 +5547,18 @@ SimpleQueryResult query_rlr_lite_index(
     if (oid >= geometries.size() || oid >= live.size() || !live[oid]) {
       continue;
     }
-    if (enable_predicate_shortcuts &&
-        rectangle_query_contains_candidate_envelope(
-            options, query_envelope, *geometries[oid]->getEnvelopeInternal())) {
-      ++result.predicate_shortcuts;
+    if (account_rectangle_shortcut(
+            rectangle_query_candidate_shortcut(
+                options, enable_predicate_shortcuts, query_envelope,
+                *geometries[oid]),
+            result.predicate_shortcuts, result.envelope_shortcuts,
+            result.representative_point_shortcuts)) {
       result.answers.insert(oid);
       continue;
     }
-    ++result.exact_calls;
-    if (query_case.geometry->intersects(geometries[oid].get())) {
+    if (timed_geos_intersects(query_case.geometry, geometries[oid].get(),
+                              result.exact_calls,
+                              result.geos_exact_ns)) {
       result.answers.insert(oid);
     }
   }
@@ -5572,12 +5694,20 @@ void append_hire_sfc_debug_csv(
               "mls_final_validation_repair_count,"
               "rcu_snapshot_publish_count,rcu_retired_snapshot_count,"
               "rcu_reclaimed_snapshot_count,rcu_active_reader_count,"
+              "rcu_delta_append_count,rcu_delta_compaction_count,"
+              "rcu_delta_entries,rcu_local_leaf_publish_count,"
+              "rcu_mls_pointer_swap_count,rcu_full_root_publish_count,"
+              "rcu_spatial_summary_publish_count,"
+              "rcu_spatial_tree_node_count,rcu_spatial_tree_levels,"
               "background_job_count,background_job_abort_count,"
               "last_pap_levels,last_pap_sigma,last_mls_covered_leaves,"
               "legacy_forward_attempt_count,legacy_forward_success_count,"
               "legacy_backward_attempt_count,legacy_backward_success_count,"
               "model_downgrade_count,legacy_transform_abort_count,"
               "legacy_coefficient_reject_count,"
+              "legacy_transform_gate_skip_count,"
+              "legacy_regression_cache_refresh_count,"
+              "full_record_ref_rebuild_count,local_record_ref_refresh_count,"
               "last_transform_input_leaves,last_transform_input_records,"
               "last_recalibration_job_kind,"
               "inter_level_bulk_enabled,"
@@ -5661,6 +5791,15 @@ void append_hire_sfc_debug_csv(
          << stats.rcu_retired_snapshot_count << ","
          << stats.rcu_reclaimed_snapshot_count << ","
          << stats.rcu_active_reader_count << ","
+         << stats.rcu_delta_append_count << ","
+         << stats.rcu_delta_compaction_count << ","
+         << stats.rcu_delta_entries << ","
+         << stats.rcu_local_leaf_publish_count << ","
+         << stats.rcu_mls_pointer_swap_count << ","
+         << stats.rcu_full_root_publish_count << ","
+         << stats.rcu_spatial_summary_publish_count << ","
+         << stats.rcu_spatial_tree_node_count << ","
+         << stats.rcu_spatial_tree_levels << ","
          << stats.background_job_count << ","
          << stats.background_job_abort_count << ","
          << stats.last_pap_levels << "," << stats.last_pap_sigma << ","
@@ -5672,6 +5811,10 @@ void append_hire_sfc_debug_csv(
          << stats.model_downgrade_count << ","
          << stats.legacy_transform_abort_count << ","
          << stats.legacy_coefficient_reject_count << ","
+         << stats.legacy_transform_gate_skip_count << ","
+         << stats.legacy_regression_cache_refresh_count << ","
+         << stats.full_record_ref_rebuild_count << ","
+         << stats.local_record_ref_refresh_count << ","
          << stats.last_transform_input_leaves << ","
          << stats.last_transform_input_records << ","
          << stats.last_recalibration_job_kind << ","
@@ -5841,8 +5984,25 @@ CompareSummary finalize_compare_summary(
   summary.delta_records_scanned = aggregate.delta_records_scanned;
   summary.mbr_candidates = aggregate.mbr_candidates;
   summary.predicate_shortcuts = aggregate.predicate_shortcuts;
+  summary.envelope_shortcuts = aggregate.envelope_shortcuts;
+  summary.representative_point_shortcuts =
+      aggregate.representative_point_shortcuts;
+  summary.predicate_shortcuts_enabled = options.predicate_shortcuts ? 1 : 0;
+  summary.representative_point_shortcuts_enabled =
+      options.representative_point_shortcuts ? 1 : 0;
   summary.candidates = aggregate.candidates;
   summary.exact_calls = aggregate.exact_calls;
+  summary.geos_exact_ns = aggregate.geos_exact_ns;
+  summary.avg_geos_exact_ns =
+      aggregate.exact_calls == 0
+          ? 0.0
+          : static_cast<double>(aggregate.geos_exact_ns) /
+                static_cast<double>(aggregate.exact_calls);
+  summary.geos_exact_query_fraction =
+      total_query_ns == 0
+          ? 0.0
+          : static_cast<double>(aggregate.geos_exact_ns) /
+                static_cast<double>(total_query_ns);
   summary.answers = aggregate.answers;
   summary.candidate_answer_ratio =
       static_cast<double>(aggregate.exact_calls) /
@@ -5990,6 +6150,9 @@ CompareSummary convert_deli_summary(const CheckpointSummary& source,
   summary.predicate_shortcuts_enabled = 0;
   summary.candidates = source.exact_calls;
   summary.exact_calls = source.exact_calls;
+  summary.geos_exact_ns = source.geos_exact_ns;
+  summary.avg_geos_exact_ns = source.avg_geos_exact_ns;
+  summary.geos_exact_query_fraction = source.geos_exact_query_fraction;
   summary.answers = source.answers;
   summary.candidate_answer_ratio = source.candidate_answer_ratio;
   summary.zero_answer_queries = source.zero_answer_queries;
@@ -6126,6 +6289,17 @@ CheckpointSummary run_checkpoint(const Options& options,
   summary.interval_candidates = aggregate.interval_candidates;
   summary.mbr_candidates = aggregate.mbr_candidates;
   summary.exact_calls = aggregate.exact_calls;
+  summary.geos_exact_ns = aggregate.geos_exact_ns;
+  summary.avg_geos_exact_ns =
+      aggregate.exact_calls == 0
+          ? 0.0
+          : static_cast<double>(aggregate.geos_exact_ns) /
+                static_cast<double>(aggregate.exact_calls);
+  summary.geos_exact_query_fraction =
+      total_query_ns == 0
+          ? 0.0
+          : static_cast<double>(aggregate.geos_exact_ns) /
+                static_cast<double>(total_query_ns);
   summary.answers = aggregate.answers;
   summary.candidate_answer_ratio =
       static_cast<double>(aggregate.exact_calls) /
@@ -6175,7 +6349,8 @@ void write_csv(const std::string& path, const Options& options,
          "block_split_count,avg_query_ns,p50_query_ns,p95_query_ns,"
          "p99_query_ns,p999_query_ns,records_scanned,visited_blocks,skipped_zmax_blocks,"
          "skipped_mbr_blocks,skipped_block_ratio,interval_candidates,"
-         "mbr_candidates,exact_calls,answers,candidate_answer_ratio,"
+         "mbr_candidates,exact_calls,geos_exact_ns,avg_geos_exact_ns,"
+         "geos_exact_query_fraction,answers,candidate_answer_ratio,"
          "zero_answer_queries,answers_match_boost,missing_count,extra_count,"
          "boost_rebuild_ns,boost_query_ns,insert_ns,delete_ns,insert_tps,"
          "delete_tps,validate_ok,seed,lines_seen,parse_errors\n";
@@ -6202,7 +6377,9 @@ void write_csv(const std::string& path, const Options& options,
            << summary.skipped_mbr_blocks << ","
            << summary.skipped_block_ratio << ","
            << summary.interval_candidates << "," << summary.mbr_candidates
-           << "," << summary.exact_calls << "," << summary.answers << ","
+           << "," << summary.exact_calls << "," << summary.geos_exact_ns
+           << "," << summary.avg_geos_exact_ns << ","
+           << summary.geos_exact_query_fraction << "," << summary.answers << ","
            << summary.candidate_answer_ratio << ","
            << summary.zero_answer_queries << ","
            << summary.answers_match_boost << "," << summary.missing_count
@@ -6356,6 +6533,12 @@ void print_compare_summary(const CompareSummary& summary) {
             << " query_tps=" << summary.query_tps
             << " overall_ops_tps=" << summary.overall_ops_tps
 	            << " candidates=" << summary.candidates
+            << " exact_calls=" << summary.exact_calls
+            << " representative_shortcuts="
+            << summary.representative_point_shortcuts
+            << " avg_geos_exact_ns=" << summary.avg_geos_exact_ns
+            << " geos_exact_fraction="
+            << summary.geos_exact_query_fraction
             << " candidate_answer_ratio=" << summary.candidate_answer_ratio
             << " answers_match_boost=" << summary.answers_match_boost
             << " missing=" << summary.missing_count
@@ -6451,7 +6634,11 @@ void write_compare_csv(const std::string& path,
          "insert_tps,delete_tps,query_tps,overall_ops_tps,avg_query_ns,p50_query_ns,"
          "p95_query_ns,p99_query_ns,p999_query_ns,block_checks,visited_blocks,"
          "compact_records_scanned,delta_records_scanned,mbr_candidates,"
-         "predicate_shortcuts,predicate_shortcuts_enabled,candidates,exact_calls,answers,"
+         "predicate_shortcuts,envelope_shortcuts,"
+         "representative_point_shortcuts,predicate_shortcuts_enabled,"
+         "representative_point_shortcuts_enabled,"
+         "candidates,exact_calls,geos_exact_ns,avg_geos_exact_ns,"
+         "geos_exact_query_fraction,answers,"
          "candidate_answer_ratio,zero_answer_queries,answers_match_boost,"
          "missing_count,extra_count,oracle_build_ns,oracle_query_ns,"
          "block_size,stale_threshold_fraction,delete_compact_fraction,"
@@ -6491,9 +6678,14 @@ void write_compare_csv(const std::string& path,
            << row.block_checks << "," << row.visited_blocks << ","
            << row.compact_records_scanned << ","
            << row.delta_records_scanned << "," << row.mbr_candidates << ","
-           << row.predicate_shortcuts << "," << row.predicate_shortcuts_enabled
-           << "," << row.candidates << ","
-           << row.exact_calls << ","
+           << row.predicate_shortcuts << "," << row.envelope_shortcuts << ","
+           << row.representative_point_shortcuts << ","
+           << row.predicate_shortcuts_enabled << ","
+           << row.representative_point_shortcuts_enabled << ","
+           << row.candidates << ","
+           << row.exact_calls << "," << row.geos_exact_ns << ","
+           << row.avg_geos_exact_ns << ","
+           << row.geos_exact_query_fraction << ","
            << row.answers << "," << row.candidate_answer_ratio << ","
            << row.zero_answer_queries << "," << row.answers_match_boost
            << "," << row.missing_count << "," << row.extra_count << ","
@@ -6668,6 +6860,7 @@ SimpleQueryResult simple_from_deli_query(const QueryResult& source) {
   result.mbr_candidates = source.mbr_candidates;
   result.candidates = source.exact_calls;
   result.exact_calls = source.exact_calls;
+  result.geos_exact_ns = source.geos_exact_ns;
   result.answers = source.answers;
   return result;
 }

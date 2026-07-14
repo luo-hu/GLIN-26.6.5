@@ -162,8 +162,10 @@ void test_fixed_legacy_and_sibling_scan() {
 
   QueryStats query_stats;
   verify_query(index, records, live, 30.0, 35.0, &query_stats);
-  require(query_stats.leaf_sibling_hops > 0,
-          "Full range query did not traverse the sibling chain");
+  require(query_stats.internal_nodes_visited > 0,
+          "Full range query did not traverse the spatial directory");
+  require(query_stats.block_checks < stats.leaf_count,
+          "subtree summaries did not prune any legacy leaf");
 }
 
 }  // namespace

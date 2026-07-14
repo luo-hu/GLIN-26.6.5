@@ -39,6 +39,8 @@ void configure(bool rcu) {
   setenv("HIRE_SFC_ENABLE_MBR_SKIP", "1", 1);
   setenv("HIRE_SFC_ENABLE_COST_RETRAIN", "0", 1);
   setenv("HIRE_SFC_ENABLE_LEGACY_TRANSFORM", "1", 1);
+  setenv("HIRE_SFC_LEGACY_TRANSFORM_UPDATE_THRESHOLD", "1", 1);
+  setenv("HIRE_SFC_LEGACY_TRANSFORM_COOLDOWN_UPDATES", "0", 1);
   setenv("HIRE_SFC_ENABLE_BACKGROUND_RECALIBRATION", rcu ? "1" : "0", 1);
   setenv("HIRE_SFC_ENABLE_RCU_RECALIBRATION", rcu ? "1" : "0", 1);
   setenv("HIRE_SFC_BACKGROUND_TEST_DELAY_US", "0", 1);

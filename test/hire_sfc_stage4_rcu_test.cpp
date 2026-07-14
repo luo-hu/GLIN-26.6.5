@@ -42,6 +42,9 @@ void configure_rcu() {
   setenv("HIRE_SFC_TOMBSTONE_REBUILD_RATIO", "2.0", 1);
   setenv("HIRE_SFC_QUERY_WINDOW_BUCKETS", "4", 1);
   setenv("HIRE_SFC_INTERNAL_FANOUT", "4", 1);
+  setenv("HIRE_SFC_ENABLE_LOCAL_LEAF_BLOCKS", "1", 1);
+  setenv("HIRE_SFC_ENABLE_LOCAL_LEAF_SIMD", "1", 1);
+  setenv("HIRE_SFC_LOCAL_READ_BLOCK_SIZE", "4", 1);
 }
 
 std::vector<std::size_t> query_all(const HireSfcLiteIndex& index) {
@@ -129,8 +132,15 @@ void test_nonblocking_recalibration_and_log_replay() {
           "retrained MLS was not installed exactly once");
   require(stats.background_job_abort_count == 0,
           "background retraining unexpectedly aborted");
-  require(stats.rcu_snapshot_publish_count >= 8,
-          "foreground updates did not publish immutable read versions");
+  require(stats.rcu_full_root_publish_count == 1 &&
+              stats.rcu_snapshot_publish_count == 1,
+          "local MLS RCU republished the complete index root");
+  require(stats.rcu_mls_pointer_swap_count >= 1,
+          "MLS installation did not swap its stable parent-child slot");
+  require(stats.rcu_local_leaf_publish_count >= 4,
+          "foreground updates did not publish local leaf versions");
+  require(stats.rcu_delta_append_count == 0 && stats.rcu_delta_entries == 0,
+          "local MLS RCU leaked updates into a global ReadView delta");
   require(stats.rcu_retired_snapshot_count > 0 &&
               stats.rcu_reclaimed_snapshot_count > 0,
           "RCU grace-period retirement was not observed");
@@ -185,11 +195,104 @@ void test_query_hotness_active_trigger() {
           "active RCU trigger violated the measured cost boundary");
 }
 
+void test_local_spatial_tree_pruning_and_expansion() {
+  configure_rcu();
+  setenv("HIRE_SFC_FORCE_LEGACY", "1", 1);
+  setenv("HIRE_SFC_ENABLE_COST_RETRAIN", "0", 1);
+  setenv("HIRE_SFC_ENABLE_LOCAL_SPATIAL_TREE", "1", 1);
+
+  std::vector<RecordInput> bulk;
+  for (std::size_t id = 0; id < 128; ++id) {
+    bulk.push_back(make_record(id, static_cast<double>(id * 10)));
+  }
+  HireSfcLiteIndex index(256, true);
+  index.bulk_load(bulk);
+
+  std::vector<std::size_t> candidates;
+  hire_sfc_lite::QueryStats stats;
+  index.range_query(399.0, 412.0, Box2D{399.0, -1.0, 412.0, 2.0},
+                    candidates, &stats);
+  require(candidates == std::vector<std::size_t>{40, 41},
+          "local spatial tree changed a narrow query answer");
+  const DebugStats initial = index.debug_stats();
+  require(initial.rcu_spatial_tree_node_count > 1 &&
+              initial.rcu_spatial_tree_levels >= 2,
+          "local spatial tree did not build a hierarchy");
+  require(stats.visited_leaves < initial.leaf_count,
+          "local subtree summaries did not prune any leaves");
+
+  candidates.clear();
+  stats = hire_sfc_lite::QueryStats{};
+  index.range_query(-1.0, 2000.0,
+                    Box2D{549.0, -1.0, 552.0, 2.0}, candidates, &stats);
+  require(candidates == std::vector<std::size_t>{55},
+          "local leaf block summaries changed the query answer");
+  require(stats.leaf_block_checks > 0 && stats.leaf_blocks_pruned > 0,
+          "local leaf block summaries did not prune a block");
+  require(stats.records_scanned < 16,
+          "local leaf block summaries did not reduce record scans");
+
+  require(index.insert(make_record(200, 5000.0)),
+          "out-of-summary insert failed");
+  candidates.clear();
+  stats = hire_sfc_lite::QueryStats{};
+  index.range_query(4999.0, 5002.0,
+                    Box2D{4999.0, -1.0, 5002.0, 2.0}, candidates, &stats);
+  require(candidates == std::vector<std::size_t>{200},
+          "subtree expansion hid a newly published record");
+  require(index.debug_stats().rcu_spatial_summary_publish_count >
+              initial.rcu_spatial_summary_publish_count,
+          "insert did not publish an expanded subtree summary");
+}
+
+void test_local_leaf_simd_matches_scalar() {
+  configure_rcu();
+  setenv("HIRE_SFC_FORCE_LEGACY", "1", 1);
+  setenv("HIRE_SFC_ENABLE_COST_RETRAIN", "0", 1);
+  setenv("HIRE_SFC_ENABLE_LOCAL_LEAF_BLOCKS", "0", 1);
+
+  std::vector<RecordInput> bulk;
+  for (std::size_t id = 0; id < 64; ++id) {
+    bulk.push_back(make_record(id, static_cast<double>(id * 10)));
+  }
+
+  setenv("HIRE_SFC_ENABLE_LOCAL_LEAF_SIMD", "0", 1);
+  HireSfcLiteIndex scalar_index(128, true);
+  scalar_index.bulk_load(bulk);
+  std::vector<std::size_t> scalar_candidates;
+  hire_sfc_lite::QueryStats scalar_stats;
+  scalar_index.range_query(-1.0, 1000.0,
+                           Box2D{109.0, -1.0, 142.0, 2.0},
+                           scalar_candidates, &scalar_stats);
+
+  setenv("HIRE_SFC_ENABLE_LOCAL_LEAF_SIMD", "1", 1);
+  HireSfcLiteIndex simd_index(128, true);
+  simd_index.bulk_load(bulk);
+  std::vector<std::size_t> simd_candidates;
+  hire_sfc_lite::QueryStats simd_stats;
+  simd_index.range_query(-1.0, 1000.0,
+                         Box2D{109.0, -1.0, 142.0, 2.0}, simd_candidates,
+                         &simd_stats);
+
+  require(simd_candidates == scalar_candidates,
+          "SoA/SIMD filtering differs from the scalar fallback");
+  require(simd_candidates ==
+              std::vector<std::size_t>({11, 12, 13, 14}),
+          "SoA/SIMD filtering returned an unexpected answer");
+#if defined(__AVX2__)
+  require(scalar_stats.leaf_simd_batches == 0 &&
+              simd_stats.leaf_simd_batches > 0,
+          "local leaf SIMD switch did not select the AVX2 path");
+#endif
+}
+
 }  // namespace
 
 int main() {
   test_nonblocking_recalibration_and_log_replay();
   test_query_hotness_active_trigger();
+  test_local_spatial_tree_pruning_and_expansion();
+  test_local_leaf_simd_matches_scalar();
   std::cout << "HIRE SFC Stage 4 PAP/MLS/RCU tests passed\n";
   return 0;
 }

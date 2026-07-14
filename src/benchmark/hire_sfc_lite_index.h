@@ -12,6 +12,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -61,6 +62,9 @@ struct RecordInput {
 
 struct QueryStats {
   std::size_t block_checks = 0;
+  std::size_t leaf_block_checks = 0;
+  std::size_t leaf_blocks_pruned = 0;
+  std::size_t leaf_simd_batches = 0;
   std::size_t visited_leaves = 0;
   std::size_t skipped_zmax_leaves = 0;
   std::size_t skipped_mbr_leaves = 0;
@@ -148,6 +152,15 @@ struct DebugStats {
   std::size_t rcu_retired_snapshot_count = 0;
   std::size_t rcu_reclaimed_snapshot_count = 0;
   std::size_t rcu_active_reader_count = 0;
+  std::size_t rcu_delta_append_count = 0;
+  std::size_t rcu_delta_compaction_count = 0;
+  std::size_t rcu_delta_entries = 0;
+  std::size_t rcu_local_leaf_publish_count = 0;
+  std::size_t rcu_mls_pointer_swap_count = 0;
+  std::size_t rcu_full_root_publish_count = 0;
+  std::size_t rcu_spatial_summary_publish_count = 0;
+  std::size_t rcu_spatial_tree_node_count = 0;
+  std::size_t rcu_spatial_tree_levels = 0;
   std::size_t background_job_count = 0;
   std::size_t background_job_abort_count = 0;
   std::size_t last_pap_levels = 0;
@@ -160,6 +173,10 @@ struct DebugStats {
   std::size_t model_downgrade_count = 0;
   std::size_t legacy_transform_abort_count = 0;
   std::size_t legacy_coefficient_reject_count = 0;
+  std::size_t legacy_transform_gate_skip_count = 0;
+  std::size_t legacy_regression_cache_refresh_count = 0;
+  std::size_t full_record_ref_rebuild_count = 0;
+  std::size_t local_record_ref_refresh_count = 0;
   std::size_t last_transform_input_leaves = 0;
   std::size_t last_transform_input_records = 0;
   bool inter_level_bulk_enabled = false;
@@ -210,12 +227,19 @@ enum class LeafKind { Model, Legacy };
 class HireSfcLiteIndex {
  private:
   struct ReadSnapshot;
+  struct ReadView;
+  struct LocalReadLeafHandle;
+  struct LocalSpatialSummary;
+  struct LocalMlsVersion;
+  struct LocalMlsSlot;
+  struct LocalReadTreeNode;
+  struct LocalReadRoot;
   enum class UpdateKind : int;
 
  public:
   explicit HireSfcLiteIndex(std::size_t object_count,
                             bool enable_full_internal_directory = false)
-      : config_(Config::from_env()),
+      : config_(Config::from_env(enable_full_internal_directory)),
         full_internal_directory_(enable_full_internal_directory),
         records_(object_count) {}
 
@@ -241,7 +265,11 @@ class HireSfcLiteIndex {
       lock.lock();
     }
     bulk_load_unlocked(entries);
-    publish_read_snapshot_locked();
+    if (local_mls_rcu_enabled()) {
+      initialize_local_mls_root_locked();
+    } else {
+      publish_read_snapshot_locked();
+    }
     if (lock.owns_lock()) {
       lock.unlock();
     }
@@ -254,17 +282,36 @@ class HireSfcLiteIndex {
       lock.lock();
     }
     const bool inserted = insert_unlocked(input);
+    if (inserted) {
+      ++update_clock_;
+    }
     if (inserted && full_internal_directory_ &&
         config_.enable_legacy_transform && input.id < records_.size() &&
-        records_[input.id].leaf_index < leaves_.size()) {
-      const std::size_t leaf_index = records_[input.id].leaf_index;
+        record_leaf_index(input.id) < leaves_.size()) {
+      const std::size_t leaf_index = record_leaf_index(input.id);
       if (leaves_[leaf_index].kind == LeafKind::Legacy) {
         maybe_schedule_legacy_transformation(leaf_index);
       }
     }
     if (inserted && rcu_enabled()) {
       append_mls_update_locked(UpdateKind::Insert, input, input.id);
-      publish_read_snapshot_locked();
+      if (local_mls_rcu_enabled()) {
+        const std::shared_ptr<const LocalReadRoot> root =
+            std::atomic_load_explicit(&local_read_root_,
+                                      std::memory_order_acquire);
+        if (!root || (root->slots.empty() && !leaves_.empty())) {
+          initialize_local_mls_root_locked();
+        }
+        const bool had_dirty_slot = !dirty_local_mls_slots_.empty();
+        publish_dirty_local_mls_slots_locked();
+        if (!had_dirty_slot) {
+          const std::size_t leaf_index = record_leaf_index(input.id);
+          publish_local_insert_locked(leaf_index, input.id);
+          publish_dirty_local_mls_slots_locked();
+        }
+      } else {
+        append_read_delta_locked(UpdateKind::Insert, input);
+      }
     }
     return inserted;
   }
@@ -275,11 +322,18 @@ class HireSfcLiteIndex {
       lock.lock();
     }
     RecordInput deleted;
+    std::size_t deleted_leaf_id = npos();
+    bool deleted_was_buffer = false;
     if (id < records_.size()) {
       deleted = RecordInput{id, records_[id].zmin, records_[id].zmax,
                             records_[id].box};
+      deleted_leaf_id = records_[id].leaf_id;
+      deleted_was_buffer = records_[id].in_buffer;
     }
     const bool erased = erase_unlocked(id);
+    if (erased) {
+      ++update_clock_;
+    }
     if (erased && full_internal_directory_ &&
         config_.enable_legacy_transform && !leaves_.empty()) {
       const std::size_t leaf_index = find_leaf_for_zmin(deleted.zmin);
@@ -290,7 +344,17 @@ class HireSfcLiteIndex {
     }
     if (erased && rcu_enabled()) {
       append_mls_update_locked(UpdateKind::Erase, deleted, id);
-      publish_read_snapshot_locked();
+      if (local_mls_rcu_enabled()) {
+        const bool had_dirty_slot = !dirty_local_mls_slots_.empty();
+        publish_dirty_local_mls_slots_locked();
+        if (!had_dirty_slot && !leaves_.empty()) {
+          publish_local_erase_locked(deleted_leaf_id, id,
+                                     deleted_was_buffer);
+          publish_dirty_local_mls_slots_locked();
+        }
+      } else {
+        append_read_delta_locked(UpdateKind::Erase, deleted);
+      }
     }
     return erased;
   }
@@ -300,12 +364,23 @@ class HireSfcLiteIndex {
                    std::vector<std::size_t>& candidate_ids,
                    QueryStats* stats) const {
     if (rcu_enabled()) {
-      const std::shared_ptr<const ReadSnapshot> snapshot =
-          std::atomic_load_explicit(&read_snapshot_,
-                                    std::memory_order_acquire);
-      if (snapshot) {
-        range_query_snapshot(*snapshot, raw_qmin, raw_qmax, raw_query_box,
-                             candidate_ids, stats);
+      if (local_mls_rcu_enabled()) {
+        const std::shared_ptr<const LocalReadRoot> root =
+            std::atomic_load_explicit(&local_read_root_,
+                                      std::memory_order_acquire);
+        if (root) {
+          range_query_local_mls(*root, raw_qmin, raw_qmax, raw_query_box,
+                                candidate_ids, stats);
+          return;
+        }
+      }
+      const std::shared_ptr<const ReadView> view =
+          std::atomic_load_explicit(&read_view_, std::memory_order_acquire);
+      if (view && view->snapshot) {
+        range_query_snapshot(*view->snapshot, raw_qmin, raw_qmax,
+                             raw_query_box, candidate_ids, stats);
+        apply_read_deltas(*view, raw_qmin, raw_qmax, raw_query_box,
+                          candidate_ids, stats);
         return;
       }
     }
@@ -336,6 +411,12 @@ class HireSfcLiteIndex {
     rcu_snapshot_publish_count_ = 0;
     rcu_retired_snapshot_count_ = 0;
     rcu_reclaimed_snapshot_count_ = 0;
+    rcu_delta_append_count_ = 0;
+    rcu_delta_compaction_count_ = 0;
+    rcu_local_leaf_publish_count_ = 0;
+    rcu_mls_pointer_swap_count_ = 0;
+    rcu_full_root_publish_count_ = 0;
+    rcu_spatial_summary_publish_count_ = 0;
     background_job_count_ = 0;
     background_job_abort_count_ = 0;
     last_pap_levels_ = 0;
@@ -348,15 +429,31 @@ class HireSfcLiteIndex {
     model_downgrade_count_ = 0;
     legacy_transform_abort_count_ = 0;
     legacy_coefficient_reject_count_ = 0;
+    legacy_transform_gate_skip_count_ = 0;
+    legacy_regression_cache_refresh_count_ = 0;
+    full_record_ref_rebuild_count_ = 0;
+    local_record_ref_refresh_count_ = 0;
+    update_clock_ = 0;
     last_transform_input_leaves_ = 0;
     last_transform_input_records_ = 0;
     last_recalibration_job_kind_ = RecalibrationKind::ModelRetrain;
     bulk_leaf_optimization_stats_ = bulk_loading::OptimizationStats{};
     bulk_load_ns_ = 0;
     next_update_sequence_ = 1;
+    next_read_delta_sequence_ = 1;
     active_recalibrations_.clear();
     read_leaf_cache_.clear();
     retired_read_snapshots_.clear();
+    read_view_.reset();
+    local_read_root_.reset();
+    local_mls_slots_.clear();
+    local_slot_ancestor_paths_.clear();
+    local_slot_deletes_since_spatial_refresh_.clear();
+    local_read_leaf_handles_.clear();
+    dirty_local_mls_slots_.clear();
+    local_mls_generation_ = 0;
+    next_local_read_tree_node_id_ = 1;
+    retired_local_mls_versions_.clear();
     leaf_split_count_ = 0;
     leaf_merge_count_ = 0;
     leaf_redistribution_count_ = 0;
@@ -408,7 +505,7 @@ class HireSfcLiteIndex {
     if (records_[input.id].alive) {
       return false;
     }
-    const std::size_t previous_leaf_index = records_[input.id].leaf_index;
+    const std::size_t previous_leaf_index = record_leaf_index(input.id);
     store_record(input);
     records_[input.id].alive = true;
     ++live_count_;
@@ -471,7 +568,7 @@ class HireSfcLiteIndex {
     apply_pending_rebuilds();
     records_[id].alive = false;
     --live_count_;
-    const std::size_t leaf_index = records_[id].leaf_index;
+    const std::size_t leaf_index = record_leaf_index(id);
     if (leaf_index < leaves_.size()) {
       if (full_internal_directory_ &&
           leaves_[leaf_index].kind == LeafKind::Legacy) {
@@ -521,6 +618,34 @@ class HireSfcLiteIndex {
     }
     const Box2D query_box = normalize(raw_query_box);
     HireInternalDirectory::SearchStats internal_stats;
+    if (full_internal_directory_) {
+      std::vector<std::size_t> leaf_ids;
+      if (config_.enable_spatial_directory_pruning) {
+        internal_directory_.find_spatial_candidate_leaves(
+            qmin, qmax, query_box.xmin, query_box.ymin, query_box.xmax,
+            query_box.ymax, leaf_ids,
+            stats == nullptr ? nullptr : &internal_stats);
+      } else {
+        for (const Leaf& leaf : leaves_) {
+          if (leaf.min_zmin <= qmax) {
+            leaf_ids.push_back(leaf.node_id);
+          }
+        }
+      }
+      if (stats != nullptr) {
+        stats->internal_nodes_visited += internal_stats.visited_nodes;
+        stats->internal_log_entries_scanned +=
+            internal_stats.log_entries_scanned;
+      }
+      for (std::size_t leaf_id : leaf_ids) {
+        const auto found = leaf_id_to_index_.find(leaf_id);
+        if (found != leaf_id_to_index_.end()) {
+          scan_leaf(leaves_[found->second], qmin, qmax, query_box,
+                    candidate_ids, stats);
+        }
+      }
+      return;
+    }
     const std::size_t last_leaf = find_last_leaf_for_qmax(
         qmax, stats == nullptr ? nullptr : &internal_stats);
     if (stats != nullptr) {
@@ -530,24 +655,6 @@ class HireSfcLiteIndex {
       stats->internal_log_entries_scanned += internal_stats.log_entries_scanned;
     }
     if (last_leaf == npos()) {
-      return;
-    }
-    if (full_internal_directory_) {
-      std::size_t leaf_id = leaves_[last_leaf].node_id;
-      std::size_t hops = 0;
-      while (leaf_id != npos() && hops < leaves_.size()) {
-        const auto leaf_it = leaf_id_to_index_.find(leaf_id);
-        if (leaf_it == leaf_id_to_index_.end()) {
-          break;
-        }
-        scan_leaf(leaves_[leaf_it->second], qmin, qmax, query_box,
-                  candidate_ids, stats);
-        leaf_id = leaves_[leaf_it->second].prev_leaf_id;
-        ++hops;
-        if (stats != nullptr && leaf_id != npos()) {
-          ++stats->leaf_sibling_hops;
-        }
-      }
       return;
     }
     for (std::size_t i = 0; i <= last_leaf && i < leaves_.size(); ++i) {
@@ -632,6 +739,11 @@ class HireSfcLiteIndex {
     std::unique_lock<std::mutex> lock(writer_mutex_, std::defer_lock);
     if (rcu_enabled()) {
       lock.lock();
+      if (local_mls_rcu_enabled()) {
+        reclaim_local_mls_versions_locked();
+      } else {
+        reclaim_retired_snapshots_locked();
+      }
     }
     DebugStats stats;
     stats.leaf_count = leaves_.size();
@@ -657,6 +769,27 @@ class HireSfcLiteIndex {
     stats.rcu_reclaimed_snapshot_count = rcu_reclaimed_snapshot_count_;
     stats.rcu_active_reader_count =
         rcu_active_readers_.load(std::memory_order_acquire);
+    stats.rcu_delta_append_count = rcu_delta_append_count_;
+    stats.rcu_delta_compaction_count = rcu_delta_compaction_count_;
+    stats.rcu_local_leaf_publish_count = rcu_local_leaf_publish_count_;
+    stats.rcu_mls_pointer_swap_count = rcu_mls_pointer_swap_count_;
+    stats.rcu_full_root_publish_count = rcu_full_root_publish_count_;
+    stats.rcu_spatial_summary_publish_count =
+        rcu_spatial_summary_publish_count_;
+    if (local_mls_rcu_enabled()) {
+      const std::shared_ptr<const LocalReadRoot> root =
+          std::atomic_load_explicit(&local_read_root_,
+                                    std::memory_order_acquire);
+      if (root) {
+        stats.rcu_spatial_tree_node_count = root->spatial_tree_nodes;
+        stats.rcu_spatial_tree_levels = root->spatial_tree_levels;
+      }
+    }
+    if (!local_mls_rcu_enabled()) {
+      const std::shared_ptr<const ReadView> current_view =
+          std::atomic_load_explicit(&read_view_, std::memory_order_acquire);
+      stats.rcu_delta_entries = current_view ? current_view->delta_count : 0;
+    }
     stats.background_job_count = background_job_count_;
     stats.background_job_abort_count = background_job_abort_count_;
     stats.last_pap_levels = last_pap_levels_;
@@ -670,6 +803,12 @@ class HireSfcLiteIndex {
     stats.legacy_transform_abort_count = legacy_transform_abort_count_;
     stats.legacy_coefficient_reject_count =
         legacy_coefficient_reject_count_;
+    stats.legacy_transform_gate_skip_count =
+        legacy_transform_gate_skip_count_;
+    stats.legacy_regression_cache_refresh_count =
+        legacy_regression_cache_refresh_count_;
+    stats.full_record_ref_rebuild_count = full_record_ref_rebuild_count_;
+    stats.local_record_ref_refresh_count = local_record_ref_refresh_count_;
     stats.last_transform_input_leaves = last_transform_input_leaves_;
     stats.last_transform_input_records = last_transform_input_records_;
     stats.inter_level_bulk_enabled =
@@ -886,7 +1025,7 @@ class HireSfcLiteIndex {
     DebugRecordState state;
     if (id < records_.size()) {
       state.alive = records_[id].alive;
-      state.leaf_index = records_[id].leaf_index;
+      state.leaf_index = record_leaf_index(id);
     }
     for (const Leaf& leaf : leaves_) {
       for (std::size_t record_id : leaf.record_ids) {
@@ -901,10 +1040,37 @@ class HireSfcLiteIndex {
           static_cast<std::size_t>(
               std::count(leaf.buffer_ids.begin(), leaf.buffer_ids.end(), id));
     }
-    const std::shared_ptr<const ReadSnapshot> snapshot =
-        std::atomic_load_explicit(&read_snapshot_, std::memory_order_acquire);
-    if (snapshot) {
-      for (const std::shared_ptr<const ReadLeaf>& leaf : snapshot->leaves) {
+    std::vector<std::shared_ptr<const ReadLeaf>> read_leaves;
+    if (local_mls_rcu_enabled()) {
+      const std::shared_ptr<const LocalReadRoot> root =
+          std::atomic_load_explicit(&local_read_root_,
+                                    std::memory_order_acquire);
+      if (root) {
+        for (const std::shared_ptr<LocalMlsSlot>& slot : root->slots) {
+          const std::shared_ptr<const LocalMlsVersion> version =
+              std::atomic_load_explicit(&slot->version,
+                                        std::memory_order_acquire);
+          if (!version) {
+            continue;
+          }
+          for (const auto& handle : version->leaves) {
+            std::shared_lock<std::shared_timed_mutex> leaf_lock(
+                handle->mutex);
+            read_leaves.push_back(
+                std::make_shared<ReadLeaf>(handle->leaf));
+          }
+        }
+      }
+    } else {
+      const std::shared_ptr<const ReadView> view =
+          std::atomic_load_explicit(&read_view_, std::memory_order_acquire);
+      const std::shared_ptr<const ReadSnapshot> snapshot =
+          view ? view->snapshot : nullptr;
+      if (snapshot) {
+        read_leaves = snapshot->leaves;
+      }
+    }
+    for (const std::shared_ptr<const ReadLeaf>& leaf : read_leaves) {
         state.snapshot_main_occurrences +=
             static_cast<std::size_t>(std::count_if(
                 leaf->records.begin(), leaf->records.end(),
@@ -913,7 +1079,6 @@ class HireSfcLiteIndex {
             static_cast<std::size_t>(std::count_if(
                 leaf->buffer.begin(), leaf->buffer.end(),
                 [&](const ReadRecord& record) { return record.id == id; }));
-      }
     }
     return state;
   }
@@ -944,10 +1109,12 @@ class HireSfcLiteIndex {
           leaf.query_window.capacity() * sizeof(QueryWindowBucket);
     }
     if (rcu_enabled()) {
+      const std::shared_ptr<const ReadView> view =
+          std::atomic_load_explicit(&read_view_, std::memory_order_acquire);
       const std::shared_ptr<const ReadSnapshot> snapshot =
-          std::atomic_load_explicit(&read_snapshot_,
-                                    std::memory_order_acquire);
+          view ? view->snapshot : nullptr;
       if (snapshot) {
+        bytes += sizeof(ReadView);
         bytes += sizeof(ReadSnapshot);
         bytes += snapshot->leaves.capacity() *
                  sizeof(std::shared_ptr<const ReadLeaf>);
@@ -955,6 +1122,7 @@ class HireSfcLiteIndex {
         bytes += snapshot->internal_directory.estimate_bytes();
         bytes += snapshot->leaf_id_to_index.size() *
                  sizeof(std::pair<std::size_t, std::size_t>);
+        bytes += view->delta_count * sizeof(ReadDelta);
       }
       for (const auto& cached : read_leaf_cache_) {
         if (!cached.second.leaf) {
@@ -962,12 +1130,39 @@ class HireSfcLiteIndex {
         }
         bytes += sizeof(ReadLeaf);
         bytes += cached.second.leaf->records.capacity() * sizeof(ReadRecord);
+        bytes += cached.second.leaf->sorted_zmin.capacity() * sizeof(double);
+        bytes += cached.second.leaf->record_zmax.capacity() * sizeof(double);
+        bytes += cached.second.leaf->record_xmin.capacity() * sizeof(double);
+        bytes += cached.second.leaf->record_ymin.capacity() * sizeof(double);
+        bytes += cached.second.leaf->record_xmax.capacity() * sizeof(double);
+        bytes += cached.second.leaf->record_ymax.capacity() * sizeof(double);
+        bytes += cached.second.leaf->blocks.capacity() *
+                 sizeof(ReadBlockSummary);
         bytes += cached.second.leaf->buffer.capacity() * sizeof(ReadRecord);
+        bytes += cached.second.leaf->masked_deleted_ids.size() *
+                 sizeof(std::size_t);
         if (cached.second.leaf->runtime) {
           bytes += sizeof(LeafRuntime);
           bytes += cached.second.leaf->runtime->bucket_count *
                    sizeof(AtomicQueryBucket);
         }
+      }
+      for (const auto& item : local_read_leaf_handles_) {
+        if (!item.second) {
+          continue;
+        }
+        const ReadLeaf& leaf = item.second->leaf;
+        bytes += sizeof(LocalReadLeafHandle);
+        bytes += leaf.records.capacity() * sizeof(ReadRecord);
+        bytes += leaf.sorted_zmin.capacity() * sizeof(double);
+        bytes += leaf.record_zmax.capacity() * sizeof(double);
+        bytes += leaf.record_xmin.capacity() * sizeof(double);
+        bytes += leaf.record_ymin.capacity() * sizeof(double);
+        bytes += leaf.record_xmax.capacity() * sizeof(double);
+        bytes += leaf.record_ymax.capacity() * sizeof(double);
+        bytes += leaf.blocks.capacity() * sizeof(ReadBlockSummary);
+        bytes += leaf.buffer.capacity() * sizeof(ReadRecord);
+        bytes += leaf.masked_deleted_ids.size() * sizeof(std::size_t);
       }
     }
     return bytes;
@@ -989,6 +1184,11 @@ class HireSfcLiteIndex {
     std::size_t directory_log_limit = 256;
     std::size_t legacy_transform_max_leaves = 4;
     std::size_t legacy_backward_min_leaves = 2;
+    std::size_t legacy_transform_update_threshold = 64;
+    std::size_t legacy_transform_cooldown_updates = 256;
+    std::size_t rcu_delta_limit = 1024;
+    std::size_t local_spatial_delete_refresh = 64;
+    std::size_t local_read_block_size = 32;
     double tombstone_rebuild_ratio = 0.25;
     double legacy_min_fill_fraction = 0.40;
     double cost_ema_alpha = 0.20;
@@ -1007,14 +1207,28 @@ class HireSfcLiteIndex {
     bool enable_legacy_transform = true;
     bool enable_background_recalibration = false;
     bool enable_rcu_recalibration = false;
+    bool enable_local_mls_rcu = true;
+    bool enable_local_spatial_tree = true;
+    bool enable_local_leaf_blocks = true;
+    bool enable_local_leaf_simd = false;
+    bool enable_spatial_directory_pruning = true;
 
-    static Config from_env() {
+    static Config from_env(bool paper_profile) {
       Config config;
+      if (paper_profile) {
+        config.leaf_size = 256;
+        config.model_leaf_size = 32768;
+        config.epsilon = 64.0;
+        config.min_model_leaf = 512;
+        config.buffer_limit = 256;
+      }
       config.leaf_size = std::max<std::size_t>(
           16, env_size("HIRE_SFC_LEAF_SIZE", config.leaf_size));
       config.model_leaf_size = std::max<std::size_t>(
           config.leaf_size,
-          env_size("HIRE_SFC_MODEL_LEAF_SIZE", config.leaf_size * 4));
+          env_size("HIRE_SFC_MODEL_LEAF_SIZE",
+                   config.model_leaf_size == 0 ? config.leaf_size * 4
+                                               : config.model_leaf_size));
       config.epsilon = env_double("HIRE_SFC_EPSILON", config.epsilon);
       config.min_model_leaf =
           env_size("HIRE_SFC_MIN_MODEL_LEAF", config.min_model_leaf);
@@ -1046,6 +1260,20 @@ class HireSfcLiteIndex {
       config.legacy_backward_min_leaves = std::max<std::size_t>(
           2, env_size("HIRE_SFC_LEGACY_BACKWARD_MIN_LEAVES",
                       config.legacy_backward_min_leaves));
+      config.legacy_transform_update_threshold = std::max<std::size_t>(
+          1, env_size("HIRE_SFC_LEGACY_TRANSFORM_UPDATE_THRESHOLD",
+                      config.legacy_transform_update_threshold));
+      config.legacy_transform_cooldown_updates = env_size(
+          "HIRE_SFC_LEGACY_TRANSFORM_COOLDOWN_UPDATES",
+          config.legacy_transform_cooldown_updates);
+      config.rcu_delta_limit = std::max<std::size_t>(
+          1, env_size("HIRE_SFC_RCU_DELTA_LIMIT", config.rcu_delta_limit));
+      config.local_spatial_delete_refresh = std::max<std::size_t>(
+          1, env_size("HIRE_SFC_LOCAL_SPATIAL_DELETE_REFRESH",
+                      config.local_spatial_delete_refresh));
+      config.local_read_block_size = std::max<std::size_t>(
+          4, env_size("HIRE_SFC_LOCAL_READ_BLOCK_SIZE",
+                      config.local_read_block_size));
       config.tombstone_rebuild_ratio =
           env_double("HIRE_SFC_TOMBSTONE_REBUILD_RATIO",
                      config.tombstone_rebuild_ratio);
@@ -1098,6 +1326,20 @@ class HireSfcLiteIndex {
       config.enable_rcu_recalibration =
           env_bool("HIRE_SFC_ENABLE_RCU_RECALIBRATION",
                    config.enable_rcu_recalibration);
+      config.enable_local_mls_rcu = env_bool(
+          "HIRE_SFC_ENABLE_LOCAL_MLS_RCU", config.enable_local_mls_rcu);
+      config.enable_local_spatial_tree = env_bool(
+          "HIRE_SFC_ENABLE_LOCAL_SPATIAL_TREE",
+          config.enable_local_spatial_tree);
+      config.enable_local_leaf_blocks = env_bool(
+          "HIRE_SFC_ENABLE_LOCAL_LEAF_BLOCKS",
+          config.enable_local_leaf_blocks);
+      config.enable_local_leaf_simd = env_bool(
+          "HIRE_SFC_ENABLE_LOCAL_LEAF_SIMD",
+          config.enable_local_leaf_simd);
+      config.enable_spatial_directory_pruning = env_bool(
+          "HIRE_SFC_ENABLE_SPATIAL_DIRECTORY_PRUNING",
+          config.enable_spatial_directory_pruning);
       return config;
     }
 
@@ -1162,6 +1404,7 @@ class HireSfcLiteIndex {
     bool alive = false;
     bool in_buffer = false;
     std::size_t leaf_index = npos();
+    std::size_t leaf_id = npos();
   };
 
   struct AtomicQueryBucket {
@@ -1189,6 +1432,20 @@ class HireSfcLiteIndex {
     Box2D box;
   };
 
+  struct ReadDelta {
+    std::uint64_t sequence = 0;
+    UpdateKind kind = UpdateKind::Insert;
+    ReadRecord record;
+    std::shared_ptr<const ReadDelta> previous;
+  };
+
+  struct ReadBlockSummary {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+    double max_zmax = -std::numeric_limits<double>::infinity();
+    Box2D mbr;
+  };
+
   struct ReadLeaf {
     std::size_t node_id = npos();
     std::uint64_t version = 0;
@@ -1198,7 +1455,15 @@ class HireSfcLiteIndex {
     double max_zmax = -std::numeric_limits<double>::infinity();
     Box2D mbr;
     std::vector<ReadRecord> records;
+    std::vector<double> sorted_zmin;
+    std::vector<double> record_zmax;
+    std::vector<double> record_xmin;
+    std::vector<double> record_ymin;
+    std::vector<double> record_xmax;
+    std::vector<double> record_ymax;
+    std::vector<ReadBlockSummary> blocks;
     std::vector<ReadRecord> buffer;
+    std::unordered_set<std::size_t> masked_deleted_ids;
     std::shared_ptr<LeafRuntime> runtime;
   };
 
@@ -1208,6 +1473,51 @@ class HireSfcLiteIndex {
     std::unordered_map<std::size_t, std::size_t> leaf_id_to_index;
     std::vector<std::shared_ptr<const ReadLeaf>> leaves;
     std::vector<double> min_zmin;
+  };
+
+  struct ReadView {
+    std::shared_ptr<const ReadSnapshot> snapshot;
+    std::shared_ptr<const ReadDelta> delta_head;
+    std::size_t delta_count = 0;
+  };
+
+  struct LocalReadLeafHandle {
+    std::size_t node_id = npos();
+    mutable std::shared_timed_mutex mutex;
+    ReadLeaf leaf;
+  };
+
+  struct LocalSpatialSummary {
+    bool valid = false;
+    double min_zmin = std::numeric_limits<double>::infinity();
+    double max_zmax = -std::numeric_limits<double>::infinity();
+    Box2D mbr;
+  };
+
+  struct LocalMlsVersion {
+    std::uint64_t generation = 0;
+    std::vector<std::shared_ptr<LocalReadLeafHandle>> leaves;
+  };
+
+  struct LocalMlsSlot {
+    std::size_t slot_id = npos();
+    std::shared_ptr<const LocalMlsVersion> version;
+    std::shared_ptr<const LocalSpatialSummary> spatial_summary;
+  };
+
+  struct LocalReadTreeNode {
+    std::size_t node_id = npos();
+    std::vector<std::shared_ptr<LocalReadTreeNode>> children;
+    std::vector<std::shared_ptr<LocalMlsSlot>> slots;
+    std::shared_ptr<const LocalSpatialSummary> spatial_summary;
+  };
+
+  struct LocalReadRoot {
+    std::uint64_t generation = 0;
+    std::vector<std::shared_ptr<LocalMlsSlot>> slots;
+    std::shared_ptr<LocalReadTreeNode> spatial_root;
+    std::size_t spatial_tree_nodes = 0;
+    std::size_t spatial_tree_levels = 0;
   };
 
   struct ReadLeafCacheEntry {
@@ -1243,6 +1553,7 @@ class HireSfcLiteIndex {
 
   struct Leaf {
     std::size_t node_id = npos();
+    std::size_t read_slot_id = npos();
     LeafKind kind = LeafKind::Legacy;
     std::vector<std::size_t> record_ids;
     std::vector<std::size_t> buffer_ids;
@@ -1253,6 +1564,8 @@ class HireSfcLiteIndex {
     std::size_t next_leaf_id = npos();
     double min_zmin = std::numeric_limits<double>::infinity();
     double max_zmin = -std::numeric_limits<double>::infinity();
+    double published_directory_max_zmin =
+        -std::numeric_limits<double>::infinity();
     double max_zmax = -std::numeric_limits<double>::infinity();
     Box2D mbr;
     double slope = 0.0;
@@ -1264,6 +1577,11 @@ class HireSfcLiteIndex {
     mutable std::vector<QueryWindowBucket> query_window;
     mutable std::size_t cost_sample_sequence = 0;
     std::uint64_t read_version = 0;
+    std::size_t legacy_updates_since_transform = 0;
+    std::uint64_t next_legacy_transform_update = 0;
+    double transform_slope = 0.0;
+    double transform_intercept = 0.0;
+    bool regression_cache_valid = false;
     bool pending_rebuild = false;
   };
 
@@ -1277,10 +1595,36 @@ class HireSfcLiteIndex {
     return std::numeric_limits<std::size_t>::max();
   }
 
+  std::size_t record_leaf_index(std::size_t id) const {
+    if (id >= records_.size()) {
+      return npos();
+    }
+    const Record& record = records_[id];
+    if (full_internal_directory_) {
+      const auto found = leaf_id_to_index_.find(record.leaf_id);
+      return found == leaf_id_to_index_.end() ? npos() : found->second;
+    }
+    return record.leaf_index;
+  }
+
+  void set_record_owner(std::size_t id, std::size_t leaf_index,
+                        bool in_buffer) {
+    if (id >= records_.size() || leaf_index >= leaves_.size()) {
+      return;
+    }
+    records_[id].leaf_index = leaf_index;
+    records_[id].leaf_id = leaves_[leaf_index].node_id;
+    records_[id].in_buffer = in_buffer;
+  }
+
   bool rcu_enabled() const {
     return full_internal_directory_ &&
            config_.enable_background_recalibration &&
            config_.enable_rcu_recalibration;
+  }
+
+  bool local_mls_rcu_enabled() const {
+    return rcu_enabled() && config_.enable_local_mls_rcu;
   }
 
   void touch_leaf(Leaf& leaf) { leaf.read_version = next_read_version_++; }
@@ -1460,6 +1804,9 @@ class HireSfcLiteIndex {
     leaf.query_count_recent = 0;
     leaf.query_window.clear();
     leaf.cost_sample_sequence = 0;
+    leaf.legacy_updates_since_transform = 0;
+    leaf.next_legacy_transform_update = 0;
+    leaf.regression_cache_valid = false;
     bool have_box = false;
     for (std::size_t id : leaf.record_ids) {
       const Record& record = records_[id];
@@ -1483,6 +1830,7 @@ class HireSfcLiteIndex {
       leaf.mbr = Box2D{};
     }
     fit_leaf_model(leaf);
+    leaf.regression_cache_valid = false;
     if (full_internal_directory_ && leaf.kind == LeafKind::Legacy) {
       prepare_legacy_storage(leaf);
     } else {
@@ -1585,8 +1933,8 @@ class HireSfcLiteIndex {
       leaf.buffer_positions[id] = leaf.buffer_ids.size();
     }
     leaf.buffer_ids.push_back(id);
-    records_[id].leaf_index = leaf_index;
-    records_[id].in_buffer = true;
+    leaf.regression_cache_valid = false;
+    set_record_owner(id, leaf_index, true);
   }
 
   void refresh_leaf_bounds(Leaf& leaf) {
@@ -1642,6 +1990,7 @@ class HireSfcLiteIndex {
     }
     leaf.buffer_ids.pop_back();
     leaf.buffer_positions.erase(position_it);
+    leaf.regression_cache_valid = false;
     records_[id].in_buffer = false;
     if (leaf.live_count > 0) {
       --leaf.live_count;
@@ -1674,11 +2023,12 @@ class HireSfcLiteIndex {
           return record_id_less(existing_id, inserted_id);
         });
     leaf.record_ids.insert(position, id);
-    records_[id].leaf_index = leaf_index;
-    records_[id].in_buffer = false;
+    set_record_owner(id, leaf_index, false);
     expand_leaf_on_insert(leaf, RecordInput{id, records_[id].zmin,
                                             records_[id].zmax,
                                             records_[id].box});
+    ++leaf.legacy_updates_since_transform;
+    leaf.regression_cache_valid = false;
     note_directory_update(leaf_index);
   }
 
@@ -1691,26 +2041,31 @@ class HireSfcLiteIndex {
     combined.push_back(inserted_id);
     sort_ids(combined);
     const std::size_t split = combined.size() / 2;
+    const std::size_t read_slot_id = leaves_[leaf_index].read_slot_id;
     Leaf right;
     assign_leaf_node_id(right);
+    right.read_slot_id = read_slot_id;
     leaves_[leaf_index].record_ids.assign(
         combined.begin(), combined.begin() + static_cast<long>(split));
     right.record_ids.assign(combined.begin() + static_cast<long>(split),
                             combined.end());
     rebuild_as_legacy_leaf(leaves_[leaf_index]);
     rebuild_as_legacy_leaf(right);
+    leaves_[leaf_index].legacy_updates_since_transform =
+        config_.legacy_transform_update_threshold;
+    right.legacy_updates_since_transform =
+        config_.legacy_transform_update_threshold;
 
-    const std::size_t left_id = leaves_[leaf_index].node_id;
-    const double left_max = leaves_[leaf_index].max_zmin;
-    const std::size_t right_id = right.node_id;
-    const double right_max = right.max_zmin;
     leaves_.insert(leaves_.begin() + static_cast<long>(leaf_index + 1),
                    std::move(right));
     ++leaf_split_count_;
-    rebuild_record_leaf_refs();
+    mark_local_mls_slot_dirty(read_slot_id);
+    refresh_leaf_structure_from(leaf_index);
+    refresh_record_owners(leaf_index, 2);
     if (directory_ready_) {
-      internal_directory_.insert_leaf_after(left_id, right_id, left_max,
-                                            right_max);
+      internal_directory_.insert_leaf_after(
+          directory_leaf_summary(leaves_[leaf_index]),
+          directory_leaf_summary(leaves_[leaf_index + 1]));
     }
   }
 
@@ -1727,6 +2082,8 @@ class HireSfcLiteIndex {
     leaf.record_ids.erase(position);
     records_[id].in_buffer = false;
     refresh_leaf_bounds(leaf);
+    ++leaf.legacy_updates_since_transform;
+    leaf.regression_cache_valid = false;
     note_directory_update(leaf_index);
     const std::size_t minimum = std::max<std::size_t>(
         1, static_cast<std::size_t>(
@@ -1757,22 +2114,29 @@ class HireSfcLiteIndex {
     }
     const std::size_t left_index = std::min(leaf_index, sibling_index);
     const std::size_t right_index = std::max(leaf_index, sibling_index);
+    if (local_mls_rcu_enabled() &&
+        leaves_[left_index].read_slot_id !=
+            leaves_[right_index].read_slot_id) {
+      return;
+    }
+    const std::size_t read_slot_id = leaves_[left_index].read_slot_id;
     std::vector<std::size_t> combined = leaves_[left_index].record_ids;
     combined.insert(combined.end(), leaves_[right_index].record_ids.begin(),
                     leaves_[right_index].record_ids.end());
     sort_ids(combined);
 
-    const std::size_t left_id = leaves_[left_index].node_id;
     const std::size_t right_id = leaves_[right_index].node_id;
     if (combined.size() <= config_.leaf_size) {
       leaves_[left_index].record_ids = std::move(combined);
       rebuild_as_legacy_leaf(leaves_[left_index]);
-      const double left_max = leaves_[left_index].max_zmin;
       leaves_.erase(leaves_.begin() + static_cast<long>(right_index));
       ++leaf_merge_count_;
-      rebuild_record_leaf_refs();
+      mark_local_mls_slot_dirty(read_slot_id);
+      refresh_leaf_structure_from(left_index);
+      refresh_record_owners(left_index, 1);
       if (directory_ready_) {
-        internal_directory_.update_leaf_boundary(left_id, left_max);
+        internal_directory_.update_leaf_summary(
+            directory_leaf_summary(leaves_[left_index]));
         internal_directory_.remove_leaf(right_id);
       }
       return;
@@ -1786,12 +2150,13 @@ class HireSfcLiteIndex {
     rebuild_as_legacy_leaf(leaves_[left_index]);
     rebuild_as_legacy_leaf(leaves_[right_index]);
     ++leaf_redistribution_count_;
-    rebuild_record_leaf_refs();
+    mark_local_mls_slot_dirty(read_slot_id);
+    refresh_record_owners(left_index, 2);
     if (directory_ready_) {
-      internal_directory_.update_leaf_boundary(
-          left_id, leaves_[left_index].max_zmin);
-      internal_directory_.update_leaf_boundary(
-          right_id, leaves_[right_index].max_zmin);
+      internal_directory_.update_leaf_summary(
+          directory_leaf_summary(leaves_[left_index]));
+      internal_directory_.update_leaf_summary(
+          directory_leaf_summary(leaves_[right_index]));
     }
   }
 
@@ -1834,6 +2199,14 @@ class HireSfcLiteIndex {
     for (std::size_t index : leaf_indices) {
       if (index >= leaves_.size() || leaves_[index].pending_rebuild) {
         return false;
+      }
+    }
+    if (local_mls_rcu_enabled()) {
+      const std::size_t slot_id = leaves_[leaf_indices.front()].read_slot_id;
+      for (std::size_t index : leaf_indices) {
+        if (leaves_[index].read_slot_id != slot_id) {
+          return false;
+        }
       }
     }
     std::shared_ptr<RecalibrationJob> job =
@@ -1906,7 +2279,7 @@ class HireSfcLiteIndex {
     if (!rcu_enabled() || id >= records_.size()) {
       return;
     }
-    const std::size_t leaf_index = records_[id].leaf_index;
+    const std::size_t leaf_index = record_leaf_index(id);
     if (leaf_index >= leaves_.size()) {
       return;
     }
@@ -2081,13 +2454,16 @@ class HireSfcLiteIndex {
 
   void prune_empty_leaves_locked() {
     bool removed = false;
+    std::size_t first_removed = leaves_.size();
     for (std::size_t index = 0; index < leaves_.size() && leaves_.size() > 1;) {
       if (leaves_[index].live_count != 0 || leaves_[index].pending_rebuild) {
         ++index;
         continue;
       }
       const std::size_t leaf_id = leaves_[index].node_id;
+      mark_local_mls_slot_dirty(leaves_[index].read_slot_id);
       leaves_.erase(leaves_.begin() + static_cast<long>(index));
+      first_removed = std::min(first_removed, index);
       if (directory_ready_) {
         internal_directory_.remove_leaf(leaf_id);
       }
@@ -2095,7 +2471,7 @@ class HireSfcLiteIndex {
       removed = true;
     }
     if (removed) {
-      rebuild_record_leaf_refs();
+      refresh_leaf_structure_from(first_removed);
     }
   }
 
@@ -2108,6 +2484,7 @@ class HireSfcLiteIndex {
       return false;
     }
     const std::size_t leaf_index = target_it->second;
+    const std::size_t read_slot_id = leaves_[leaf_index].read_slot_id;
     if (leaf_index + job.replaced_leaf_ids.size() > leaves_.size()) {
       return false;
     }
@@ -2185,6 +2562,7 @@ class HireSfcLiteIndex {
     for (std::size_t segment_size : effective_segment_sizes) {
       const std::size_t end = begin + segment_size;
       Leaf leaf;
+      leaf.read_slot_id = read_slot_id;
       if (replacement.empty()) {
         leaf.node_id = job.target_leaf_id;
       } else {
@@ -2216,6 +2594,7 @@ class HireSfcLiteIndex {
                    std::make_move_iterator(replacement.end()));
     ++local_rebuild_count_;
     ++mls_install_count_;
+    mark_local_mls_slot_dirty(read_slot_id);
     if (job.kind == RecalibrationKind::ForwardMerge) {
       ++legacy_forward_success_count_;
       ++legacy_transform_count_;
@@ -2231,27 +2610,26 @@ class HireSfcLiteIndex {
       last_retrain_error_after_ =
           std::max(last_retrain_error_after_, leaf.max_model_error);
     }
-    rebuild_record_leaf_refs();
+    refresh_leaf_structure_from(leaf_index);
+    refresh_record_owners(leaf_index, replacement.size());
     if (directory_ready_) {
       if (replacement.empty()) {
         for (std::size_t removed_id : job.replaced_leaf_ids) {
           internal_directory_.remove_leaf(removed_id);
         }
       } else {
-        internal_directory_.update_leaf_boundary(
-            job.target_leaf_id, leaves_[leaf_index].max_zmin);
+        internal_directory_.update_leaf_summary(
+            directory_leaf_summary(leaves_[leaf_index]));
         for (std::size_t offset = 1;
              offset < job.replaced_leaf_ids.size(); ++offset) {
           internal_directory_.remove_leaf(job.replaced_leaf_ids[offset]);
         }
-        std::size_t previous_id = job.target_leaf_id;
         for (std::size_t offset = 1; offset < replacement.size(); ++offset) {
           const Leaf& previous = leaves_[leaf_index + offset - 1];
           const Leaf& current = leaves_[leaf_index + offset];
           internal_directory_.insert_leaf_after(
-              previous_id, current.node_id, previous.max_zmin,
-              current.max_zmin);
-          previous_id = current.node_id;
+              directory_leaf_summary(previous),
+              directory_leaf_summary(current));
         }
       }
     }
@@ -2327,8 +2705,6 @@ class HireSfcLiteIndex {
           ++legacy_transform_abort_count_;
         }
         active_recalibrations_.erase(active);
-        prune_empty_leaves_locked();
-        publish_read_snapshot_locked();
         return;
       }
       const std::uint64_t fit_start = steady_now_ns();
@@ -2355,8 +2731,14 @@ class HireSfcLiteIndex {
         last_actual_retrain_ns_ = merge_ns + fit_ns;
       }
       active_recalibrations_.erase(active);
-      prune_empty_leaves_locked();
-      publish_read_snapshot_locked();
+      if (installed) {
+        prune_empty_leaves_locked();
+        if (local_mls_rcu_enabled()) {
+          publish_dirty_local_mls_slots_locked();
+        } else {
+          publish_read_snapshot_locked();
+        }
+      }
       return;
     }
   }
@@ -2612,8 +2994,7 @@ class HireSfcLiteIndex {
       if (can_place_in_sorted_slot(leaf, slot, new_id)) {
         leaf.tombstone_ids.erase(new_id);
         --leaf.tombstone_count;
-        records_[new_id].leaf_index = leaf_index;
-        records_[new_id].in_buffer = false;
+        set_record_owner(new_id, leaf_index, false);
         expand_leaf_on_insert(
             leaf, RecordInput{new_id, records_[new_id].zmin,
                               records_[new_id].zmax, records_[new_id].box});
@@ -2649,8 +3030,7 @@ class HireSfcLiteIndex {
     const std::size_t replaced_id = leaf.record_ids[best_slot];
     leaf.record_ids[best_slot] = new_id;
     leaf.tombstone_ids.erase(replaced_id);
-    records_[new_id].leaf_index = leaf_index;
-    records_[new_id].in_buffer = false;
+    set_record_owner(new_id, leaf_index, false);
     if (leaf.tombstone_count > 0) {
       --leaf.tombstone_count;
     }
@@ -2669,6 +3049,7 @@ class HireSfcLiteIndex {
     const double error_before = leaves_[leaf_index].max_model_error;
     const std::uint64_t merge_start = steady_now_ns();
     const std::size_t old_leaf_id = leaves_[leaf_index].node_id;
+    const std::size_t read_slot_id = leaves_[leaf_index].read_slot_id;
     std::vector<std::size_t> ids = leaves_[leaf_index].record_ids;
     ids.insert(ids.end(), leaves_[leaf_index].buffer_ids.begin(),
                leaves_[leaf_index].buffer_ids.end());
@@ -2690,6 +3071,7 @@ class HireSfcLiteIndex {
       const std::size_t end =
           std::min(live_ids.size(), begin + config_.leaf_size);
       Leaf leaf;
+      leaf.read_slot_id = read_slot_id;
       if (replacement.empty() && full_internal_directory_) {
         leaf.node_id = old_leaf_id;
       } else {
@@ -2722,21 +3104,25 @@ class HireSfcLiteIndex {
                    std::make_move_iterator(replacement.begin()),
                    std::make_move_iterator(replacement.end()));
     ++local_rebuild_count_;
-    rebuild_record_leaf_refs();
+    mark_local_mls_slot_dirty(read_slot_id);
+    if (full_internal_directory_) {
+      refresh_leaf_structure_from(leaf_index);
+      refresh_record_owners(leaf_index, replacement.size());
+    } else {
+      rebuild_record_leaf_refs();
+    }
     if (full_internal_directory_ && directory_ready_) {
       if (replacement.empty()) {
         internal_directory_.remove_leaf(old_leaf_id);
       } else {
-        internal_directory_.update_leaf_boundary(
-            old_leaf_id, leaves_[leaf_index].max_zmin);
-        std::size_t previous_id = old_leaf_id;
+        internal_directory_.update_leaf_summary(
+            directory_leaf_summary(leaves_[leaf_index]));
         for (std::size_t offset = 1; offset < replacement.size(); ++offset) {
           const Leaf& previous = leaves_[leaf_index + offset - 1];
           const Leaf& current = leaves_[leaf_index + offset];
           internal_directory_.insert_leaf_after(
-              previous_id, current.node_id, previous.max_zmin,
-              current.max_zmin);
-          previous_id = current.node_id;
+              directory_leaf_summary(previous),
+              directory_leaf_summary(current));
         }
       }
     }
@@ -2744,7 +3130,6 @@ class HireSfcLiteIndex {
       try_transform_legacy_run(leaf_index);
     }
     if (!full_internal_directory_) {
-      rebuild_record_leaf_refs();
       rebuild_directory();
     }
   }
@@ -2771,21 +3156,32 @@ class HireSfcLiteIndex {
     return fit_record_inputs(inputs, 0, inputs.size());
   }
 
-  bool coefficients_similar(const Leaf& lhs, const Leaf& rhs) const {
+  void refresh_legacy_regression_cache(Leaf& leaf) {
+    if (leaf.regression_cache_valid) {
+      return;
+    }
+    const RegressionFit fit = fit_leaf_for_transformation(leaf);
+    leaf.transform_slope = fit.slope;
+    leaf.transform_intercept = fit.intercept;
+    leaf.regression_cache_valid = true;
+    ++legacy_regression_cache_refresh_count_;
+  }
+
+  bool coefficients_similar(Leaf& lhs, Leaf& rhs) {
     if (lhs.live_count < 2 || rhs.live_count < 2) {
       return false;
     }
-    const RegressionFit lhs_fit = fit_leaf_for_transformation(lhs);
-    const RegressionFit rhs_fit = fit_leaf_for_transformation(rhs);
+    refresh_legacy_regression_cache(lhs);
+    refresh_legacy_regression_cache(rhs);
     const double slope_scale =
         std::max(1.0,
-                 std::max(std::fabs(lhs_fit.slope),
-                          std::fabs(rhs_fit.slope)));
+                 std::max(std::fabs(lhs.transform_slope),
+                          std::fabs(rhs.transform_slope)));
     const double lhs_origin =
-        lhs_fit.slope * lhs.min_zmin + lhs_fit.intercept;
+        lhs.transform_slope * lhs.min_zmin + lhs.transform_intercept;
     const double rhs_origin =
-        rhs_fit.slope * rhs.min_zmin + rhs_fit.intercept;
-    return std::fabs(lhs_fit.slope - rhs_fit.slope) <=
+        rhs.transform_slope * rhs.min_zmin + rhs.transform_intercept;
+    return std::fabs(lhs.transform_slope - rhs.transform_slope) <=
                config_.legacy_slope_tolerance * slope_scale &&
            std::fabs(lhs_origin - rhs_origin) <=
                config_.legacy_intercept_tolerance;
@@ -2863,9 +3259,32 @@ class HireSfcLiteIndex {
       return false;
     }
 
+    Leaf& center = leaves_[center_index];
+    if (center.legacy_updates_since_transform <
+            config_.legacy_transform_update_threshold ||
+        update_clock_ < center.next_legacy_transform_update) {
+      ++legacy_transform_gate_skip_count_;
+      return false;
+    }
+    center.legacy_updates_since_transform = 0;
+    center.next_legacy_transform_update =
+        update_clock_ + config_.legacy_transform_cooldown_updates;
+    const std::size_t cache_begin =
+        center_index > config_.legacy_transform_max_leaves
+            ? center_index - config_.legacy_transform_max_leaves
+            : 0;
+    const std::size_t cache_end = std::min(
+        leaves_.size(), center_index + config_.legacy_transform_max_leaves + 1);
+    for (std::size_t index = cache_begin; index < cache_end; ++index) {
+      leaves_[index].regression_cache_valid = false;
+    }
+    refresh_legacy_regression_cache(center);
+
     if (center_index > 0 &&
         leaves_[center_index - 1].kind == LeafKind::Model &&
-        !leaves_[center_index - 1].pending_rebuild) {
+        !leaves_[center_index - 1].pending_rebuild &&
+        (!local_mls_rcu_enabled() ||
+         leaves_[center_index - 1].read_slot_id == center.read_slot_id)) {
       const std::size_t combined_records =
           leaves_[center_index - 1].live_count +
           leaves_[center_index].live_count;
@@ -2895,14 +3314,18 @@ class HireSfcLiteIndex {
     while (begin > 0 &&
            center_index - begin + 1 < config_.legacy_transform_max_leaves &&
            leaves_[begin - 1].kind == LeafKind::Legacy &&
-           !leaves_[begin - 1].pending_rebuild) {
+           !leaves_[begin - 1].pending_rebuild &&
+           (!local_mls_rcu_enabled() ||
+            leaves_[begin - 1].read_slot_id == center.read_slot_id)) {
       --begin;
     }
     std::size_t end = center_index + 1;
     while (end < leaves_.size() &&
            end - begin < config_.legacy_transform_max_leaves &&
            leaves_[end].kind == LeafKind::Legacy &&
-           !leaves_[end].pending_rebuild) {
+           !leaves_[end].pending_rebuild &&
+           (!local_mls_rcu_enabled() ||
+            leaves_[end].read_slot_id == center.read_slot_id)) {
       ++end;
     }
     if (end - begin < config_.legacy_backward_min_leaves) {
@@ -2979,6 +3402,7 @@ class HireSfcLiteIndex {
     }
     sort_ids(live_ids);
     Leaf candidate;
+    candidate.read_slot_id = leaves_[begin].read_slot_id;
     std::vector<std::size_t> removed_leaf_ids;
     if (full_internal_directory_) {
       candidate.node_id = leaves_[begin].node_id;
@@ -2996,11 +3420,17 @@ class HireSfcLiteIndex {
     leaves_.insert(leaves_.begin() + static_cast<long>(begin),
                    std::move(candidate));
     ++legacy_transform_count_;
-    rebuild_record_leaf_refs();
+    mark_local_mls_slot_dirty(leaves_[begin].read_slot_id);
+    if (full_internal_directory_) {
+      refresh_leaf_structure_from(begin);
+      refresh_record_owners(begin, 1);
+    } else {
+      rebuild_record_leaf_refs();
+    }
     if (full_internal_directory_) {
       if (directory_ready_) {
-        internal_directory_.update_leaf_boundary(
-            leaves_[begin].node_id, leaves_[begin].max_zmin);
+        internal_directory_.update_leaf_summary(
+            directory_leaf_summary(leaves_[begin]));
         for (std::size_t removed_id : removed_leaf_ids) {
           internal_directory_.remove_leaf(removed_id);
         }
@@ -3011,7 +3441,66 @@ class HireSfcLiteIndex {
     return true;
   }
 
+  void refresh_leaf_structure_from(std::size_t begin) {
+    if (!full_internal_directory_) {
+      rebuild_record_leaf_refs();
+      return;
+    }
+    if (leaves_.empty()) {
+      leaf_id_to_index_.clear();
+      return;
+    }
+    leaf_id_to_index_.clear();
+    for (std::size_t leaf_index = 0; leaf_index < leaves_.size();
+         ++leaf_index) {
+      assign_leaf_node_id(leaves_[leaf_index]);
+      leaf_id_to_index_[leaves_[leaf_index].node_id] = leaf_index;
+    }
+    begin = std::min(begin, leaves_.size() - 1);
+    if (begin > 0) {
+      --begin;
+    }
+    for (std::size_t leaf_index = begin; leaf_index < leaves_.size();
+         ++leaf_index) {
+      Leaf& leaf = leaves_[leaf_index];
+      leaf.prev_leaf_id =
+          leaf_index == 0 ? npos() : leaves_[leaf_index - 1].node_id;
+      leaf.next_leaf_id = leaf_index + 1 == leaves_.size()
+                              ? npos()
+                              : leaves_[leaf_index + 1].node_id;
+    }
+  }
+
+  void refresh_record_owners(std::size_t begin, std::size_t count) {
+    if (!full_internal_directory_ || begin >= leaves_.size() || count == 0) {
+      return;
+    }
+    const std::size_t end = std::min(leaves_.size(), begin + count);
+    for (std::size_t leaf_index = begin; leaf_index < end; ++leaf_index) {
+      Leaf& leaf = leaves_[leaf_index];
+      leaf.buffer_positions.clear();
+      for (std::size_t id : leaf.record_ids) {
+        if (id < records_.size() &&
+            leaf.tombstone_ids.find(id) == leaf.tombstone_ids.end()) {
+          set_record_owner(id, leaf_index, false);
+        }
+      }
+      for (std::size_t position = 0; position < leaf.buffer_ids.size();
+           ++position) {
+        const std::size_t id = leaf.buffer_ids[position];
+        if (id < records_.size()) {
+          set_record_owner(id, leaf_index, true);
+          leaf.buffer_positions[id] = position;
+        }
+      }
+    }
+    ++local_record_ref_refresh_count_;
+  }
+
   void rebuild_record_leaf_refs() {
+    if (full_internal_directory_) {
+      ++full_record_ref_rebuild_count_;
+    }
     if (full_internal_directory_) {
       leaf_id_to_index_.clear();
     }
@@ -3034,6 +3523,7 @@ class HireSfcLiteIndex {
         if (id < records_.size() &&
             leaf.tombstone_ids.find(id) == leaf.tombstone_ids.end()) {
           records_[id].leaf_index = leaf_index;
+          records_[id].leaf_id = leaf.node_id;
           records_[id].in_buffer = false;
         }
       }
@@ -3042,6 +3532,7 @@ class HireSfcLiteIndex {
         const std::size_t id = leaf.buffer_ids[position];
         if (id < records_.size()) {
           records_[id].leaf_index = leaf_index;
+          records_[id].leaf_id = leaf.node_id;
           records_[id].in_buffer = true;
           if (full_internal_directory_) {
             leaf.buffer_positions[id] = position;
@@ -3051,19 +3542,35 @@ class HireSfcLiteIndex {
     }
   }
 
+  HireInternalDirectory::LeafSummary directory_leaf_summary(
+      const Leaf& leaf) const {
+    HireInternalDirectory::LeafSummary summary;
+    summary.leaf_id = leaf.node_id;
+    summary.min_key = leaf.min_zmin;
+    summary.max_key = leaf.max_zmin;
+    summary.max_zmax = leaf.max_zmax;
+    summary.xmin = leaf.mbr.xmin;
+    summary.ymin = leaf.mbr.ymin;
+    summary.xmax = leaf.mbr.xmax;
+    summary.ymax = leaf.mbr.ymax;
+    summary.spatial_valid = leaf.live_count > 0;
+    return summary;
+  }
+
   void rebuild_directory() {
     directory_min_zmin_.clear();
     directory_max_zmin_.clear();
     directory_log_.clear();
     directory_min_zmin_.reserve(leaves_.size());
     directory_max_zmin_.reserve(leaves_.size());
-    std::vector<std::pair<std::size_t, double>> full_entries;
+    std::vector<HireInternalDirectory::LeafSummary> full_entries;
     full_entries.reserve(leaves_.size());
-    for (const Leaf& leaf : leaves_) {
+    for (Leaf& leaf : leaves_) {
       directory_min_zmin_.push_back(leaf.min_zmin);
       directory_max_zmin_.push_back(leaf.max_zmin);
       if (full_internal_directory_) {
-        full_entries.emplace_back(leaf.node_id, leaf.max_zmin);
+        full_entries.push_back(directory_leaf_summary(leaf));
+        leaf.published_directory_max_zmin = leaf.max_zmin;
       }
     }
     fit_directory_model();
@@ -3079,8 +3586,19 @@ class HireSfcLiteIndex {
       return;
     }
     if (full_internal_directory_) {
-      internal_directory_.update_leaf_boundary(leaves_[leaf_index].node_id,
-                                               leaves_[leaf_index].max_zmin);
+      Leaf& leaf = leaves_[leaf_index];
+      if (local_mls_rcu_enabled()) {
+        if (leaf.published_directory_max_zmin == leaf.max_zmin) {
+          return;
+        }
+        internal_directory_.update_leaf_boundary(leaf.node_id,
+                                                 leaf.max_zmin);
+        leaf.published_directory_max_zmin = leaf.max_zmin;
+        return;
+      }
+      internal_directory_.update_leaf_summary(
+          directory_leaf_summary(leaf));
+      leaf.published_directory_max_zmin = leaf.max_zmin;
       return;
     }
     if (!config_.enable_directory_log) {
@@ -3270,6 +3788,60 @@ class HireSfcLiteIndex {
     return result;
   }
 
+  void rebuild_read_leaf_blocks(ReadLeaf& leaf) const {
+    leaf.blocks.clear();
+    if (!config_.enable_local_leaf_blocks || leaf.records.empty()) {
+      return;
+    }
+    leaf.blocks.reserve(
+        (leaf.records.size() + config_.local_read_block_size - 1) /
+        config_.local_read_block_size);
+    for (std::size_t begin = 0; begin < leaf.records.size();
+         begin += config_.local_read_block_size) {
+      ReadBlockSummary block;
+      block.begin = begin;
+      block.end = std::min(leaf.records.size(),
+                           begin + config_.local_read_block_size);
+      block.max_zmax = leaf.records[begin].zmax;
+      block.mbr = leaf.records[begin].box;
+      for (std::size_t index = begin + 1; index < block.end; ++index) {
+        block.max_zmax = std::max(block.max_zmax,
+                                  leaf.records[index].zmax);
+        expand(block.mbr, leaf.records[index].box);
+      }
+      leaf.blocks.push_back(block);
+    }
+  }
+
+  void rebuild_read_leaf_layout(ReadLeaf& leaf) const {
+    leaf.sorted_zmin.clear();
+    leaf.record_zmax.clear();
+    leaf.record_xmin.clear();
+    leaf.record_ymin.clear();
+    leaf.record_xmax.clear();
+    leaf.record_ymax.clear();
+    const std::size_t count = leaf.records.size();
+    leaf.sorted_zmin.reserve(count);
+    if (config_.enable_local_leaf_simd) {
+      leaf.record_zmax.reserve(count);
+      leaf.record_xmin.reserve(count);
+      leaf.record_ymin.reserve(count);
+      leaf.record_xmax.reserve(count);
+      leaf.record_ymax.reserve(count);
+    }
+    for (const ReadRecord& record : leaf.records) {
+      leaf.sorted_zmin.push_back(record.zmin);
+      if (config_.enable_local_leaf_simd) {
+        leaf.record_zmax.push_back(record.zmax);
+        leaf.record_xmin.push_back(record.box.xmin);
+        leaf.record_ymin.push_back(record.box.ymin);
+        leaf.record_xmax.push_back(record.box.xmax);
+        leaf.record_ymax.push_back(record.box.ymax);
+      }
+    }
+    rebuild_read_leaf_blocks(leaf);
+  }
+
   std::shared_ptr<const ReadLeaf> make_read_leaf_locked(const Leaf& leaf) {
     const auto cached = read_leaf_cache_.find(leaf.node_id);
     if (cached != read_leaf_cache_.end() &&
@@ -3302,6 +3874,7 @@ class HireSfcLiteIndex {
       view->records.push_back(
           ReadRecord{id, record.zmin, record.zmax, record.box});
     }
+    rebuild_read_leaf_layout(*view);
     view->buffer.reserve(leaf.buffer_ids.size());
     for (std::size_t id : leaf.buffer_ids) {
       if (id >= records_.size() || !records_[id].alive) {
@@ -3314,6 +3887,511 @@ class HireSfcLiteIndex {
     read_leaf_cache_[leaf.node_id] =
         ReadLeafCacheEntry{leaf.read_version, view};
     return view;
+  }
+
+  std::shared_ptr<LocalReadLeafHandle> make_local_leaf_handle_locked(
+      const Leaf& leaf) {
+    std::shared_ptr<LocalReadLeafHandle> handle =
+        std::make_shared<LocalReadLeafHandle>();
+    handle->node_id = leaf.node_id;
+    std::shared_ptr<const ReadLeaf> read_leaf = make_read_leaf_locked(leaf);
+    handle->leaf = *read_leaf;
+    return handle;
+  }
+
+  static void include_local_spatial_summary(
+      LocalSpatialSummary& target, const LocalSpatialSummary& source) {
+    if (!source.valid) {
+      return;
+    }
+    if (!target.valid) {
+      target = source;
+      return;
+    }
+    target.min_zmin = std::min(target.min_zmin, source.min_zmin);
+    target.max_zmax = std::max(target.max_zmax, source.max_zmax);
+    expand(target.mbr, source.mbr);
+  }
+
+  static LocalSpatialSummary local_spatial_summary_for_leaf(
+      const Leaf& leaf) {
+    LocalSpatialSummary summary;
+    if (leaf.live_count == 0) {
+      return summary;
+    }
+    summary.valid = true;
+    summary.min_zmin = leaf.min_zmin;
+    summary.max_zmax = leaf.max_zmax;
+    summary.mbr = leaf.mbr;
+    return summary;
+  }
+
+  static LocalSpatialSummary expand_local_spatial_summary(
+      LocalSpatialSummary summary, const RecordInput& record) {
+    if (!summary.valid) {
+      summary.valid = true;
+      summary.min_zmin = record.zmin;
+      summary.max_zmax = record.zmax;
+      summary.mbr = record.box;
+      return summary;
+    }
+    summary.min_zmin = std::min(summary.min_zmin, record.zmin);
+    summary.max_zmax = std::max(summary.max_zmax, record.zmax);
+    expand(summary.mbr, record.box);
+    return summary;
+  }
+
+  static bool local_spatial_summary_contains(
+      const LocalSpatialSummary& target,
+      const LocalSpatialSummary& source) {
+    if (!source.valid) {
+      return true;
+    }
+    return target.valid && target.min_zmin <= source.min_zmin &&
+           target.max_zmax >= source.max_zmax &&
+           target.mbr.xmin <= source.mbr.xmin &&
+           target.mbr.ymin <= source.mbr.ymin &&
+           target.mbr.xmax >= source.mbr.xmax &&
+           target.mbr.ymax >= source.mbr.ymax;
+  }
+
+  void publish_local_spatial_summary_locked(
+      std::shared_ptr<const LocalSpatialSummary>* destination,
+      const LocalSpatialSummary& summary) {
+    std::shared_ptr<const LocalSpatialSummary> published =
+        std::make_shared<LocalSpatialSummary>(summary);
+    std::atomic_store_explicit(destination, published,
+                               std::memory_order_release);
+    ++rcu_spatial_summary_publish_count_;
+  }
+
+  LocalSpatialSummary summarize_local_slot_locked(
+      std::size_t slot_id) const {
+    LocalSpatialSummary summary;
+    for (const Leaf& leaf : leaves_) {
+      if (leaf.read_slot_id == slot_id) {
+        include_local_spatial_summary(
+            summary, local_spatial_summary_for_leaf(leaf));
+      }
+    }
+    return summary;
+  }
+
+  LocalSpatialSummary summarize_local_tree_node_locked(
+      const LocalReadTreeNode& node) const {
+    LocalSpatialSummary summary;
+    for (const std::shared_ptr<LocalMlsSlot>& slot : node.slots) {
+      const std::shared_ptr<const LocalSpatialSummary> child =
+          std::atomic_load_explicit(&slot->spatial_summary,
+                                    std::memory_order_acquire);
+      if (child) {
+        include_local_spatial_summary(summary, *child);
+      }
+    }
+    for (const std::shared_ptr<LocalReadTreeNode>& child_node :
+         node.children) {
+      const std::shared_ptr<const LocalSpatialSummary> child =
+          std::atomic_load_explicit(&child_node->spatial_summary,
+                                    std::memory_order_acquire);
+      if (child) {
+        include_local_spatial_summary(summary, *child);
+      }
+    }
+    return summary;
+  }
+
+  void record_local_spatial_paths_locked(
+      const std::shared_ptr<LocalReadTreeNode>& node,
+      std::vector<std::shared_ptr<LocalReadTreeNode>> path) {
+    if (!node) {
+      return;
+    }
+    path.push_back(node);
+    for (const std::shared_ptr<LocalMlsSlot>& slot : node->slots) {
+      if (slot->slot_id < local_slot_ancestor_paths_.size()) {
+        local_slot_ancestor_paths_[slot->slot_id] = path;
+      }
+    }
+    for (const std::shared_ptr<LocalReadTreeNode>& child : node->children) {
+      record_local_spatial_paths_locked(child, path);
+    }
+  }
+
+  void build_local_spatial_tree_locked(LocalReadRoot& root) {
+    root.spatial_root.reset();
+    root.spatial_tree_nodes = 0;
+    root.spatial_tree_levels = 0;
+    local_slot_ancestor_paths_.assign(root.slots.size(), {});
+    if (!config_.enable_local_spatial_tree || root.slots.empty()) {
+      return;
+    }
+    const std::size_t fanout = std::max<std::size_t>(
+        2, internal_directory_.bulk_slot_count_for_planning());
+    std::vector<std::shared_ptr<LocalReadTreeNode>> level;
+    for (std::size_t begin = 0; begin < root.slots.size(); begin += fanout) {
+      const std::size_t end = std::min(root.slots.size(), begin + fanout);
+      std::shared_ptr<LocalReadTreeNode> node =
+          std::make_shared<LocalReadTreeNode>();
+      node->node_id = next_local_read_tree_node_id_++;
+      node->slots.assign(root.slots.begin() + static_cast<long>(begin),
+                         root.slots.begin() + static_cast<long>(end));
+      publish_local_spatial_summary_locked(
+          &node->spatial_summary, summarize_local_tree_node_locked(*node));
+      level.push_back(node);
+      ++root.spatial_tree_nodes;
+    }
+    root.spatial_tree_levels = 1;
+    while (level.size() > 1) {
+      std::vector<std::shared_ptr<LocalReadTreeNode>> parents;
+      for (std::size_t begin = 0; begin < level.size(); begin += fanout) {
+        const std::size_t end = std::min(level.size(), begin + fanout);
+        std::shared_ptr<LocalReadTreeNode> node =
+            std::make_shared<LocalReadTreeNode>();
+        node->node_id = next_local_read_tree_node_id_++;
+        node->children.assign(level.begin() + static_cast<long>(begin),
+                              level.begin() + static_cast<long>(end));
+        publish_local_spatial_summary_locked(
+            &node->spatial_summary, summarize_local_tree_node_locked(*node));
+        parents.push_back(node);
+        ++root.spatial_tree_nodes;
+      }
+      level = std::move(parents);
+      ++root.spatial_tree_levels;
+    }
+    root.spatial_root = level.front();
+    record_local_spatial_paths_locked(root.spatial_root, {});
+  }
+
+  void expand_local_spatial_path_locked(
+      std::size_t slot_id, const LocalSpatialSummary& expansion) {
+    if (!config_.enable_local_spatial_tree || !expansion.valid ||
+        slot_id >= local_mls_slots_.size()) {
+      return;
+    }
+    if (slot_id < local_slot_ancestor_paths_.size()) {
+      for (const std::shared_ptr<LocalReadTreeNode>& node :
+           local_slot_ancestor_paths_[slot_id]) {
+        const std::shared_ptr<const LocalSpatialSummary> current =
+            std::atomic_load_explicit(&node->spatial_summary,
+                                      std::memory_order_acquire);
+        if (current &&
+            local_spatial_summary_contains(*current, expansion)) {
+          continue;
+        }
+        LocalSpatialSummary next = current ? *current : LocalSpatialSummary{};
+        include_local_spatial_summary(next, expansion);
+        publish_local_spatial_summary_locked(&node->spatial_summary, next);
+      }
+    }
+    const std::shared_ptr<LocalMlsSlot>& slot = local_mls_slots_[slot_id];
+    const std::shared_ptr<const LocalSpatialSummary> current =
+        std::atomic_load_explicit(&slot->spatial_summary,
+                                  std::memory_order_acquire);
+    if (current && local_spatial_summary_contains(*current, expansion)) {
+      return;
+    }
+    LocalSpatialSummary next = current ? *current : LocalSpatialSummary{};
+    include_local_spatial_summary(next, expansion);
+    publish_local_spatial_summary_locked(&slot->spatial_summary, next);
+  }
+
+  void refresh_local_spatial_path_exact_locked(std::size_t slot_id) {
+    if (!config_.enable_local_spatial_tree ||
+        slot_id >= local_mls_slots_.size()) {
+      return;
+    }
+    if (slot_id < local_slot_deletes_since_spatial_refresh_.size()) {
+      local_slot_deletes_since_spatial_refresh_[slot_id] = 0;
+    }
+    publish_local_spatial_summary_locked(
+        &local_mls_slots_[slot_id]->spatial_summary,
+        summarize_local_slot_locked(slot_id));
+    if (slot_id >= local_slot_ancestor_paths_.size()) {
+      return;
+    }
+    const auto& path = local_slot_ancestor_paths_[slot_id];
+    for (auto node = path.rbegin(); node != path.rend(); ++node) {
+      publish_local_spatial_summary_locked(
+          &(*node)->spatial_summary,
+          summarize_local_tree_node_locked(*(*node)));
+    }
+  }
+
+  void initialize_local_mls_root_locked() {
+    local_mls_slots_.clear();
+    local_read_leaf_handles_.clear();
+    dirty_local_mls_slots_.clear();
+    std::shared_ptr<LocalReadRoot> root = std::make_shared<LocalReadRoot>();
+    root->generation = ++local_mls_generation_;
+    root->slots.reserve(leaves_.size());
+    for (std::size_t index = 0; index < leaves_.size(); ++index) {
+      Leaf& leaf = leaves_[index];
+      leaf.read_slot_id = local_mls_slots_.size();
+      std::shared_ptr<LocalReadLeafHandle> handle =
+          make_local_leaf_handle_locked(leaf);
+      local_read_leaf_handles_[leaf.node_id] = handle;
+      std::shared_ptr<LocalMlsVersion> version =
+          std::make_shared<LocalMlsVersion>();
+      version->generation = ++local_mls_generation_;
+      version->leaves.push_back(handle);
+      std::shared_ptr<LocalMlsSlot> slot =
+          std::make_shared<LocalMlsSlot>();
+      slot->slot_id = leaf.read_slot_id;
+      publish_local_spatial_summary_locked(
+          &slot->spatial_summary, local_spatial_summary_for_leaf(leaf));
+      std::shared_ptr<const LocalMlsVersion> immutable_version = version;
+      std::atomic_store_explicit(&slot->version, immutable_version,
+                                 std::memory_order_release);
+      local_mls_slots_.push_back(slot);
+      root->slots.push_back(slot);
+    }
+    local_slot_deletes_since_spatial_refresh_.assign(root->slots.size(), 0);
+    build_local_spatial_tree_locked(*root);
+    std::shared_ptr<const LocalReadRoot> immutable_root = root;
+    std::atomic_store_explicit(&local_read_root_, immutable_root,
+                               std::memory_order_release);
+    ++rcu_snapshot_publish_count_;
+    ++rcu_full_root_publish_count_;
+  }
+
+  void mark_local_mls_slot_dirty(std::size_t slot_id) {
+    if (local_mls_rcu_enabled() && slot_id != npos()) {
+      dirty_local_mls_slots_.insert(slot_id);
+    }
+  }
+
+  void publish_local_leaf_locked(std::size_t leaf_index) {
+    if (!local_mls_rcu_enabled() || leaf_index >= leaves_.size()) {
+      return;
+    }
+    const Leaf& leaf = leaves_[leaf_index];
+    const auto found = local_read_leaf_handles_.find(leaf.node_id);
+    if (found == local_read_leaf_handles_.end()) {
+      mark_local_mls_slot_dirty(leaf.read_slot_id);
+      return;
+    }
+    std::shared_ptr<const ReadLeaf> read_leaf = make_read_leaf_locked(leaf);
+    std::unique_lock<std::shared_timed_mutex> leaf_lock(
+        found->second->mutex);
+    found->second->leaf = *read_leaf;
+    ++rcu_local_leaf_publish_count_;
+  }
+
+  static bool read_record_less(const ReadRecord& lhs,
+                               const ReadRecord& rhs) {
+    if (lhs.zmin != rhs.zmin) {
+      return lhs.zmin < rhs.zmin;
+    }
+    if (lhs.zmax != rhs.zmax) {
+      return lhs.zmax < rhs.zmax;
+    }
+    return lhs.id < rhs.id;
+  }
+
+  static void erase_read_record(std::vector<ReadRecord>& records,
+                                std::size_t id) {
+    records.erase(
+        std::remove_if(records.begin(), records.end(),
+                       [&](const ReadRecord& record) {
+                         return record.id == id;
+                       }),
+        records.end());
+  }
+
+  void publish_local_insert_locked(std::size_t leaf_index, std::size_t id) {
+    if (!local_mls_rcu_enabled() || leaf_index >= leaves_.size() ||
+        id >= records_.size()) {
+      return;
+    }
+    const Leaf& source = leaves_[leaf_index];
+    const auto found = local_read_leaf_handles_.find(source.node_id);
+    if (found == local_read_leaf_handles_.end()) {
+      mark_local_mls_slot_dirty(source.read_slot_id);
+      return;
+    }
+    const Record& record = records_[id];
+    const ReadRecord inserted{id, record.zmin, record.zmax, record.box};
+    expand_local_spatial_path_locked(
+        source.read_slot_id,
+        expand_local_spatial_summary(
+            LocalSpatialSummary{},
+            RecordInput{id, record.zmin, record.zmax, record.box}));
+    std::unique_lock<std::shared_timed_mutex> leaf_lock(
+        found->second->mutex);
+    ReadLeaf& target = found->second->leaf;
+    bool main_records_changed = false;
+    const auto existing = std::find_if(
+        target.records.begin(), target.records.end(),
+        [&](const ReadRecord& item) { return item.id == id; });
+    if (existing != target.records.end()) {
+      target.records.erase(existing);
+      main_records_changed = true;
+    }
+    erase_read_record(target.buffer, id);
+    target.masked_deleted_ids.erase(id);
+    if (record.in_buffer) {
+      target.buffer.push_back(inserted);
+    } else {
+      const auto position =
+          std::lower_bound(target.records.begin(), target.records.end(),
+                           inserted, read_record_less);
+      target.records.insert(position, inserted);
+      main_records_changed = true;
+    }
+    if (main_records_changed) {
+      rebuild_read_leaf_layout(target);
+    }
+    target.version = source.read_version;
+    target.kind = source.kind;
+    target.min_zmin = source.min_zmin;
+    target.max_zmin = source.max_zmin;
+    target.max_zmax = source.max_zmax;
+    target.mbr = source.mbr;
+    ++rcu_local_leaf_publish_count_;
+  }
+
+  void publish_local_erase_locked(std::size_t leaf_id, std::size_t id,
+                                  bool was_buffer) {
+    if (!local_mls_rcu_enabled()) {
+      return;
+    }
+    const auto found = local_read_leaf_handles_.find(leaf_id);
+    if (found == local_read_leaf_handles_.end()) {
+      return;
+    }
+    const auto leaf_position = leaf_id_to_index_.find(leaf_id);
+    if (leaf_position == leaf_id_to_index_.end()) {
+      return;
+    }
+    const Leaf& source = leaves_[leaf_position->second];
+    std::unique_lock<std::shared_timed_mutex> leaf_lock(
+        found->second->mutex);
+    ReadLeaf& target = found->second->leaf;
+    bool main_records_changed = false;
+    if (was_buffer) {
+      erase_read_record(target.buffer, id);
+    } else if (source.kind == LeafKind::Model) {
+      target.masked_deleted_ids.insert(id);
+    } else {
+      const auto position = std::find_if(
+          target.records.begin(), target.records.end(),
+          [&](const ReadRecord& record) { return record.id == id; });
+      if (position != target.records.end()) {
+        target.records.erase(position);
+        main_records_changed = true;
+      }
+    }
+    if (main_records_changed) {
+      rebuild_read_leaf_layout(target);
+    }
+    target.version = source.read_version;
+    target.kind = source.kind;
+    target.min_zmin = source.min_zmin;
+    target.max_zmin = source.max_zmin;
+    target.max_zmax = source.max_zmax;
+    target.mbr = source.mbr;
+    ++rcu_local_leaf_publish_count_;
+    if (source.read_slot_id <
+        local_slot_deletes_since_spatial_refresh_.size()) {
+      std::size_t& deletes =
+          local_slot_deletes_since_spatial_refresh_[source.read_slot_id];
+      ++deletes;
+      if (deletes >= config_.local_spatial_delete_refresh) {
+        refresh_local_spatial_path_exact_locked(source.read_slot_id);
+      }
+    }
+  }
+
+  void reclaim_local_mls_versions_locked() const {
+    retired_local_mls_versions_.erase(
+        std::remove_if(retired_local_mls_versions_.begin(),
+                       retired_local_mls_versions_.end(),
+                       [&](const std::weak_ptr<const LocalMlsVersion>& old) {
+                         if (!old.expired()) {
+                           return false;
+                         }
+                         ++rcu_reclaimed_snapshot_count_;
+                         return true;
+                       }),
+        retired_local_mls_versions_.end());
+  }
+
+  void publish_dirty_local_mls_slots_locked() {
+    if (!local_mls_rcu_enabled()) {
+      return;
+    }
+    for (std::size_t slot_id : dirty_local_mls_slots_) {
+      if (slot_id >= local_mls_slots_.size()) {
+        continue;
+      }
+      std::shared_ptr<LocalMlsVersion> next =
+          std::make_shared<LocalMlsVersion>();
+      next->generation = ++local_mls_generation_;
+      for (const Leaf& leaf : leaves_) {
+        if (leaf.read_slot_id != slot_id) {
+          continue;
+        }
+        std::shared_ptr<LocalReadLeafHandle> handle =
+            make_local_leaf_handle_locked(leaf);
+        local_read_leaf_handles_[leaf.node_id] = handle;
+        next->leaves.push_back(handle);
+      }
+      const LocalSpatialSummary next_summary =
+          summarize_local_slot_locked(slot_id);
+      expand_local_spatial_path_locked(slot_id, next_summary);
+      std::shared_ptr<const LocalMlsVersion> immutable_next = next;
+      std::shared_ptr<const LocalMlsVersion> retired =
+          std::atomic_exchange_explicit(&local_mls_slots_[slot_id]->version,
+                                        immutable_next,
+                                        std::memory_order_acq_rel);
+      if (retired) {
+        for (const auto& handle : retired->leaves) {
+          const auto current = local_read_leaf_handles_.find(handle->node_id);
+          if (current != local_read_leaf_handles_.end() &&
+              current->second.get() == handle.get()) {
+            local_read_leaf_handles_.erase(current);
+          }
+        }
+        retired_local_mls_versions_.push_back(retired);
+        ++rcu_retired_snapshot_count_;
+      }
+      ++rcu_mls_pointer_swap_count_;
+      refresh_local_spatial_path_exact_locked(slot_id);
+    }
+    dirty_local_mls_slots_.clear();
+    reclaim_local_mls_versions_locked();
+  }
+
+  void append_read_delta_locked(UpdateKind kind, const RecordInput& input) {
+    if (!rcu_enabled()) {
+      return;
+    }
+    const std::shared_ptr<const ReadView> previous_view =
+        std::atomic_load_explicit(&read_view_, std::memory_order_acquire);
+    if (!previous_view || !previous_view->snapshot) {
+      publish_read_snapshot_locked();
+      return;
+    }
+    std::shared_ptr<ReadDelta> delta = std::make_shared<ReadDelta>();
+    delta->sequence = next_read_delta_sequence_++;
+    delta->kind = kind;
+    delta->record =
+        ReadRecord{input.id, input.zmin, input.zmax, normalize(input.box)};
+    delta->previous = previous_view->delta_head;
+
+    std::shared_ptr<ReadView> next_view = std::make_shared<ReadView>();
+    next_view->snapshot = previous_view->snapshot;
+    next_view->delta_head = delta;
+    next_view->delta_count = previous_view->delta_count + 1;
+    std::shared_ptr<const ReadView> immutable = next_view;
+    std::atomic_store_explicit(&read_view_, immutable,
+                               std::memory_order_release);
+    ++rcu_delta_append_count_;
+    if (next_view->delta_count >= config_.rcu_delta_limit &&
+        active_recalibrations_.empty()) {
+      ++rcu_delta_compaction_count_;
+      publish_read_snapshot_locked();
+    }
   }
 
   void publish_read_snapshot_locked() {
@@ -3342,15 +4420,22 @@ class HireSfcLiteIndex {
       }
     }
 
-    std::shared_ptr<const ReadSnapshot> immutable = snapshot;
-    std::shared_ptr<const ReadSnapshot> retired =
-        std::atomic_exchange_explicit(&read_snapshot_, immutable,
+    std::shared_ptr<ReadView> next_view = std::make_shared<ReadView>();
+    next_view->snapshot = snapshot;
+    std::shared_ptr<const ReadView> immutable_view = next_view;
+    std::shared_ptr<const ReadView> retired_view =
+        std::atomic_exchange_explicit(&read_view_, immutable_view,
                                       std::memory_order_acq_rel);
     ++rcu_snapshot_publish_count_;
-    if (retired) {
-      retired_read_snapshots_.push_back(retired);
+    if (retired_view && retired_view->snapshot &&
+        retired_view->snapshot.get() != snapshot.get()) {
+      retired_read_snapshots_.push_back(retired_view->snapshot);
       ++rcu_retired_snapshot_count_;
     }
+    reclaim_retired_snapshots_locked();
+  }
+
+  void reclaim_retired_snapshots_locked() const {
     retired_read_snapshots_.erase(
         std::remove_if(retired_read_snapshots_.begin(),
                        retired_read_snapshots_.end(),
@@ -3405,6 +4490,285 @@ class HireSfcLiteIndex {
     return result;
   }
 
+  static std::size_t simd_upper_bound_zmin(
+      const std::vector<double>& sorted_keys, double qmax) {
+    std::size_t index = 0;
+#if defined(__AVX2__)
+    const __m256d query = _mm256_set1_pd(qmax);
+    for (; index + 4 <= sorted_keys.size(); index += 4) {
+      const __m256d values = _mm256_loadu_pd(sorted_keys.data() + index);
+      const __m256d greater =
+          _mm256_cmp_pd(values, query, _CMP_GT_OQ);
+      const int mask = _mm256_movemask_pd(greater);
+      if (mask != 0) {
+        return index + static_cast<std::size_t>(__builtin_ctz(mask));
+      }
+    }
+#endif
+    while (index < sorted_keys.size() && sorted_keys[index] <= qmax) {
+      ++index;
+    }
+    return index;
+  }
+
+  std::size_t scan_local_read_record_range(
+      const ReadLeaf& leaf, std::size_t begin, std::size_t end,
+      double qmin, const Box2D& query_box,
+      std::vector<std::size_t>& candidate_ids, QueryStats* stats) const {
+    end = std::min(end, leaf.records.size());
+    if (begin >= end) {
+      return 0;
+    }
+    if (stats != nullptr) {
+      stats->records_scanned += end - begin;
+    }
+    std::size_t index = begin;
+#if defined(__AVX2__)
+    const bool soa_ready = leaf.record_zmax.size() >= end &&
+                           leaf.record_xmin.size() >= end &&
+                           leaf.record_ymin.size() >= end &&
+                           leaf.record_xmax.size() >= end &&
+                           leaf.record_ymax.size() >= end;
+    if (config_.enable_local_leaf_simd && soa_ready) {
+      const __m256d query_zmin = _mm256_set1_pd(qmin);
+      const __m256d query_xmin = _mm256_set1_pd(query_box.xmin);
+      const __m256d query_ymin = _mm256_set1_pd(query_box.ymin);
+      const __m256d query_xmax = _mm256_set1_pd(query_box.xmax);
+      const __m256d query_ymax = _mm256_set1_pd(query_box.ymax);
+      for (; index + 4 <= end; index += 4) {
+        const __m256d zmax =
+            _mm256_loadu_pd(leaf.record_zmax.data() + index);
+        const __m256d xmin =
+            _mm256_loadu_pd(leaf.record_xmin.data() + index);
+        const __m256d ymin =
+            _mm256_loadu_pd(leaf.record_ymin.data() + index);
+        const __m256d xmax =
+            _mm256_loadu_pd(leaf.record_xmax.data() + index);
+        const __m256d ymax =
+            _mm256_loadu_pd(leaf.record_ymax.data() + index);
+        const __m256d z_overlaps =
+            _mm256_cmp_pd(zmax, query_zmin, _CMP_GE_OQ);
+        __m256d disjoint =
+            _mm256_cmp_pd(xmax, query_xmin, _CMP_LT_OQ);
+        disjoint = _mm256_or_pd(
+            disjoint, _mm256_cmp_pd(query_xmax, xmin, _CMP_LT_OQ));
+        disjoint = _mm256_or_pd(
+            disjoint, _mm256_cmp_pd(ymax, query_ymin, _CMP_LT_OQ));
+        disjoint = _mm256_or_pd(
+            disjoint, _mm256_cmp_pd(query_ymax, ymin, _CMP_LT_OQ));
+        const __m256d spatial_matches =
+            _mm256_andnot_pd(disjoint, z_overlaps);
+        unsigned int mask = static_cast<unsigned int>(
+            _mm256_movemask_pd(spatial_matches));
+        while (mask != 0) {
+          const std::size_t lane =
+              static_cast<std::size_t>(__builtin_ctz(mask));
+          const ReadRecord& record = leaf.records[index + lane];
+          if (leaf.masked_deleted_ids.find(record.id) ==
+              leaf.masked_deleted_ids.end()) {
+            candidate_ids.push_back(record.id);
+            if (stats != nullptr) {
+              ++stats->mbr_candidates;
+            }
+          }
+          mask &= mask - 1;
+        }
+        if (stats != nullptr) {
+          ++stats->leaf_simd_batches;
+        }
+      }
+    }
+#endif
+    for (; index < end; ++index) {
+      const ReadRecord& record = leaf.records[index];
+      if (leaf.masked_deleted_ids.find(record.id) !=
+          leaf.masked_deleted_ids.end()) {
+        continue;
+      }
+      if (record.zmax >= qmin && intersects(record.box, query_box)) {
+        candidate_ids.push_back(record.id);
+        if (stats != nullptr) {
+          ++stats->mbr_candidates;
+        }
+      }
+    }
+    return end - begin;
+  }
+
+  void scan_local_read_leaf(const ReadLeaf& leaf, double qmin, double qmax,
+                            const Box2D& query_box,
+                            std::vector<std::size_t>& candidate_ids,
+                            QueryStats* stats) const {
+    if (stats != nullptr) {
+      ++stats->block_checks;
+    }
+    if (leaf.min_zmin > qmax || leaf.max_zmax < qmin ||
+        (config_.enable_mbr_skip && !intersects(leaf.mbr, query_box))) {
+      if (stats != nullptr) {
+        if (leaf.max_zmax < qmin) {
+          ++stats->skipped_zmax_leaves;
+        } else {
+          ++stats->skipped_mbr_leaves;
+        }
+      }
+      return;
+    }
+    if (stats != nullptr) {
+      ++stats->visited_leaves;
+    }
+    record_snapshot_leaf_query(leaf);
+    const std::size_t sample_sequence =
+        leaf.runtime
+            ? leaf.runtime->cost_sample_sequence.fetch_add(
+                  1, std::memory_order_relaxed) +
+                  1
+            : 0;
+    const bool sample_cost =
+        leaf.kind == LeafKind::Model && sample_sequence > 0 &&
+        sample_sequence % config_.cost_sample_every == 0;
+    const std::uint64_t model_start = sample_cost ? steady_now_ns() : 0;
+    std::size_t model_scanned = 0;
+    const std::size_t scan_end =
+        simd_upper_bound_zmin(leaf.sorted_zmin, qmax);
+    if (config_.enable_local_leaf_blocks && !leaf.blocks.empty()) {
+      for (const ReadBlockSummary& block : leaf.blocks) {
+        if (block.begin >= scan_end) {
+          break;
+        }
+        if (stats != nullptr) {
+          ++stats->leaf_block_checks;
+        }
+        if (block.max_zmax < qmin || !intersects(block.mbr, query_box)) {
+          if (stats != nullptr) {
+            ++stats->leaf_blocks_pruned;
+          }
+          continue;
+        }
+        model_scanned += scan_local_read_record_range(
+            leaf, block.begin, std::min(block.end, scan_end), qmin,
+            query_box, candidate_ids, stats);
+      }
+    } else {
+      model_scanned += scan_local_read_record_range(
+          leaf, 0, scan_end, qmin, query_box, candidate_ids, stats);
+    }
+    if (sample_cost && model_scanned > 0) {
+      rcu_model_scan_ns_.fetch_add(steady_now_ns() - model_start,
+                                   std::memory_order_relaxed);
+      rcu_model_scan_entries_.fetch_add(model_scanned,
+                                        std::memory_order_relaxed);
+      rcu_model_scan_samples_.fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool sample_buffer = sample_cost && !leaf.buffer.empty();
+    const std::uint64_t buffer_start = sample_buffer ? steady_now_ns() : 0;
+    std::size_t buffer_scanned = 0;
+    for (const ReadRecord& record : leaf.buffer) {
+      ++buffer_scanned;
+      if (stats != nullptr) {
+        ++stats->buffer_records_scanned;
+      }
+      if (record.zmin <= qmax && record.zmax >= qmin &&
+          intersects(record.box, query_box)) {
+        candidate_ids.push_back(record.id);
+        if (stats != nullptr) {
+          ++stats->mbr_candidates;
+        }
+      }
+    }
+    if (sample_buffer && buffer_scanned > 0) {
+      rcu_buffer_scan_ns_.fetch_add(steady_now_ns() - buffer_start,
+                                    std::memory_order_relaxed);
+      rcu_buffer_scan_entries_.fetch_add(buffer_scanned,
+                                         std::memory_order_relaxed);
+      rcu_buffer_scan_samples_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  bool local_spatial_summary_overlaps(
+      const LocalSpatialSummary& summary, double qmin, double qmax,
+      const Box2D& query_box) const {
+    return summary.valid && summary.min_zmin <= qmax &&
+           (!config_.enable_zmax_skip || summary.max_zmax >= qmin) &&
+           (!config_.enable_mbr_skip || intersects(summary.mbr, query_box));
+  }
+
+  void scan_local_mls_slot(
+      const std::shared_ptr<LocalMlsSlot>& slot, double qmin, double qmax,
+      const Box2D& query_box, std::vector<std::size_t>& candidate_ids,
+      QueryStats* stats) const {
+    if (config_.enable_local_spatial_tree) {
+      const std::shared_ptr<const LocalSpatialSummary> summary =
+          std::atomic_load_explicit(&slot->spatial_summary,
+                                    std::memory_order_acquire);
+      if (summary &&
+          !local_spatial_summary_overlaps(*summary, qmin, qmax, query_box)) {
+        return;
+      }
+    }
+    const std::shared_ptr<const LocalMlsVersion> version =
+        std::atomic_load_explicit(&slot->version,
+                                  std::memory_order_acquire);
+    if (!version) {
+      return;
+    }
+    for (const std::shared_ptr<LocalReadLeafHandle>& handle :
+         version->leaves) {
+      std::shared_lock<std::shared_timed_mutex> leaf_lock(handle->mutex);
+      scan_local_read_leaf(handle->leaf, qmin, qmax, query_box,
+                           candidate_ids, stats);
+    }
+  }
+
+  void scan_local_read_tree_node(
+      const std::shared_ptr<LocalReadTreeNode>& node, double qmin,
+      double qmax, const Box2D& query_box,
+      std::vector<std::size_t>& candidate_ids, QueryStats* stats) const {
+    if (!node) {
+      return;
+    }
+    if (stats != nullptr) {
+      ++stats->internal_nodes_visited;
+    }
+    const std::shared_ptr<const LocalSpatialSummary> summary =
+        std::atomic_load_explicit(&node->spatial_summary,
+                                  std::memory_order_acquire);
+    if (summary &&
+        !local_spatial_summary_overlaps(*summary, qmin, qmax, query_box)) {
+      return;
+    }
+    for (const std::shared_ptr<LocalReadTreeNode>& child : node->children) {
+      scan_local_read_tree_node(child, qmin, qmax, query_box, candidate_ids,
+                                stats);
+    }
+    for (const std::shared_ptr<LocalMlsSlot>& slot : node->slots) {
+      scan_local_mls_slot(slot, qmin, qmax, query_box, candidate_ids, stats);
+    }
+  }
+
+  void range_query_local_mls(const LocalReadRoot& root, double raw_qmin,
+                             double raw_qmax, const Box2D& raw_query_box,
+                             std::vector<std::size_t>& candidate_ids,
+                             QueryStats* stats) const {
+    rcu_active_readers_.fetch_add(1, std::memory_order_acq_rel);
+    candidate_ids.clear();
+    double qmin = raw_qmin;
+    double qmax = raw_qmax;
+    if (qmin > qmax) {
+      std::swap(qmin, qmax);
+    }
+    const Box2D query_box = normalize(raw_query_box);
+    if (config_.enable_local_spatial_tree && root.spatial_root) {
+      scan_local_read_tree_node(root.spatial_root, qmin, qmax, query_box,
+                                candidate_ids, stats);
+    } else {
+      for (const std::shared_ptr<LocalMlsSlot>& slot : root.slots) {
+        scan_local_mls_slot(slot, qmin, qmax, query_box, candidate_ids,
+                            stats);
+      }
+    }
+    rcu_active_readers_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
   void range_query_snapshot(const ReadSnapshot& snapshot, double raw_qmin,
                             double raw_qmax, const Box2D& raw_query_box,
                             std::vector<std::size_t>& candidate_ids,
@@ -3426,27 +4790,17 @@ class HireSfcLiteIndex {
       return;
     }
     HireInternalDirectory::SearchStats internal_stats;
-    const std::size_t leaf_id =
-        snapshot.internal_directory.find_leaf(qmax, &internal_stats);
-    const auto routed = snapshot.leaf_id_to_index.find(leaf_id);
-    std::size_t index = npos();
-    if (routed != snapshot.leaf_id_to_index.end()) {
-      index = routed->second;
-      while (index + 1 < snapshot.min_zmin.size() &&
-             snapshot.min_zmin[index + 1] <= qmax) {
-        ++index;
-      }
+    std::vector<std::size_t> leaf_ids;
+    if (config_.enable_spatial_directory_pruning) {
+      snapshot.internal_directory.find_spatial_candidate_leaves(
+          qmin, qmax, query_box.xmin, query_box.ymin, query_box.xmax,
+          query_box.ymax, leaf_ids, &internal_stats);
     } else {
-      auto upper = std::upper_bound(snapshot.min_zmin.begin(),
-                                    snapshot.min_zmin.end(), qmax);
-      if (upper != snapshot.min_zmin.begin()) {
-        index = static_cast<std::size_t>(
-            upper - snapshot.min_zmin.begin() - 1);
+      for (const std::shared_ptr<const ReadLeaf>& leaf : snapshot.leaves) {
+        if (leaf->min_zmin <= qmax) {
+          leaf_ids.push_back(leaf->node_id);
+        }
       }
-    }
-    if (index == npos() || index >= snapshot.leaves.size()) {
-      rcu_active_readers_.fetch_sub(1, std::memory_order_acq_rel);
-      return;
     }
     if (stats != nullptr) {
       stats->internal_nodes_visited += internal_stats.visited_nodes;
@@ -3455,7 +4809,13 @@ class HireSfcLiteIndex {
       stats->internal_log_entries_scanned +=
           internal_stats.log_entries_scanned;
     }
-    for (;;) {
+    for (std::size_t leaf_id : leaf_ids) {
+      const auto routed = snapshot.leaf_id_to_index.find(leaf_id);
+      if (routed == snapshot.leaf_id_to_index.end() ||
+          routed->second >= snapshot.leaves.size()) {
+        continue;
+      }
+      const std::size_t index = routed->second;
       const ReadLeaf& leaf = *snapshot.leaves[index];
       if (stats != nullptr) {
         ++stats->block_checks;
@@ -3533,15 +4893,57 @@ class HireSfcLiteIndex {
           ++stats->skipped_mbr_leaves;
         }
       }
-      if (index == 0) {
-        break;
-      }
-      --index;
-      if (stats != nullptr) {
-        ++stats->leaf_sibling_hops;
-      }
     }
     rcu_active_readers_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  void apply_read_deltas(const ReadView& view, double raw_qmin,
+                         double raw_qmax, const Box2D& raw_query_box,
+                         std::vector<std::size_t>& candidate_ids,
+                         QueryStats* stats) const {
+    if (!view.delta_head) {
+      return;
+    }
+    double qmin = raw_qmin;
+    double qmax = raw_qmax;
+    if (qmin > qmax) {
+      std::swap(qmin, qmax);
+    }
+    const Box2D query_box = normalize(raw_query_box);
+    const std::uint64_t delta_scan_start = steady_now_ns();
+    std::size_t delta_entries_scanned = 0;
+    std::unordered_set<std::size_t> overridden;
+    overridden.reserve(view.delta_count * 2 + 1);
+    std::vector<std::size_t> delta_matches;
+    for (std::shared_ptr<const ReadDelta> delta = view.delta_head; delta;
+         delta = delta->previous) {
+      ++delta_entries_scanned;
+      if (!overridden.insert(delta->record.id).second) {
+        continue;
+      }
+      if (delta->kind == UpdateKind::Insert && delta->record.zmin <= qmax &&
+          delta->record.zmax >= qmin &&
+          intersects(delta->record.box, query_box)) {
+        delta_matches.push_back(delta->record.id);
+        if (stats != nullptr) {
+          ++stats->buffer_records_scanned;
+          ++stats->mbr_candidates;
+        }
+      }
+    }
+    candidate_ids.erase(
+        std::remove_if(candidate_ids.begin(), candidate_ids.end(),
+                       [&](std::size_t id) {
+                         return overridden.find(id) != overridden.end();
+                       }),
+        candidate_ids.end());
+    candidate_ids.insert(candidate_ids.end(), delta_matches.begin(),
+                         delta_matches.end());
+    rcu_buffer_scan_ns_.fetch_add(steady_now_ns() - delta_scan_start,
+                                  std::memory_order_relaxed);
+    rcu_buffer_scan_entries_.fetch_add(delta_entries_scanned,
+                                       std::memory_order_relaxed);
+    rcu_buffer_scan_samples_.fetch_add(1, std::memory_order_relaxed);
   }
 
   void scan_leaf(const Leaf& leaf, double qmin, double qmax,
@@ -3712,11 +5114,24 @@ class HireSfcLiteIndex {
   double last_retrain_error_after_ = 0.0;
   TriggerReason last_retrain_trigger_reason_ = TriggerReason::None;
   mutable std::mutex writer_mutex_;
-  std::shared_ptr<const ReadSnapshot> read_snapshot_;
+  std::shared_ptr<const ReadView> read_view_;
+  std::shared_ptr<const LocalReadRoot> local_read_root_;
+  std::vector<std::shared_ptr<LocalMlsSlot>> local_mls_slots_;
+  std::vector<std::vector<std::shared_ptr<LocalReadTreeNode>>>
+      local_slot_ancestor_paths_;
+  std::vector<std::size_t> local_slot_deletes_since_spatial_refresh_;
+  std::unordered_map<std::size_t, std::shared_ptr<LocalReadLeafHandle>>
+      local_read_leaf_handles_;
+  std::unordered_set<std::size_t> dirty_local_mls_slots_;
+  std::uint64_t local_mls_generation_ = 0;
+  mutable std::vector<std::weak_ptr<const LocalMlsVersion>>
+      retired_local_mls_versions_;
   std::unordered_map<std::size_t, ReadLeafCacheEntry> read_leaf_cache_;
-  std::vector<std::weak_ptr<const ReadSnapshot>> retired_read_snapshots_;
+  mutable std::vector<std::weak_ptr<const ReadSnapshot>>
+      retired_read_snapshots_;
   std::uint64_t next_read_version_ = 1;
   std::uint64_t read_snapshot_generation_ = 0;
+  std::uint64_t next_read_delta_sequence_ = 1;
   mutable std::atomic<std::size_t> rcu_active_readers_{0};
   mutable std::atomic<std::uint64_t> rcu_model_scan_ns_{0};
   mutable std::atomic<std::uint64_t> rcu_model_scan_entries_{0};
@@ -3742,7 +5157,14 @@ class HireSfcLiteIndex {
   std::size_t mls_final_validation_repair_count_ = 0;
   std::size_t rcu_snapshot_publish_count_ = 0;
   std::size_t rcu_retired_snapshot_count_ = 0;
-  std::size_t rcu_reclaimed_snapshot_count_ = 0;
+  mutable std::size_t rcu_reclaimed_snapshot_count_ = 0;
+  std::size_t rcu_delta_append_count_ = 0;
+  std::size_t rcu_delta_compaction_count_ = 0;
+  std::size_t rcu_local_leaf_publish_count_ = 0;
+  std::size_t rcu_mls_pointer_swap_count_ = 0;
+  std::size_t rcu_full_root_publish_count_ = 0;
+  std::size_t rcu_spatial_summary_publish_count_ = 0;
+  std::size_t next_local_read_tree_node_id_ = 1;
   std::size_t background_job_count_ = 0;
   std::size_t background_job_abort_count_ = 0;
   std::size_t last_pap_levels_ = 0;
@@ -3755,6 +5177,11 @@ class HireSfcLiteIndex {
   std::size_t model_downgrade_count_ = 0;
   std::size_t legacy_transform_abort_count_ = 0;
   std::size_t legacy_coefficient_reject_count_ = 0;
+  std::size_t legacy_transform_gate_skip_count_ = 0;
+  std::size_t legacy_regression_cache_refresh_count_ = 0;
+  std::size_t full_record_ref_rebuild_count_ = 0;
+  std::size_t local_record_ref_refresh_count_ = 0;
+  std::uint64_t update_clock_ = 0;
   std::size_t last_transform_input_leaves_ = 0;
   std::size_t last_transform_input_records_ = 0;
   RecalibrationKind last_recalibration_job_kind_ =

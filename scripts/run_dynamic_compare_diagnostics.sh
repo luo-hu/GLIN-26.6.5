@@ -224,9 +224,11 @@ DELI-Cost 的 PRL-aware DP 划分参数：
 
   PREDICATE_SHORTCUTS
     是否启用 DELI predicate-aware shortcut。默认 1。
-    当前实现只使用严格安全的矩形查询 shortcut：
+    当前实现使用严格安全的矩形查询 shortcut：
     如果 query 矩形的 envelope 完全包含对象 envelope，则该对象必然与 query 矩形相交，
-    可以直接返回答案并跳过 GEOS exact intersects。
+    可以直接返回答案并跳过 GEOS exact intersects；如果对象的一个真实坐标落在 query
+    矩形内，也可作为相交的正向 witness。后者由
+    REPRESENTATIVE_POINT_SHORTCUTS=0/1 单独控制，默认 1。
     设为 0 可以复现实验中的 DELI v1，不使用该 predicate-aware 层。
 
   PREDICATE_SHORTCUTS_LIST
@@ -503,6 +505,7 @@ COST_PARTITION_STEP="${COST_PARTITION_STEP:-0}"
 COST_PARTITION_QUERY_SAMPLE="${COST_PARTITION_QUERY_SAMPLE:-128}"
 PREDICATE_SHORTCUTS="${PREDICATE_SHORTCUTS:-1}"
 PREDICATE_SHORTCUTS_LIST="${PREDICATE_SHORTCUTS_LIST:-$PREDICATE_SHORTCUTS}"
+REPRESENTATIVE_POINT_SHORTCUTS="${REPRESENTATIVE_POINT_SHORTCUTS:-1}"
 LAZY_ALEX_DELETE="${LAZY_ALEX_DELETE:-1}"
 DEFER_DELETE_SUMMARY_REFRESH="${DEFER_DELETE_SUMMARY_REFRESH:-1}"
 PIECE_LIMIT="${PIECE_LIMIT:-10000}"
@@ -566,6 +569,7 @@ if [[ "$SHOW_CONFIG" == "1" ]]; then
     CORRECTNESS_EVERY_N=$CORRECTNESS_EVERY_N
     PREDICATE_SHORTCUTS=$PREDICATE_SHORTCUTS
     PREDICATE_SHORTCUTS_LIST=$PREDICATE_SHORTCUTS_LIST
+    REPRESENTATIVE_POINT_SHORTCUTS=$REPRESENTATIVE_POINT_SHORTCUTS
     LAZY_ALEX_DELETE=$LAZY_ALEX_DELETE
       1 表示 DELI-LB/Cost 删除只更新 overlay tombstone，跳过冗余 ALEX erase。
     DEFER_DELETE_SUMMARY_REFRESH=$DEFER_DELETE_SUMMARY_REFRESH
@@ -905,6 +909,7 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --cost_partition_step "$COST_PARTITION_STEP" \
           --cost_partition_query_sample "$COST_PARTITION_QUERY_SAMPLE" \
           --predicate_shortcuts "$predicate_shortcuts_value" \
+          --representative_point_shortcuts "$REPRESENTATIVE_POINT_SHORTCUTS" \
           --lazy_alex_delete "$LAZY_ALEX_DELETE" \
           --defer_delete_summary_refresh "$DEFER_DELETE_SUMMARY_REFRESH" \
           --piece_limit "$PIECE_LIMIT" \

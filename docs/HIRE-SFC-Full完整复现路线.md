@@ -428,6 +428,15 @@ rcu_snapshot_publish_count
 rcu_retired_snapshot_count
 rcu_reclaimed_snapshot_count
 rcu_active_reader_count
+rcu_delta_append_count
+rcu_delta_compaction_count
+rcu_delta_entries
+rcu_local_leaf_publish_count
+rcu_mls_pointer_swap_count
+rcu_full_root_publish_count
+rcu_spatial_summary_publish_count
+rcu_spatial_tree_node_count
+rcu_spatial_tree_levels
 background_job_count
 background_job_abort_count
 last_pap_levels
@@ -555,19 +564,130 @@ buffer_hash_entries == buffer_records
 legacy_slots_used <= legacy_slot_capacity
 broken_sibling_link_count == 0
 directory_rebuild_count == 1
+full_record_ref_rebuild_count == 1
 ```
+
+## 6. Stage 1--6 性能硬化与消融
+
+Stage 7 功能验收后的首轮正式实验暴露了几个与 HIRE 算法目标不一致的
+全局开销：每次更新都重新拟合 transformation、重建全局 record owner、发布
+完整 RCU snapshot，以及 extent query 扫描所有 `min_zmin <= qmax` 的叶子。
+性能硬化版将这些开销改为局部、阈值化操作：
+
+1. Legacy transformation 只在叶更新数达到阈值后评估，并使用 cooldown
+   限制重复拟合。回归系数缓存在 leaf 中，默认阈值为 64 次更新，
+   cooldown 为 256 次全局更新。对应参数为
+   `HIRE_SFC_LEGACY_TRANSFORM_UPDATE_THRESHOLD` 和
+   `HIRE_SFC_LEGACY_TRANSFORM_COOLDOWN_UPDATES`。
+2. Record 持有稳定 `leaf_id`。split/merge/redistribution/transformation 只刷新
+   被移动记录的 owner，不再扫描全部 records。动态阶段
+   `full_record_ref_rebuild_count` 应保持为 bulk-load 产生的 1，
+   `local_record_ref_refresh_count` 只随局部结构变化增长。
+3. RCU 已改为 MLS-local 发布。普通更新直接修改所属稳定 leaf handle；只有更新命中
+   active MLS 时才写入该 MLS 的 update log。默认路径不再构造全局 `ReadView`
+   delta，`rcu_delta_append_count` 和 `rcu_delta_entries` 在整个 workload 中应保持 0。
+   `HIRE_SFC_ENABLE_LOCAL_MLS_RCU=0` 仅保留为旧全局 snapshot 路径的消融开关。
+4. `LocalReadRoot -> LocalMlsSlot -> LocalMlsVersion` 构成稳定的 reader 结构。
+   split/merge/retraining 产生的新叶继承所属 slot；安装时只对该 slot 执行
+   `atomic_exchange`，旧 version 由 reader 引用自然延迟回收。正常动态阶段
+   `rcu_full_root_publish_count` 应保持为 bulk-load 时的 1，局部发布由
+   `rcu_mls_pointer_swap_count` 单独计数。
+5. Internal node 默认 fanout 为 256，并把 routing key 和 child ID 拆成紧凑 hot SoA；
+   MBR 等宽字段留在 cold entry 中。点路由和插入路由均执行线性模型预测、
+   `max_model_error` 有界修正，窗口失效时使用 AVX2 SIMD lower-bound fallback。
+   log-shadowed primary slot 会从 hot SoA 中屏蔽，避免重复 child。普通 MLS-local
+   更新仅在 `max_zmin` 路由边界真正变化时发布 internal key，不再同步未被当前
+   reader 使用的整套 spatial summary。
+6. MLS-local reader 在稳定 slot 之上按 fanout 256 构建不可变拓扑的 read tree。
+   每个 slot 和 read-tree node 原子发布 subtree `min_zmin`、`max_zmax` 和 MBR；
+   extent query 在加载 MLS version 或 leaf handle 前逐层剪枝。插入先从 root 到 slot
+   扩张摘要，再发布 reader leaf，保证并发查询不会漏掉新记录；删除保留安全的
+   stale-large 摘要，默认每个 slot 累积 64 次删除后精确收紧；split/merge/retraining
+   的局部 pointer swap 后立即自底向上精确发布。可用
+   `HIRE_SFC_ENABLE_LOCAL_SPATIAL_TREE=0` 关闭整棵读树做消融，删除刷新周期由
+   `HIRE_SFC_LOCAL_SPATIAL_DELETE_REFRESH` 控制。
+7. 命中叶内部按默认 32 条记录构建 `max_zmax + MBR` block summary，先整块剪枝，
+   再扫描剩余连续区间。`sorted_zmin`、block summary 和主记录在 bulk load、局部
+   rebuild、legacy 插入/删除及 MLS 安装后同步发布；model tombstone 仍保留
+   stale-large summary，因此只会多扫，不会漏答。block 大小由
+   `HIRE_SFC_LOCAL_READ_BLOCK_SIZE` 控制，可用
+   `HIRE_SFC_ENABLE_LOCAL_LEAF_BLOCKS=0` 做消融。另实现了五列 double SoA 与 AVX2
+   MBR 过滤，可用 `HIRE_SFC_ENABLE_LOCAL_LEAF_SIMD=1` 单独开启；标量 fallback 始终
+   保留。AW 500K 消融显示 32-record block 已将命中区间压得很短，SIMD 的额外内存
+   流量高于计算收益，因此 SIMD 当前默认关闭，不应与 block 收益合并报告。
+8. Benchmark 将每次 `Geometry::intersects()` 的 CPU 时间独立累计为
+   `geos_exact_ns`，并输出 `avg_geos_exact_ns` 和
+   `geos_exact_query_fraction`，不再只用 `exact_calls` 推测 GEOS 开销。矩形查询的
+   predicate layer 在 envelope containment 之外增加 representative-point witness：
+   如果候选 geometry 返回的一个真实坐标落在查询矩形内，则相交关系已被正向证明，
+   可以跳过 GEOS；无法证明时仍执行完整 `intersects()`。该规则只产生确定答案，不做
+   负向排除。默认开启，可用 `REPRESENTATIVE_POINT_SHORTCUTS=0` 独立消融。
+
+Full 的论文参数 profile 只作用于 `HIRE_SFC_FULL`，当前默认值为
+`f=256`、`alpha=512`、`beta=32768`、`epsilon=64`、`tau=256`、`delta=8`；
+分别对应 internal fanout、模型叶最小记录数、模型叶最大记录数、最大模型误差、
+更新 buffer 阈值和 inter-level bulk-loading 搜索半径。Lite 的原参数不受影响，
+且所有值仍可通过既有 `HIRE_SFC_*` 环境变量做消融覆盖。
+
+不要一次打开 Full 的全部开关后直接归因。使用下列脚本依次运行
+Stage 1--6。`stage6_guard` 之外还应分别设置
+`HIRE_SFC_ENABLE_LOCAL_SPATIAL_TREE=0/1` 比较新的 MLS-local subtree pruning：
+
+```bash
+HIRE_ABLATION_STAGES="stage1 stage2 stage3 stage4 stage5 stage6 stage6_guard" \
+  DATASETS="AW LW PARKS" SELECTIVITY_TAGS="0p01pct" \
+  WORKLOAD_MODE=mixed MIXED_PROFILES=read_heavy \
+  LIMIT=500000 MIXED_OPERATIONS=500000 CHECK_CORRECTNESS=1 \
+  BUILD_DIR=build_current \
+  ./scripts/run_hire_sfc_full_ablation.sh
+```
+
+脚本保留其他已导出的 benchmark 环境变量，每个阶段写入独立的
+`results/hire_sfc_full_ablation/<stage>` 和
+`figures/hire_sfc_full_ablation/<stage>`。性能对比时至少联合分析
+query/insert/delete latency、overall throughput、内存、剪枝计数、RCU delta 压实数
+和局部 owner 刷新数。
 
 `last_retrain_trigger_reason` 的编码为 `0=None`、`1=Active`、`2=Passive`。分析正式
 实验时，active 行应满足 `last_estimated_gain_ns > last_estimated_retrain_ns`，最近一次
 被拒绝的判断则应满足 `last_rejected_gain_ns <= last_rejected_retrain_ns`。
 
-## 6. 当前结论
+## 7. 当前结论
 
 `HIRE_SFC_FULL` 已完成 Stage 1A/1B、Stage 2、Stage 3、Stage 4、Stage 5、Stage 6，以及
 Stage 7 的功能和 sanitizer 验收。它现在具备稳定 node id、动态 child
 split/merge 上推、局部 directory 更新、哈希 model buffer、swap-last buffer deletion、
 固定容量 legacy leaf、稳定 sibling range scan、时间窗实测成本模型，以及 PAP/MLS
 后台 RCU recalibration、论文级 legacy leaf 双向转换、逐层 RLS bulk-loading，以及
-final-validated RCU installation。剩余验收项是迁移到兼容 TSan 的实验机完成 data-race
-检查，并运行论文规模的逐阶段性能消融；在这两项完成前，应称为“功能复现完成”，而不是
-“论文全部实验验收完成”。
+final-validated RCU installation。性能硬化版还增加了阈值化 transformation、稳定 record
+owner、MLS-local update log、局部 parent-slot pointer swap，以及 fanout-256 的
+key/child hot SoA internal routing，并在 reader leaf 内增加小粒度 `max_zmax + MBR`
+block summary 及可选 SoA/AVX2 MBR filter。AW 50K、20K mixed read-heavy correctness smoke 中，
+所有 checkpoint 均满足 `answers_match_boost=1`；完整 root 发布数保持为 1，全局 delta
+计数保持为 0。新增 local spatial tree 后，结构检查由每阶段约 50--55 万次下降到
+1.9--2.1 万次，下降约 96%；50K 小规模下 query latency 下降约 2%--5%，更大规模需通过
+500K/1M 正式实验验证层级收益。AW 500K、20K operations 的开关 A/B 中，结构检查由
+每阶段 340--372 万次下降到 3.5--3.9 万次，query latency 从 0.087--0.095 ms 降至
+0.063--0.064 ms，query throughput 提升约 39%--50%，overall throughput 提升约
+37%--49%；所有 checkpoint 仍满足 `answers_match_boost=1`。该短实验用于验证机制，
+不能替代正式多数据集、多选择性和多次重复实验。
+
+在保留 local spatial tree 的 AW 500K、20K operations 二级消融中，关闭 leaf block
+时四个 checkpoint 的平均查询延迟为 0.0658 ms、平均记录扫描数为 389.8 万；开启
+32-record block、保持标量过滤后分别为 0.0624 ms 和 104.5 万，记录扫描下降 73.2%，
+查询延迟下降 5.3%，query throughput 提升 5.6%，overall throughput 提升 5.5%，
+估算内存仅从 68.34 MB 增至 69.19 MB。继续开启 SoA/AVX2 后，平均查询延迟反而回升
+至 0.0641 ms，估算内存增至 88.29 MB，因此 SIMD 保留为硬件/块大小相关的可选消融，
+不是默认配置。三组全部 checkpoint 均满足 `answers_match_boost=1`。
+
+进一步在 AW 500K、20K operations、0.01% selectivity 上测量 exact predicate：仅使用
+envelope containment 时，每个 checkpoint 平均执行 17,660 次 GEOS，GEOS CPU 时间
+166.1 ms，占查询时间 58.3%；开启 representative-point witness 后新增 7,202 次安全
+shortcut，GEOS 调用降至 10,458 次，下降 40.8%，GEOS 时间降至 121.7 ms，下降 26.7%，
+query throughput 从 15,826 提升至 16,382 queries/s。剩余 GEOS 调用平均成本由
+9.4 us 升至 11.6 us，说明 shortcut 优先移除了容易判定的正例，余下的是更复杂的
+边界相交和负例。两组所有 checkpoint 均满足 `answers_match_boost=1`。
+
+剩余工作是迁移到兼容 TSan 的实验机完成 data-race 检查，以及论文规模逐阶段性能消融。
+在这些项目完成前，应称为
+“核心更新路径对齐、功能复现完成”，而不是“论文全部实验验收完成”。

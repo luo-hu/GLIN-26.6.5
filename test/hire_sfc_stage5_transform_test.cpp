@@ -43,6 +43,8 @@ void configure(std::size_t min_model_leaf, std::size_t buffer_limit) {
   setenv("HIRE_SFC_LEGACY_BACKWARD_MIN_LEAVES", "2", 1);
   setenv("HIRE_SFC_LEGACY_SLOPE_TOLERANCE", "0.10", 1);
   setenv("HIRE_SFC_LEGACY_INTERCEPT_TOLERANCE", "2.0", 1);
+  setenv("HIRE_SFC_LEGACY_TRANSFORM_UPDATE_THRESHOLD", "1", 1);
+  setenv("HIRE_SFC_LEGACY_TRANSFORM_COOLDOWN_UPDATES", "0", 1);
   setenv("HIRE_SFC_INTERNAL_FANOUT", "4", 1);
 }
 
@@ -123,6 +125,21 @@ void test_backward_merge() {
           "backward PLA merge did not finish");
 
   const DebugStats stats = index.debug_stats();
+  if (stats.legacy_backward_attempt_count != 1 ||
+      stats.legacy_backward_success_count != 1) {
+    std::cerr << "backward diagnostics: attempts="
+              << stats.legacy_backward_attempt_count
+              << " successes=" << stats.legacy_backward_success_count
+              << " rejects=" << stats.legacy_coefficient_reject_count
+              << " aborts=" << stats.legacy_transform_abort_count
+              << " gate_skips=" << stats.legacy_transform_gate_skip_count
+              << " cache_refreshes="
+              << stats.legacy_regression_cache_refresh_count
+              << " leaves=" << stats.leaf_count
+              << " model=" << stats.model_leaf_count
+              << " legacy=" << stats.legacy_leaf_count
+              << " splits=" << stats.leaf_split_count << '\n';
+  }
   require(stats.legacy_backward_attempt_count == 1 &&
               stats.legacy_backward_success_count == 1,
           "backward legacy-run merge did not succeed");

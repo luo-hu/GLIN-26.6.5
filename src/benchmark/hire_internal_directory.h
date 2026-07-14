@@ -15,6 +15,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 namespace hire_sfc_lite {
 
 // Dynamic HIRE-style internal layer. Internal nodes and leaf children use
@@ -73,6 +77,18 @@ class HireInternalDirectory {
     std::vector<NodeId> covered_leaf_ids;
   };
 
+  struct LeafSummary {
+    NodeId leaf_id = invalid_id();
+    double min_key = std::numeric_limits<double>::infinity();
+    double max_key = -std::numeric_limits<double>::infinity();
+    double max_zmax = -std::numeric_limits<double>::infinity();
+    double xmin = std::numeric_limits<double>::infinity();
+    double ymin = std::numeric_limits<double>::infinity();
+    double xmax = -std::numeric_limits<double>::infinity();
+    double ymax = -std::numeric_limits<double>::infinity();
+    bool spatial_valid = false;
+  };
+
   HireInternalDirectory() : config_(Config::from_env()) {}
 
   static NodeId invalid_id() {
@@ -99,17 +115,29 @@ class HireInternalDirectory {
 
   void bulk_load(
       const std::vector<std::pair<NodeId, double>>& leaf_max_keys) {
+    std::vector<LeafSummary> summaries;
+    summaries.reserve(leaf_max_keys.size());
+    for (const auto& leaf : leaf_max_keys) {
+      LeafSummary summary;
+      summary.leaf_id = leaf.first;
+      summary.max_key = leaf.second;
+      summaries.push_back(summary);
+    }
+    bulk_load(summaries);
+  }
+
+  void bulk_load(const std::vector<LeafSummary>& leaf_summaries) {
     clear();
     const auto build_start = std::chrono::steady_clock::now();
-    if (leaf_max_keys.empty()) {
+    if (leaf_summaries.empty()) {
       bulk_build_ns_ = elapsed_ns(build_start);
       return;
     }
 
     std::vector<Entry> children;
-    children.reserve(leaf_max_keys.size());
-    for (const auto& leaf : leaf_max_keys) {
-      children.push_back(Entry{leaf.second, leaf.first, true});
+    children.reserve(leaf_summaries.size());
+    for (const LeafSummary& leaf : leaf_summaries) {
+      children.push_back(entry_from_leaf_summary(leaf));
     }
     sort_entries(children);
 
@@ -145,7 +173,7 @@ class HireInternalDirectory {
                                  children.begin() + static_cast<long>(end));
         const NodeId node_id = create_node(group, children_are_leaves,
                                            invalid_id());
-        parents.push_back(Entry{node_max_key(node_id), node_id, true});
+        parents.push_back(entry_from_node(node_id));
         begin = end;
       }
       if (parents.size() == 1) {
@@ -212,6 +240,17 @@ class HireInternalDirectory {
     }
   }
 
+  void update_leaf_summary(const LeafSummary& summary) {
+    const auto parent_it = leaf_parent_.find(summary.leaf_id);
+    if (parent_it == leaf_parent_.end()) {
+      return;
+    }
+    if (update_child_entry(parent_it->second,
+                           entry_from_leaf_summary(summary))) {
+      ++boundary_updates_;
+    }
+  }
+
   bool insert_leaf_after(NodeId left_leaf_id, NodeId new_leaf_id,
                          double left_max_key, double new_max_key) {
     if (leaf_parent_.find(new_leaf_id) != leaf_parent_.end()) {
@@ -225,6 +264,39 @@ class HireInternalDirectory {
     update_child_key(parent_id, left_leaf_id, left_max_key);
     insert_child(parent_id, Entry{new_max_key, new_leaf_id, true});
     return true;
+  }
+
+  bool insert_leaf_after(const LeafSummary& left,
+                         const LeafSummary& inserted) {
+    if (leaf_parent_.find(inserted.leaf_id) != leaf_parent_.end()) {
+      return false;
+    }
+    const auto parent_it = leaf_parent_.find(left.leaf_id);
+    if (parent_it == leaf_parent_.end()) {
+      return false;
+    }
+    const NodeId parent_id = parent_it->second;
+    update_child_entry(parent_id, entry_from_leaf_summary(left));
+    insert_child(parent_id, entry_from_leaf_summary(inserted));
+    return true;
+  }
+
+  void find_spatial_candidate_leaves(double qmin, double qmax, double xmin,
+                                     double ymin, double xmax, double ymax,
+                                     std::vector<NodeId>& leaves,
+                                     SearchStats* stats = nullptr) const {
+    leaves.clear();
+    if (qmin > qmax) {
+      std::swap(qmin, qmax);
+    }
+    if (xmin > xmax) {
+      std::swap(xmin, xmax);
+    }
+    if (ymin > ymax) {
+      std::swap(ymin, ymax);
+    }
+    collect_spatial_leaves(root_id_, qmin, qmax, xmin, ymin, xmax, ymax,
+                           leaves, stats);
   }
 
   bool remove_leaf(NodeId leaf_id) {
@@ -370,6 +442,8 @@ class HireInternalDirectory {
     bytes += nodes_.size() * (sizeof(NodeId) + sizeof(Node));
     for (const auto& pair : nodes_) {
       bytes += pair.second.slots.capacity() * sizeof(Entry);
+      bytes += pair.second.routing_keys.capacity() * sizeof(double);
+      bytes += pair.second.routing_children.capacity() * sizeof(NodeId);
       bytes += pair.second.log.capacity() * sizeof(Entry);
     }
     bytes += leaf_parent_.size() * sizeof(std::pair<NodeId, NodeId>);
@@ -378,8 +452,8 @@ class HireInternalDirectory {
 
  private:
   struct Config {
-    std::size_t fanout = 64;
-    std::size_t bulk_delta = 32;
+    std::size_t fanout = 256;
+    std::size_t bulk_delta = 8;
     double gap_fraction = 0.20;
     double log_fraction = 0.10;
     double min_fill_fraction = 0.40;
@@ -450,6 +524,13 @@ class HireInternalDirectory {
     double max_key = -std::numeric_limits<double>::infinity();
     NodeId child = invalid_id();
     bool active = false;
+    double min_key = std::numeric_limits<double>::infinity();
+    double max_zmax = -std::numeric_limits<double>::infinity();
+    double xmin = std::numeric_limits<double>::infinity();
+    double ymin = std::numeric_limits<double>::infinity();
+    double xmax = -std::numeric_limits<double>::infinity();
+    double ymax = -std::numeric_limits<double>::infinity();
+    bool spatial_valid = false;
   };
 
   struct Node {
@@ -457,6 +538,10 @@ class HireInternalDirectory {
     NodeId parent = invalid_id();
     bool children_are_leaves = false;
     std::vector<Entry> slots;
+    // Routing-only hot SoA mirror. Spatial summaries stay in the cold Entry
+    // array; model/SIMD routing reads only keys and child IDs.
+    std::vector<double> routing_keys;
+    std::vector<NodeId> routing_children;
     std::vector<Entry> log;
     double slope = 0.0;
     double intercept = 0.0;
@@ -525,7 +610,31 @@ class HireInternalDirectory {
                      : (i * (config_.fanout - 1)) / (count - 1);
       node.slots[slot] = entries[i];
     }
+    refresh_routing_keys(node);
     fit_model(node);
+  }
+
+  void refresh_routing_keys(Node& node) const {
+    node.routing_keys.assign(
+        node.slots.size(), -std::numeric_limits<double>::infinity());
+    node.routing_children.assign(node.slots.size(), invalid_id());
+    for (std::size_t i = 0; i < node.slots.size(); ++i) {
+      if (node.slots[i].active) {
+        node.routing_keys[i] = node.slots[i].max_key;
+        node.routing_children[i] = node.slots[i].child;
+      }
+    }
+    for (const Entry& logged : node.log) {
+      for (std::size_t i = 0; i < node.slots.size(); ++i) {
+        if (node.slots[i].active &&
+            node.slots[i].child == logged.child) {
+          node.routing_keys[i] =
+              -std::numeric_limits<double>::infinity();
+          node.routing_children[i] = invalid_id();
+          break;
+        }
+      }
+    }
   }
 
   void fit_model(Node& node) const {
@@ -595,6 +704,122 @@ class HireInternalDirectory {
     return result;
   }
 
+  static Entry entry_from_leaf_summary(const LeafSummary& summary) {
+    Entry entry;
+    entry.max_key = summary.max_key;
+    entry.child = summary.leaf_id;
+    entry.active = true;
+    entry.min_key = summary.min_key;
+    entry.max_zmax = summary.max_zmax;
+    entry.xmin = summary.xmin;
+    entry.ymin = summary.ymin;
+    entry.xmax = summary.xmax;
+    entry.ymax = summary.ymax;
+    entry.spatial_valid = summary.spatial_valid;
+    return entry;
+  }
+
+  Entry entry_from_node(NodeId node_id) const {
+    Entry result;
+    result.child = node_id;
+    result.active = true;
+    const auto found = nodes_.find(node_id);
+    if (found == nodes_.end()) {
+      return result;
+    }
+    const std::vector<Entry> entries = collect_entries(found->second);
+    if (entries.empty()) {
+      return result;
+    }
+    result.max_key = entries.back().max_key;
+    result.spatial_valid = true;
+    for (const Entry& entry : entries) {
+      if (!entry.spatial_valid) {
+        result.spatial_valid = false;
+        continue;
+      }
+      result.min_key = std::min(result.min_key, entry.min_key);
+      result.max_zmax = std::max(result.max_zmax, entry.max_zmax);
+      result.xmin = std::min(result.xmin, entry.xmin);
+      result.ymin = std::min(result.ymin, entry.ymin);
+      result.xmax = std::max(result.xmax, entry.xmax);
+      result.ymax = std::max(result.ymax, entry.ymax);
+    }
+    return result;
+  }
+
+  static bool spatially_overlaps(const Entry& entry, double qmin,
+                                 double qmax, double xmin, double ymin,
+                                 double xmax, double ymax) {
+    if (!entry.spatial_valid) {
+      return true;
+    }
+    return entry.min_key <= qmax && entry.max_zmax >= qmin &&
+           !(entry.xmax < xmin || xmax < entry.xmin || entry.ymax < ymin ||
+             ymax < entry.ymin);
+  }
+
+  void collect_spatial_leaves(NodeId node_id, double qmin, double qmax,
+                              double xmin, double ymin, double xmax,
+                              double ymax, std::vector<NodeId>& leaves,
+                              SearchStats* stats) const {
+    const auto found = nodes_.find(node_id);
+    if (found == nodes_.end()) {
+      return;
+    }
+    if (stats != nullptr) {
+      ++stats->visited_nodes;
+    }
+    const Node& node = found->second;
+    if (stats != nullptr) {
+      stats->log_entries_scanned += node.log.size();
+    }
+
+    const auto visit_entry = [&](const Entry& entry) {
+      if (!spatially_overlaps(entry, qmin, qmax, xmin, ymin, xmax, ymax)) {
+        return;
+      }
+      if (node.children_are_leaves) {
+        leaves.push_back(entry.child);
+      } else {
+        collect_spatial_leaves(entry.child, qmin, qmax, xmin, ymin, xmax,
+                               ymax, leaves, stats);
+      }
+    };
+
+    // Logs are small and contain at most one entry per child. Resolve them
+    // directly over the stable slots so query traversal allocates no map or
+    // sorted materialization.
+    for (const Entry& slot : node.slots) {
+      if (!slot.active) {
+        continue;
+      }
+      const Entry* effective = &slot;
+      for (const Entry& logged : node.log) {
+        if (logged.child == slot.child) {
+          effective = &logged;
+          break;
+        }
+      }
+      if (effective->active) {
+        visit_entry(*effective);
+      }
+    }
+    for (const Entry& logged : node.log) {
+      if (!logged.active) {
+        continue;
+      }
+      const bool shadows_slot =
+          std::any_of(node.slots.begin(), node.slots.end(),
+                      [&](const Entry& slot) {
+                        return slot.active && slot.child == logged.child;
+                      });
+      if (!shadows_slot) {
+        visit_entry(logged);
+      }
+    }
+  }
+
   void collect_descendant_leaves(
       NodeId node_id, std::vector<NodeId>& leaves) const {
     const auto node_it = nodes_.find(node_id);
@@ -627,39 +852,135 @@ class HireInternalDirectory {
       stats->log_entries_scanned += node.log.size();
     }
 
-    // The current implementation uses the model to select the search mode but
-    // completes correction over one cache-sized node to preserve lower-bound
-    // correctness after arbitrary log updates.
-    const std::vector<Entry> entries = collect_entries(node);
-    if (entries.empty()) {
-      return Entry{};
+    std::size_t primary_index = invalid_id();
+    if (use_model && !node.routing_keys.empty()) {
+      long predicted = static_cast<long>(
+          std::llround(node.slope * key + node.intercept));
+      predicted = std::max<long>(
+          0, std::min<long>(predicted,
+                            static_cast<long>(node.routing_keys.size()) - 1));
+      const std::size_t radius =
+          static_cast<std::size_t>(std::ceil(node.max_model_error)) + 2;
+      const std::size_t center = static_cast<std::size_t>(predicted);
+      const std::size_t begin = center > radius ? center - radius : 0;
+      const std::size_t end =
+          std::min(node.routing_keys.size(), center + radius + 1);
+      for (std::size_t i = begin; i < end; ++i) {
+        if (node.routing_keys[i] >= key) {
+          primary_index = i;
+          break;
+        }
+      }
     }
-    auto it = std::lower_bound(
-        entries.begin(), entries.end(), key,
-        [](const Entry& entry, double value) { return entry.max_key < value; });
-    if (it == entries.end()) {
-      return entries.back();
+    if (primary_index == invalid_id()) {
+      primary_index = simd_lower_bound(node.routing_keys, key);
+      if (stats != nullptr && use_model) {
+        ++stats->fallback_searches;
+      }
     }
-    return *it;
+
+    Entry lower_bound;
+    bool has_lower_bound = false;
+    Entry last;
+    bool has_last = false;
+    const auto consider = [&](const Entry& entry) {
+      if (!entry.active) {
+        return;
+      }
+      if (!has_last || entry.max_key > last.max_key ||
+          (entry.max_key == last.max_key && entry.child > last.child)) {
+        last = entry;
+        has_last = true;
+      }
+      if (entry.max_key >= key &&
+          (!has_lower_bound || entry.max_key < lower_bound.max_key ||
+           (entry.max_key == lower_bound.max_key &&
+            entry.child < lower_bound.child))) {
+        lower_bound = entry;
+        has_lower_bound = true;
+      }
+    };
+    const auto consider_routing_slot = [&](std::size_t index) {
+      if (index >= node.routing_keys.size() ||
+          index >= node.routing_children.size() ||
+          node.routing_children[index] == invalid_id()) {
+        return;
+      }
+      Entry entry;
+      entry.max_key = node.routing_keys[index];
+      entry.child = node.routing_children[index];
+      entry.active = true;
+      consider(entry);
+    };
+    if (primary_index != invalid_id()) {
+      consider_routing_slot(primary_index);
+    }
+    for (std::size_t i = node.routing_keys.size(); i > 0; --i) {
+      if (node.routing_keys[i - 1] !=
+          -std::numeric_limits<double>::infinity()) {
+        consider_routing_slot(i - 1);
+        break;
+      }
+    }
+    for (const Entry& entry : node.log) {
+      consider(entry);
+    }
+    return has_lower_bound ? lower_bound : (has_last ? last : Entry{});
+  }
+
+  static std::size_t simd_lower_bound(const std::vector<double>& keys,
+                                      double key) {
+    std::size_t index = 0;
+#if defined(__AVX2__)
+    const __m256d query = _mm256_set1_pd(key);
+    for (; index + 4 <= keys.size(); index += 4) {
+      const __m256d values = _mm256_loadu_pd(keys.data() + index);
+      const __m256d matches =
+          _mm256_cmp_pd(values, query, _CMP_GE_OQ);
+      const int mask = _mm256_movemask_pd(matches);
+      if (mask != 0) {
+        return index + static_cast<std::size_t>(__builtin_ctz(mask));
+      }
+    }
+#endif
+    for (; index < keys.size(); ++index) {
+      if (keys[index] >= key) {
+        return index;
+      }
+    }
+    return invalid_id();
   }
 
   Entry find_entry_for_insert(const Node& node, double key) const {
-    const std::vector<Entry> entries = collect_entries(node);
-    if (entries.empty()) {
-      return Entry{};
+    Entry result = find_entry(node, key, nullptr);
+    if (!result.active || result.max_key != key) {
+      return result;
     }
-    auto it = std::lower_bound(
-        entries.begin(), entries.end(), key,
-        [](const Entry& entry, double value) { return entry.max_key < value; });
-    if (it == entries.end()) {
-      return entries.back();
-    }
-    if (it->max_key == key) {
-      while (it + 1 != entries.end() && (it + 1)->max_key == key) {
-        ++it;
+
+    // Inserts with a key equal to multiple child boundaries must select the
+    // last such child to preserve the existing right-biased split behavior.
+    const auto consider_equal = [&](const Entry& entry) {
+      if (entry.active && entry.max_key == key &&
+          entry.child > result.child) {
+        result = entry;
       }
+    };
+    for (std::size_t i = 0; i < node.routing_keys.size(); ++i) {
+      if (node.routing_keys[i] != key ||
+          i >= node.routing_children.size() ||
+          node.routing_children[i] == invalid_id()) {
+        continue;
+      }
+      Entry entry;
+      entry.max_key = key;
+      entry.child = node.routing_children[i];
+      entry.active = true;
+      consider_equal(entry);
     }
-    return *it;
+    for (const Entry& entry : node.log) {
+      consider_equal(entry);
+    }
+    return result;
   }
 
   bool primary_contains(const Node& node, NodeId child) const {
@@ -730,6 +1051,14 @@ class HireInternalDirectory {
       return false;
     }
     slot = entry;
+    if (node.routing_keys.size() != node.slots.size() ||
+        node.routing_children.size() != node.slots.size()) {
+      refresh_routing_keys(node);
+    } else {
+      node.routing_keys[static_cast<std::size_t>(predicted)] = entry.max_key;
+      node.routing_children[static_cast<std::size_t>(predicted)] =
+          entry.child;
+    }
     ++gap_insert_count_;
     return true;
   }
@@ -739,10 +1068,12 @@ class HireInternalDirectory {
     for (Entry& existing : node.log) {
       if (existing.child == entry.child) {
         existing = entry;
+        refresh_routing_keys(node);
         return;
       }
     }
     node.log.push_back(entry);
+    refresh_routing_keys(node);
     if (count_insert) {
       ++log_insert_count_;
     }
@@ -791,7 +1122,7 @@ class HireInternalDirectory {
     }
     Node& node = it->second;
     if (child_exists(node, entry.child)) {
-      update_child_key(node_id, entry.child, entry.max_key);
+      update_child_entry(node_id, entry);
       return;
     }
     if (!try_gap_insert(node, entry)) {
@@ -824,11 +1155,36 @@ class HireInternalDirectory {
     const auto current = std::find_if(
         entries.begin(), entries.end(),
         [&](const Entry& entry) { return entry.child == child; });
-    if (current == entries.end() || current->max_key == new_max_key) {
+    if (current == entries.end()) {
+      return false;
+    }
+    Entry updated = *current;
+    updated.max_key = new_max_key;
+    return update_child_entry(node_id, updated);
+  }
+
+  bool update_child_entry(NodeId node_id, const Entry& updated) {
+    auto it = nodes_.find(node_id);
+    if (it == nodes_.end()) {
+      return false;
+    }
+    const std::vector<Entry> entries = collect_entries(it->second);
+    const auto current = std::find_if(
+        entries.begin(), entries.end(),
+        [&](const Entry& entry) { return entry.child == updated.child; });
+    if (current == entries.end()) {
+      return false;
+    }
+    if (current->max_key == updated.max_key &&
+        current->min_key == updated.min_key &&
+        current->max_zmax == updated.max_zmax &&
+        current->xmin == updated.xmin && current->ymin == updated.ymin &&
+        current->xmax == updated.xmax && current->ymax == updated.ymax &&
+        current->spatial_valid == updated.spatial_valid) {
       return false;
     }
     Node& node = it->second;
-    append_or_replace_log(node, Entry{new_max_key, child, true}, false);
+    append_or_replace_log(node, updated, false);
     if (node.log.size() > log_limit()) {
       compact_log(node_id);
     }
@@ -841,7 +1197,7 @@ class HireInternalDirectory {
     if (it == nodes_.end() || it->second.parent == invalid_id()) {
       return;
     }
-    update_child_key(it->second.parent, node_id, node_max_key(node_id));
+    update_child_entry(it->second.parent, entry_from_node(node_id));
   }
 
   void split_internal(NodeId node_id) {
@@ -869,17 +1225,15 @@ class HireInternalDirectory {
 
     if (old_parent == invalid_id()) {
       const NodeId new_root = create_node(
-          {Entry{node_max_key(node_id), node_id, true},
-           Entry{node_max_key(right_id), right_id, true}},
+          {entry_from_node(node_id), entry_from_node(right_id)},
           false, invalid_id());
       root_id_ = new_root;
       nodes_.at(node_id).parent = new_root;
       nodes_.at(right_id).parent = new_root;
       return;
     }
-    update_child_key(old_parent, node_id, node_max_key(node_id));
-    insert_child(old_parent,
-                 Entry{node_max_key(right_id), right_id, true});
+    update_child_entry(old_parent, entry_from_node(node_id));
+    insert_child(old_parent, entry_from_node(right_id));
   }
 
   void remove_child(NodeId node_id, NodeId child) {
@@ -897,6 +1251,7 @@ class HireInternalDirectory {
       node.log.push_back(Entry{0.0, child, false});
       ++masked_delete_count_;
     }
+    refresh_routing_keys(node);
 
     const std::size_t count = child_count(node);
     if (node_id == root_id_) {
@@ -965,7 +1320,7 @@ class HireInternalDirectory {
       set_child_parents(left_id);
       nodes_.erase(right_id);
       ++internal_merge_count_;
-      update_child_key(parent_id, left_id, node_max_key(left_id));
+      update_child_entry(parent_id, entry_from_node(left_id));
       remove_child(parent_id, right_id);
       return;
     }
@@ -987,8 +1342,8 @@ class HireInternalDirectory {
     set_child_parents(left_id);
     set_child_parents(right_id);
     ++internal_redistribution_count_;
-    update_child_key(parent_id, left_id, node_max_key(left_id));
-    update_child_key(parent_id, right_id, node_max_key(right_id));
+    update_child_entry(parent_id, entry_from_node(left_id));
+    update_child_entry(parent_id, entry_from_node(right_id));
   }
 
   Config config_;

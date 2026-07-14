@@ -72,6 +72,7 @@ def enrich(row, path):
     out["build_ms"] = as_float(out, "build_ns") / 1e6
     out["insert_ms"] = as_float(out, "insert_ns") / 1e6
     out["delete_ms"] = as_float(out, "delete_ns") / 1e6
+    out["geos_exact_ms"] = as_float(out, "geos_exact_ns") / 1e6
     out["index_mb_estimate"] = as_float(out, "index_bytes_estimate") / (1024 * 1024)
     return out
 
@@ -131,8 +132,15 @@ def field_order(rows):
         "delta_records_scanned",
         "mbr_candidates",
         "predicate_shortcuts",
+        "envelope_shortcuts",
+        "representative_point_shortcuts",
         "predicate_shortcuts_enabled",
+        "representative_point_shortcuts_enabled",
         "exact_calls",
+        "geos_exact_ns",
+        "geos_exact_ms",
+        "avg_geos_exact_ns",
+        "geos_exact_query_fraction",
         "answers",
         "build_ms",
         "insert_ms",
