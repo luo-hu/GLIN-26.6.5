@@ -674,17 +674,17 @@ enum class RectangleShortcutKind {
 RectangleShortcutKind rectangle_query_candidate_shortcut(
     const Options& options, bool enabled,
     const geos::geom::Envelope& query_envelope,
-    const Geometry& candidate) {
+    const geos::geom::Envelope& candidate_envelope,
+    const Geometry* candidate) {
   if (!enabled || !options.predicate_shortcuts) {
     return RectangleShortcutKind::None;
   }
-  if (envelope_contains(query_envelope,
-                        *candidate.getEnvelopeInternal())) {
+  if (envelope_contains(query_envelope, candidate_envelope)) {
     return RectangleShortcutKind::EnvelopeContains;
   }
   const geos::geom::Coordinate* coordinate =
-      options.representative_point_shortcuts
-          ? candidate.getCoordinate()
+      options.representative_point_shortcuts && candidate != nullptr
+          ? candidate->getCoordinate()
           : nullptr;
   if (coordinate != nullptr && coordinate->x >= query_envelope.getMinX() &&
       coordinate->x <= query_envelope.getMaxX() &&
@@ -693,6 +693,15 @@ RectangleShortcutKind rectangle_query_candidate_shortcut(
     return RectangleShortcutKind::RepresentativePoint;
   }
   return RectangleShortcutKind::None;
+}
+
+RectangleShortcutKind rectangle_query_candidate_shortcut(
+    const Options& options, bool enabled,
+    const geos::geom::Envelope& query_envelope,
+    const Geometry& candidate) {
+  return rectangle_query_candidate_shortcut(
+      options, enabled, query_envelope, *candidate.getEnvelopeInternal(),
+      &candidate);
 }
 
 bool account_rectangle_shortcut(RectangleShortcutKind kind,
@@ -3925,7 +3934,7 @@ class LocalBoundedCompactQueryOverlay {
     if (account_rectangle_shortcut(
             rectangle_query_candidate_shortcut(
                 options_, options_.predicate_shortcuts, query_envelope,
-                *geometries_[oid]),
+                meta.envelope, geometries_[oid].get()),
             result.predicate_shortcuts, result.envelope_shortcuts,
             result.representative_point_shortcuts)) {
       result.answers.insert(oid);
@@ -4411,11 +4420,12 @@ class LocalBoundedCompactQueryOverlay {
       if (oid >= live_.size() || !live_[oid]) {
         return;
       }
+      const GeometryMeta& meta = metadata_[oid];
       ++result.mbr_candidates;
       if (account_rectangle_shortcut(
               rectangle_query_candidate_shortcut(
                   options_, enable_shortcuts, query_envelope,
-                  *geometries_[oid]),
+                  meta.envelope, geometries_[oid].get()),
               result.predicate_shortcuts, result.envelope_shortcuts,
               result.representative_point_shortcuts)) {
         result.answers.insert(oid);
