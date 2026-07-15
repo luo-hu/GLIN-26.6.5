@@ -24,6 +24,7 @@ INDEX_ORDER = [
     "DELI_ALEX_HYBRID_SINGLE_STORE",
     "DELI_ALEX_HYBRID_SINGLE_STORE_COST",
     "DELI_ADAPTIVE_PRL_FUSION",
+    "DELI_FUSION_GUARD_ONLY",
     "RLR_LITE_CS",
     "RLR_LITE_CS_SPLIT",
     "HIRE_SFC_LITE",
@@ -43,6 +44,7 @@ COLORS = {
     "DELI_ALEX_HYBRID_SINGLE_STORE": "#008B8B",
     "DELI_ALEX_HYBRID_SINGLE_STORE_COST": "#111111",
     "DELI_ADAPTIVE_PRL_FUSION": "#D62728",
+    "DELI_FUSION_GUARD_ONLY": "#6B6B6B",
     "RLR_LITE_CS": "#9467BD",
     "RLR_LITE_CS_SPLIT": "#FF7F0E",
     "HIRE_SFC_LITE": "#2CA02C",
@@ -62,6 +64,7 @@ LABELS = {
     "DELI_ALEX_HYBRID_SINGLE_STORE": "DELI-SingleStore",
     "DELI_ALEX_HYBRID_SINGLE_STORE_COST": "DELI-SingleStore-Cost",
     "DELI_ADAPTIVE_PRL_FUSION": "DELI-Fusion",
+    "DELI_FUSION_GUARD_ONLY": "DELI-Fusion Guard-only",
     "RLR_LITE_CS": "RLR-Lite-CS",
     "RLR_LITE_CS_SPLIT": "RLR-Lite-CS-Split",
     "HIRE_SFC_LITE": "HIRE-SFC-Lite",
@@ -74,18 +77,33 @@ MARKERS = {
     "DELI_ALEX_HYBRID_SINGLE_STORE": "D",
     "DELI_ALEX_HYBRID_SINGLE_STORE_COST": "X",
     "DELI_ADAPTIVE_PRL_FUSION": "h",
+    "DELI_FUSION_GUARD_ONLY": "s",
     "RLR_LITE_CS": "P",
     "RLR_LITE_CS_SPLIT": "*",
     "HIRE_SFC_LITE": "v",
     "HIRE_SFC_FULL": "d",
 }
 
+FUSION_ROUTE_SUFFIXES = {
+    "_ROUTE_ADAPTIVE": ("Adaptive", "#D62728", "h"),
+    "_ROUTE_SFC": ("Force SFC", "#E69F00", "^"),
+    "_ROUTE_GUARD": ("Force Guard", "#009E73", "v"),
+}
+
+
+def split_fusion_route_suffix(index):
+    for suffix, style in FUSION_ROUTE_SUFFIXES.items():
+        if index.endswith(suffix):
+            return index[:-len(suffix)], style
+    return index, None
+
 
 def canonical_index(index):
     if index.endswith("_NOPRL"):
-        return index[:-6]
-    if index.endswith("_PRL"):
-        return index[:-4]
+        index = index[:-6]
+    elif index.endswith("_PRL"):
+        index = index[:-4]
+    index, _ = split_fusion_route_suffix(index)
     return index
 
 
@@ -102,6 +120,14 @@ def index_order_value(index):
 def label_for_index(index):
     base = canonical_index(index)
     label = LABELS.get(base, base)
+    route_index = index
+    if route_index.endswith("_NOPRL"):
+        route_index = route_index[:-6]
+    elif route_index.endswith("_PRL"):
+        route_index = route_index[:-4]
+    _, route_style = split_fusion_route_suffix(route_index)
+    if route_style:
+        label = f"{label} {route_style[0]}"
     if index.endswith("_NOPRL"):
         return f"{label} noPRL"
     if index.endswith("_PRL"):
@@ -121,7 +147,14 @@ def blend_rgb(rgb, target, amount):
 
 
 def color_for_index(index):
-    base = hex_to_rgb(COLORS.get(canonical_index(index)))
+    route_index = index
+    if route_index.endswith("_NOPRL"):
+        route_index = route_index[:-6]
+    elif route_index.endswith("_PRL"):
+        route_index = route_index[:-4]
+    _, route_style = split_fusion_route_suffix(route_index)
+    color = route_style[1] if route_style else COLORS.get(canonical_index(index))
+    base = hex_to_rgb(color)
     if index.endswith("_NOPRL"):
         return blend_rgb(base, (1.0, 1.0, 1.0), 0.48)
     if index.endswith("_PRL"):
@@ -136,6 +169,14 @@ def linestyle_for_index(index):
 
 
 def marker_for_index(index):
+    route_index = index
+    if route_index.endswith("_NOPRL"):
+        route_index = route_index[:-6]
+    elif route_index.endswith("_PRL"):
+        route_index = route_index[:-4]
+    _, route_style = split_fusion_route_suffix(route_index)
+    if route_style:
+        return route_style[2]
     base_marker = MARKERS.get(canonical_index(index))
     if base_marker:
         return base_marker

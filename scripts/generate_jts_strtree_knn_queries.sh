@@ -15,6 +15,7 @@ Example:
     42
 
 This writes:
+  OUTPUT_PREFIX_5pct.csv
   OUTPUT_PREFIX_1pct.csv
   OUTPUT_PREFIX_0p1pct.csv
   OUTPUT_PREFIX_0p01pct.csv
@@ -29,9 +30,12 @@ LIMIT=$3
 QUERY_COUNT=${4:-100}
 SEED=${5:-42}
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+if [[ "$DATA_FILE" != /* ]]; then
+  DATA_FILE="$(realpath "$DATA_FILE")"
+fi
 GENERATOR_DIR="$REPO_ROOT/java/jts-query-generator"
 JTS_JAVA_HEAP="${JTS_JAVA_HEAP:-12g}"
-QUERY_SELECTIVITIES="${QUERY_SELECTIVITIES:-1%,0.1%,0.01%,0.001%}"
+QUERY_SELECTIVITIES="${QUERY_SELECTIVITIES:-5%,1%,0.1%,0.01%,0.001%}"
 
 if ! command -v java >/dev/null 2>&1; then
   echo "Error: java is not installed. Run: sudo apt install -y openjdk-17-jdk maven" >&2

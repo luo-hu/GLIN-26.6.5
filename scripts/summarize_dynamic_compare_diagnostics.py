@@ -14,6 +14,26 @@ SELECTIVITY_TAGS = {
     "1pct": "1%",
 }
 
+SELECTIVITY_TAG_PATTERN = re.compile(r"_(\d+(?:p\d+)?pct)_")
+
+FUSION_MEMORY_FIELDS = [
+    "fusion_live_bitmap_bytes",
+    "fusion_delta_bitmap_bytes",
+    "fusion_object_locator_bytes",
+    "fusion_directory_bytes",
+    "fusion_block_header_bytes",
+    "fusion_compact_id_bytes",
+    "fusion_block_delta_id_bytes",
+    "fusion_predicate_plan_bytes",
+    "fusion_local_guard_bytes_estimate",
+    "fusion_base_guard_bytes_estimate",
+    "fusion_delta_guard_bytes_estimate",
+    "fusion_global_delta_log_bytes",
+    "fusion_rebuild_queue_bytes",
+    "fusion_shared_metadata_bytes",
+    "fusion_shared_geometry_handle_bytes",
+]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="汇总统一动态对比实验。")
@@ -30,12 +50,15 @@ def split_names(value):
 
 
 def selectivity_from_name(path):
-    match = re.search(r"_(0p001pct|0p01pct|0p1pct|1pct)_", path.name)
-    return SELECTIVITY_TAGS.get(match.group(1), "") if match else ""
+    match = SELECTIVITY_TAG_PATTERN.search(path.name)
+    if not match:
+        return ""
+    tag = match.group(1)
+    return SELECTIVITY_TAGS.get(tag, f"{tag[:-3].replace('p', '.')}%")
 
 
 def selectivity_tag_from_name(path):
-    match = re.search(r"_(0p001pct|0p01pct|0p1pct|1pct)_", path.name)
+    match = SELECTIVITY_TAG_PATTERN.search(path.name)
     return match.group(1) if match else ""
 
 
@@ -74,6 +97,9 @@ def enrich(row, path):
     out["delete_ms"] = as_float(out, "delete_ns") / 1e6
     out["geos_exact_ms"] = as_float(out, "geos_exact_ns") / 1e6
     out["index_mb_estimate"] = as_float(out, "index_bytes_estimate") / (1024 * 1024)
+    for field in FUSION_MEMORY_FIELDS:
+        if field in out:
+            out[field.replace("_bytes", "_mb")] = as_float(out, field) / (1024 * 1024)
     return out
 
 
@@ -88,6 +114,26 @@ def disambiguate_predicate_modes(rows):
             row["index"] = f"{row.get('index', '')}_NOPRL"
         elif mode == "1":
             row["index"] = f"{row.get('index', '')}_PRL"
+
+
+def disambiguate_fusion_route_modes(rows):
+    fusion_rows = [
+        row for row in rows
+        if row.get("index") == "DELI_ADAPTIVE_PRL_FUSION"
+    ]
+    modes = {row.get("fusion_route_mode", "") for row in fusion_rows}
+    modes.discard("")
+    if len(modes) <= 1:
+        return
+    suffixes = {
+        "adaptive": "ROUTE_ADAPTIVE",
+        "force_sfc": "ROUTE_SFC",
+        "force_guard": "ROUTE_GUARD",
+    }
+    for row in fusion_rows:
+        suffix = suffixes.get(row.get("fusion_route_mode", ""))
+        if suffix:
+            row["index"] = f"{row['index']}_{suffix}"
 
 
 def field_order(rows):
@@ -122,6 +168,25 @@ def field_order(rows):
         "p99_delete_ms",
         "p999_delete_ms",
         "index_mb_estimate",
+        "fusion_route_mode",
+        "fusion_update_mode",
+        "fusion_active_route_guard",
+        "fusion_route_switch_count",
+        "fusion_sfc_query_count",
+        "fusion_guard_query_count",
+        "fusion_sfc_route_fraction",
+        "fusion_guard_probe_count",
+        "fusion_sfc_query_ns",
+        "fusion_guard_query_ns",
+        "fusion_guard_probe_ns",
+        "fusion_sfc_query_candidates",
+        "fusion_guard_query_candidates",
+        "fusion_guard_probe_candidates",
+        "fusion_sfc_query_exact_calls",
+        "fusion_guard_query_exact_calls",
+        "fusion_guard_probe_exact_calls",
+        "fusion_light_update_insert_count",
+        "fusion_light_update_delete_count",
         "answers_match_boost",
         "missing_count",
         "extra_count",
@@ -191,6 +256,7 @@ def main():
                 if row.get("dataset", "") in excluded:
                     continue
                 rows.append(enrich(row, path))
+    disambiguate_fusion_route_modes(rows)
     disambiguate_predicate_modes(rows)
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)

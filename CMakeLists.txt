@@ -82,6 +82,14 @@ target_include_directories(test_hire_sfc_stage7_acceptance PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/benchmark)
 target_link_libraries(test_hire_sfc_stage7_acceptance PRIVATE Threads::Threads)
 
+add_executable(test_rectangle_predicate_shortcut
+    test/rectangle_predicate_shortcut_test.cpp)
+target_include_directories(test_rectangle_predicate_shortcut PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/benchmark
+    ${GLIN_DEP_INCLUDE_DIRS})
+target_link_libraries(test_rectangle_predicate_shortcut PRIVATE
+    ${GEOS_LIBRARY})
+
 add_executable(bench_glin_wkt src/benchmark/bench_glin_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_link_libraries(bench_glin_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
 target_include_directories(bench_glin_wkt PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
@@ -154,6 +162,7 @@ add_test(NAME test_hire_sfc_stage4_rcu COMMAND test_hire_sfc_stage4_rcu)
 add_test(NAME test_hire_sfc_stage5_transform COMMAND test_hire_sfc_stage5_transform)
 add_test(NAME test_hire_sfc_stage6_bulk COMMAND test_hire_sfc_stage6_bulk)
 add_test(NAME test_hire_sfc_stage7_acceptance COMMAND test_hire_sfc_stage7_acceptance)
+add_test(NAME test_rectangle_predicate_shortcut COMMAND test_rectangle_predicate_shortcut)
 
 if(UNIX AND NOT APPLE)
   set(GLIN_TEST_LIBRARY_PATHS /usr/lib/x86_64-linux-gnu)
@@ -165,9 +174,9 @@ if(UNIX AND NOT APPLE)
   if(DEFINED ENV{LD_LIBRARY_PATH})
     list(APPEND GLIN_TEST_LIBRARY_PATHS "$ENV{LD_LIBRARY_PATH}")
   endif()
-  set_target_properties(test_glin test_glin_piece test_hire_internal_directory test_hire_sfc_stage2 test_hire_sfc_stage3_cost test_hire_sfc_stage4_rcu test_hire_sfc_stage5_transform test_hire_sfc_stage6_bulk test_hire_sfc_stage7_acceptance bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries generate_synthetic_points convert_binary_points_to_wkt generate_synthetic_rectangles bench_boost_rtree_wkt bench_geos_quadtree_wkt bench_interval_overlap_wkt bench_dynamic_extent_wkt bench_dynamic_compare_wkt bench_index_size_wkt export_zrange_cdf_wkt bench_update_wkt bench_update_wkt_piece bench_hybrid_wkt_piece
+  set_target_properties(test_glin test_glin_piece test_hire_internal_directory test_hire_sfc_stage2 test_hire_sfc_stage3_cost test_hire_sfc_stage4_rcu test_hire_sfc_stage5_transform test_hire_sfc_stage6_bulk test_hire_sfc_stage7_acceptance test_rectangle_predicate_shortcut bench_glin_wkt bench_glin_wkt_piece generate_wkt_queries generate_synthetic_points convert_binary_points_to_wkt generate_synthetic_rectangles bench_boost_rtree_wkt bench_geos_quadtree_wkt bench_interval_overlap_wkt bench_dynamic_extent_wkt bench_dynamic_compare_wkt bench_index_size_wkt export_zrange_cdf_wkt bench_update_wkt bench_update_wkt_piece bench_hybrid_wkt_piece
     PROPERTIES BUILD_RPATH "${GLIN_TEST_LIBRARY_PATHS}")
   list(JOIN GLIN_TEST_LIBRARY_PATHS ":" GLIN_TEST_LIBRARY_PATH)
-  set_tests_properties(test_glin test_glin_piece test_hire_internal_directory test_hire_sfc_stage2 test_hire_sfc_stage3_cost test_hire_sfc_stage4_rcu test_hire_sfc_stage5_transform test_hire_sfc_stage6_bulk test_hire_sfc_stage7_acceptance
+  set_tests_properties(test_glin test_glin_piece test_hire_internal_directory test_hire_sfc_stage2 test_hire_sfc_stage3_cost test_hire_sfc_stage4_rcu test_hire_sfc_stage5_transform test_hire_sfc_stage6_bulk test_hire_sfc_stage7_acceptance test_rectangle_predicate_shortcut
     PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${GLIN_TEST_LIBRARY_PATH}")
 endif()

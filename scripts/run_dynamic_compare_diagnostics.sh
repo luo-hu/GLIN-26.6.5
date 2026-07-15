@@ -28,6 +28,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   DELI-ALEX-Hybrid-SingleStore
   DELI-ALEX-Hybrid-SingleStore-Cost
   DELI_ADAPTIVE_PRL_FUSION
+  DELI_FUSION_GUARD_ONLY
   RLR_LITE_CS
   RLR_LITE_CS_SPLIT
   HIRE_SFC_LITE
@@ -236,6 +237,20 @@ DELI-Cost 的 PRL-aware DP 划分参数：
     例子：PREDICATE_SHORTCUTS_LIST="0 1"
     runner 会生成 *_prl0_dynamic_compare.csv 和 *_prl1_dynamic_compare.csv，
     summary/plot 会把 index 标成 noPRL / +PRL，方便做 PRL on/off 消融。
+
+  FUSION_ROUTE_MODE
+    DELI-Fusion 查询路由消融模式。默认 adaptive。
+    可选 adaptive、force_sfc、force_guard。
+
+  FUSION_UPDATE_MODE
+    DELI-Fusion 更新维护模式。默认 coupled，保持历史行为：query route 进入 guard 后，
+    update 也转为轻量分支。严格查询路由消融必须把三组实验统一设为 light 或 full，确保
+    只改变查询选路。debug CSV 会报告实际路径、probe 开销和轻量更新次数。
+
+  DELI_FUSION_GUARD_ONLY
+    真正的纯 Guard 结构消融。它只构建 bulk-loaded Base R-tree、mutable Delta
+    R-tree 和 live bitmap，并复用相同 PRL/GEOS refinement；不构建或维护 SFC
+    blocks、directory、compact IDs、object-to-block 或 per-block delta。
 
   INDEXES
     只跑指定索引，避免每次都把所有方法重建一遍。默认 all。
@@ -506,6 +521,8 @@ COST_PARTITION_QUERY_SAMPLE="${COST_PARTITION_QUERY_SAMPLE:-128}"
 PREDICATE_SHORTCUTS="${PREDICATE_SHORTCUTS:-1}"
 PREDICATE_SHORTCUTS_LIST="${PREDICATE_SHORTCUTS_LIST:-$PREDICATE_SHORTCUTS}"
 REPRESENTATIVE_POINT_SHORTCUTS="${REPRESENTATIVE_POINT_SHORTCUTS:-1}"
+FUSION_ROUTE_MODE="${FUSION_ROUTE_MODE:-adaptive}"
+FUSION_UPDATE_MODE="${FUSION_UPDATE_MODE:-coupled}"
 LAZY_ALEX_DELETE="${LAZY_ALEX_DELETE:-1}"
 DEFER_DELETE_SUMMARY_REFRESH="${DEFER_DELETE_SUMMARY_REFRESH:-1}"
 PIECE_LIMIT="${PIECE_LIMIT:-10000}"
@@ -570,6 +587,8 @@ if [[ "$SHOW_CONFIG" == "1" ]]; then
     PREDICATE_SHORTCUTS=$PREDICATE_SHORTCUTS
     PREDICATE_SHORTCUTS_LIST=$PREDICATE_SHORTCUTS_LIST
     REPRESENTATIVE_POINT_SHORTCUTS=$REPRESENTATIVE_POINT_SHORTCUTS
+    FUSION_ROUTE_MODE=$FUSION_ROUTE_MODE
+    FUSION_UPDATE_MODE=$FUSION_UPDATE_MODE
     LAZY_ALEX_DELETE=$LAZY_ALEX_DELETE
       1 表示 DELI-LB/Cost 删除只更新 overlay tombstone，跳过冗余 ALEX erase。
     DEFER_DELETE_SUMMARY_REFRESH=$DEFER_DELETE_SUMMARY_REFRESH
@@ -711,9 +730,10 @@ selectivity_for_tag() {
 }
 
 query_selectivities_for_tags() {
+  local tags="${1:-$SELECTIVITY_TAGS}"
   local result=""
   local tag
-  for tag in $SELECTIVITY_TAGS; do
+  for tag in $tags; do
     if [[ -n "$result" ]]; then
       result+=","
     fi
@@ -768,9 +788,11 @@ generate_queries_if_needed() {
   local data_file="$2"
   local needs_generation="$REGENERATE_QUERIES"
   local reason=""
+  local tags_to_generate=""
 
   if [[ "$REGENERATE_QUERIES" == "1" ]]; then
     reason="REGENERATE_QUERIES=1"
+    tags_to_generate="$SELECTIVITY_TAGS"
   fi
 
   for tag in $SELECTIVITY_TAGS; do
@@ -779,6 +801,23 @@ generate_queries_if_needed() {
     if [[ ! -s "$query_file" ]]; then
       needs_generation=1
       reason="missing query file: $query_file"
+      if [[ " $tags_to_generate " != *" $tag "* ]]; then
+        tags_to_generate+=" $tag"
+      fi
+      continue
+    fi
+    local validation_error=""
+    if ! validation_error="$(
+      scripts/validate_jts_query_file.py \
+        --query_file "$query_file" \
+        --expected_tag "$tag" \
+        --expected_count "$QUERY_COUNT" 2>&1
+    )"; then
+      needs_generation=1
+      reason="$validation_error"
+      if [[ " $tags_to_generate " != *" $tag "* ]]; then
+        tags_to_generate+=" $tag"
+      fi
     fi
   done
 
@@ -797,13 +836,25 @@ generate_queries_if_needed() {
     echo "Generating queries for $dataset: $reason"
   fi
   mkdir -p "$QUERY_ROOT"
-  QUERY_SELECTIVITIES="$(query_selectivities_for_tags)" \
+  QUERY_SELECTIVITIES="$(query_selectivities_for_tags "$tags_to_generate")" \
     scripts/generate_jts_strtree_knn_queries.sh \
     "$(realpath "$data_file")" \
     "$QUERY_ROOT/${dataset}_jts_strtree_knn" \
     "$QUERY_LIMIT" \
     "$QUERY_COUNT" \
     "$SEED"
+
+  for tag in $SELECTIVITY_TAGS; do
+    local query_file
+    query_file="$(query_file_for_dataset "$dataset" "$tag")"
+    if ! scripts/validate_jts_query_file.py \
+        --query_file "$query_file" \
+        --expected_tag "$tag" \
+        --expected_count "$QUERY_COUNT"; then
+      echo "Error: query generation did not produce a valid $tag file for $dataset." >&2
+      exit 1
+    fi
+  done
 }
 
 if [[ "$RUN_BENCHMARKS" == "1" ]]; then
@@ -859,9 +910,13 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
         if [[ "$prl_mode_count" -gt 1 ]]; then
           raw_suffix_for_prl="${raw_suffix%dynamic_compare}prl${predicate_shortcuts_value}_dynamic_compare"
         fi
-        raw_csv="$RESULT_DIR/${dataset}_${tag}_${raw_suffix_for_prl}.csv"
+        raw_suffix_for_route="$raw_suffix_for_prl"
+        if [[ "$FUSION_ROUTE_MODE" != "adaptive" ]]; then
+          raw_suffix_for_route="${raw_suffix_for_prl%dynamic_compare}fusion_${FUSION_ROUTE_MODE}_dynamic_compare"
+        fi
+        raw_csv="$RESULT_DIR/${dataset}_${tag}_${raw_suffix_for_route}.csv"
         if should_run_file "$raw_csv"; then
-          echo "Running dynamic compare dataset=$dataset selectivity=$tag workload=$WORKLOAD_MODE profile=$profile predicate_shortcuts=$predicate_shortcuts_value"
+          echo "Running dynamic compare dataset=$dataset selectivity=$tag workload=$WORKLOAD_MODE profile=$profile predicate_shortcuts=$predicate_shortcuts_value fusion_route=$FUSION_ROUTE_MODE"
           benchmark_prefix=()
           if command -v stdbuf >/dev/null 2>&1; then
             benchmark_prefix=(stdbuf -oL -eL)
@@ -910,6 +965,8 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --cost_partition_query_sample "$COST_PARTITION_QUERY_SAMPLE" \
           --predicate_shortcuts "$predicate_shortcuts_value" \
           --representative_point_shortcuts "$REPRESENTATIVE_POINT_SHORTCUTS" \
+          --fusion_route_mode "$FUSION_ROUTE_MODE" \
+          --fusion_update_mode "$FUSION_UPDATE_MODE" \
           --lazy_alex_delete "$LAZY_ALEX_DELETE" \
           --defer_delete_summary_refresh "$DEFER_DELETE_SUMMARY_REFRESH" \
           --piece_limit "$PIECE_LIMIT" \
