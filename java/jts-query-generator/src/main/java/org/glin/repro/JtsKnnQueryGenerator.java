@@ -336,18 +336,10 @@ public final class JtsKnnQueryGenerator {
   }
 
   private static String selectivityTag(double selectivity) {
-    if (selectivity >= 0.01) {
-      return "1pct";
-    }
-    if (selectivity >= 0.001) {
-      return "0p1pct";
-    }
-    if (selectivity >= 0.0001) {
-      return "0p01pct";
-    }
-    if (selectivity >= 0.00001) {
-      return "0p001pct";
-    }
-    return Double.toString(selectivity).replace('.', 'p').replace('-', 'm');
+    String percent = java.math.BigDecimal.valueOf(selectivity)
+        .movePointRight(2)
+        .stripTrailingZeros()
+        .toPlainString();
+    return percent.replace('.', 'p').replace('-', 'm') + "pct";
   }
 }
