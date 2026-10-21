@@ -1,4 +1,4 @@
-// Characterize the benchmark's valid WKT prefix without constructing an index.
+// Characterize a valid WKT prefix or full source without constructing an index.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -70,12 +70,37 @@ std::vector<std::uint64_t> interval_overlaps(const std::vector<Interval>& interv
   return counts;
 }
 
+std::uint64_t overlap_pairs(const std::vector<Interval>& intervals) {
+  std::vector<double> starts, ends;
+  starts.reserve(intervals.size());
+  ends.reserve(intervals.size());
+  for (const auto& interval : intervals) {
+    if (!std::isfinite(interval.first) || !std::isfinite(interval.second) ||
+        interval.first > interval.second) throw std::runtime_error("Invalid interval");
+    starts.push_back(interval.first);
+    ends.push_back(interval.second);
+  }
+  std::sort(starts.begin(), starts.end());
+  std::sort(ends.begin(), ends.end());
+  std::size_t expired = 0;
+  std::uint64_t pairs = 0;
+  for (std::size_t entered = 0; entered < starts.size(); ++entered) {
+    while (expired < ends.size() && ends[expired] < starts[entered]) ++expired;
+    pairs += entered - expired;
+  }
+  return pairs;
+}
+
 void self_test() {
   for (const std::vector<Interval>& intervals : {
            std::vector<Interval>{}, {{0, 1}}, {{0, 1}, {1, 2}},
            {{0, 10}, {1, 2}, {3, 4}, {20, 30}}, {{2, 2}, {2, 2}, {1, 3}},
            {{0, 1}, {0, 1}, {0, 0}, {1, 1}, {1.5, 2}}}) {
     const auto counts = interval_overlaps(intervals);
+    if (overlap_pairs(intervals) * 2 !=
+        std::accumulate(counts.begin(), counts.end(), std::uint64_t{0})) {
+      throw std::runtime_error("Overlap pair-count self-test failed");
+    }
     for (std::size_t i = 0; i < intervals.size(); ++i) {
       std::uint64_t expected = 0;
       for (std::size_t j = 0; j < intervals.size(); ++j) {
@@ -111,8 +136,13 @@ int main(int argc, char** argv) {
     }
     std::string input_path, output_path, dataset;
     std::size_t limit = 500000;
+    bool full_dataset = false;
     for (int i = 1; i < argc; ++i) {
       const std::string key = argv[i];
+      if (key == "--full-dataset") {
+        full_dataset = true;
+        continue;
+      }
       if (i + 1 == argc) throw std::runtime_error("Missing option value");
       const std::string value = argv[++i];
       if (key == "--data_file") input_path = value;
@@ -121,8 +151,9 @@ int main(int argc, char** argv) {
       else if (key == "--limit") limit = std::stoull(value);
       else throw std::runtime_error("Unknown option: " + key);
     }
-    if (input_path.empty() || output_path.empty() || dataset.empty() || limit == 0) {
-      throw std::runtime_error("Require --data_file, --output_csv, --dataset_name and a positive limit");
+    if (input_path.empty() || output_path.empty() || dataset.empty() ||
+        (!full_dataset && limit == 0)) {
+      throw std::runtime_error("Require --data_file, --output_csv, --dataset_name and a positive limit unless --full-dataset is used");
     }
     std::ifstream input(input_path);
     if (!input) throw std::runtime_error("Cannot open " + input_path);
@@ -131,13 +162,13 @@ int main(int argc, char** argv) {
     Encoder<double> encoder(-180.0, 0.0000005, -90.0, 0.0000005);
     geos::geom::Envelope bounds;
     std::vector<Interval> intervals;
-    intervals.reserve(limit);
+    if (!full_dataset) intervals.reserve(limit);
     std::map<std::string, std::size_t> types;
     std::size_t lines = 0, errors = 0, empty = 0;
     std::uint64_t vertices = 0;
     long double area_sum = 0, span_sum = 0;
     std::string line;
-    while (intervals.size() < limit && std::getline(input, line)) {
+    while ((full_dataset || intervals.size() < limit) && std::getline(input, line)) {
       ++lines;
       const auto wkt = extract_wkt(line);
       if (wkt.empty()) continue;
@@ -172,7 +203,10 @@ int main(int argc, char** argv) {
         std::cerr << dataset << ": " << intervals.size() << " objects\n";
       }
     }
-    if (intervals.size() != limit) throw std::runtime_error("Dataset shorter than requested valid prefix");
+    if (!full_dataset && intervals.size() != limit) {
+      throw std::runtime_error("Dataset shorter than requested valid prefix");
+    }
+    if (intervals.size() < 2) throw std::runtime_error("Need at least two valid nonempty objects");
     const double zlo = std::min_element(intervals.begin(), intervals.end(),
         [](const Interval& a, const Interval& b) { return a.first < b.first; })->first;
     const double zhi = std::max_element(intervals.begin(), intervals.end(),
@@ -180,9 +214,16 @@ int main(int argc, char** argv) {
     const long double domain_area = static_cast<long double>(bounds.getWidth()) * bounds.getHeight();
     const long double domain_span = static_cast<long double>(zhi) - zlo;
     if (domain_area <= 0 || domain_span <= 0) throw std::runtime_error("Degenerate prefix domain");
-    auto overlaps = interval_overlaps(intervals);
-    const auto overlap_sum = std::accumulate(overlaps.begin(), overlaps.end(), std::uint64_t{0});
-    std::sort(overlaps.begin(), overlaps.end());
+    std::uint64_t overlap_sum = 0;
+    std::uint64_t p95_overlap = 0;
+    if (full_dataset) {
+      overlap_sum = overlap_pairs(intervals) * 2;
+    } else {
+      auto overlaps = interval_overlaps(intervals);
+      overlap_sum = std::accumulate(overlaps.begin(), overlaps.end(), std::uint64_t{0});
+      std::sort(overlaps.begin(), overlaps.end());
+      p95_overlap = overlaps[static_cast<std::size_t>(std::ceil(0.95 * overlaps.size())) - 1];
+    }
     std::ofstream output(output_path);
     if (!output) throw std::runtime_error("Cannot open " + output_path);
     output << "dataset,data_file,loaded_count,lines_seen,parse_errors,empty_geometries,geometry_types,"
@@ -202,8 +243,9 @@ int main(int argc, char** argv) {
     const long double n = intervals.size();
     output << std::setprecision(17) << ',' << vertices << ',' << vertices / n << ','
            << area_sum / n / domain_area << ',' << span_sum / n / domain_span << ','
-           << overlap_sum / n << ',' << overlaps[static_cast<std::size_t>(std::ceil(0.95 * n)) - 1]
-           << ',' << (n > 1 ? overlap_sum / n / (n - 1) : 0) << ','
+           << overlap_sum / n << ',';
+    if (!full_dataset) output << p95_overlap;
+    output << ',' << overlap_sum / n / (n - 1) << ','
            << bounds.getMinX() << ',' << bounds.getMinY() << ',' << bounds.getMaxX() << ','
            << bounds.getMaxY() << ',' << zlo << ',' << zhi << ",-180,-90,0.0000005\n";
     if (!output) throw std::runtime_error("Failed writing statistics");

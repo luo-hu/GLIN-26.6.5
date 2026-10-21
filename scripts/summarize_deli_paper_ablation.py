@@ -93,9 +93,10 @@ def write_figure(aggregates, variants, out, stem="deli_paper_ablation_ratios"):
     fig, axes = plt.subplots(2, 2, figsize=(7.0, 4.0))
     for axis, metric, title in zip(axes.flat, metrics, titles):
         values = [aggregates[(variant, metric)] for variant in compared]
-        if any(value is None for value in values):
-            raise ValueError("Required latency/build ratio is missing")
         for position, (variant, value) in enumerate(zip(compared, values)):
+            if value is None:
+                axis.text(position, 1.02, "n/a", ha="center", va="bottom", fontsize=7)
+                continue
             _, color, hatch = style[variant]
             axis.bar(position, value, color=color, hatch=hatch, edgecolor="#303030",
                      linewidth=0.4, width=0.65)
@@ -104,7 +105,8 @@ def write_figure(aggregates, variants, out, stem="deli_paper_ablation_ratios"):
         axis.set_xticklabels([style[v][0] for v in compared], fontsize=7)
         axis.set_ylabel("Ratio to paired reference", fontsize=8)
         axis.set_title(title, fontsize=9)
-        axis.set_ylim(0, max(1.15, max(values) * 1.15))
+        axis.set_ylim(0, max(1.15, max((value for value in values if value is not None),
+                                       default=1) * 1.15))
         axis.tick_params(axis="y", labelsize=7)
         axis.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()

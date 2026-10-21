@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -131,6 +132,13 @@ struct Options {
   std::string data_file;
   std::string dataset_name = "WKT";
   std::string query_file;
+  std::string partition_training_query_file;
+  std::string cost_probe_output_csv;
+  std::string cost_probe_query_set = "train";
+  std::string update_query_repair_output_csv;
+  std::string update_query_repair_kind;
+  std::size_t update_query_repair_probe_repetitions = 3;
+  bool update_query_repair_rebuilt_first = false;
   std::string output_csv;
   std::string workload_mode = "staged";
   std::string mixed_profile = "custom";
@@ -138,6 +146,7 @@ struct Options {
   std::string indexes = "all";
   std::size_t limit = 10000;
   std::size_t query_count = 100;
+  std::size_t partition_training_query_count = 0;
   double initial_fraction = 0.5;
   double insert_fraction = 0.2;
   double delete_fraction = 0.1;
@@ -168,6 +177,7 @@ struct Options {
   std::size_t cost_partition_max_block_size = 0;
   std::size_t cost_partition_step = 0;
   std::size_t cost_partition_query_sample = 128;
+  std::size_t cost_probe_repetitions = 3;
   bool predicate_shortcuts = true;
   bool representative_point_shortcuts = true;
   FusionRouteMode fusion_route_mode = FusionRouteMode::Adaptive;
@@ -182,6 +192,7 @@ struct Options {
   std::size_t validate_every = 0;
   bool check_correctness = true;
   std::size_t correctness_every_n = 1;
+  std::size_t correctness_query_count = 0;
   bool stop_on_mismatch = true;
 };
 
@@ -198,6 +209,15 @@ struct QueryCase {
   double xmax = 0.0;
   double ymax = 0.0;
   Geometry* geometry = nullptr;
+};
+
+struct CostProbeMeasurement {
+  long long block_check_cpu_ns = 0;
+  std::size_t block_checks = 0;
+  std::size_t matched_blocks = 0;
+  long long record_scan_cpu_ns = 0;
+  std::size_t records_scanned = 0;
+  std::size_t mbr_candidates = 0;
 };
 
 struct DynamicBlock;
@@ -324,6 +344,15 @@ void print_usage(const char* program) {
       << "  --dataset_name NAME              Dataset label (default: WKT)\n"
       << "  --limit N                        Valid geometries to load (default: 10000)\n"
       << "  --query_file PATH                Query CSV file\n"
+      << "  --partition_training_query_file PATH  Separate Cost partition calibration CSV\n"
+      << "  --partition_training_query_count N  Training CSV prefix; 0 uses --query_count\n"
+      << "  --cost_probe_output_csv PATH     Run isolated DELI CPU probe and exit\n"
+      << "  --cost_probe_repetitions N       Probe batch repetitions (default: 3)\n"
+      << "  --cost_probe_query_set train|eval  Probe training or held-out queries (default: train)\n"
+      << "  --update_query_repair_output_csv PATH  Write online/rebuilt DELI checkpoint probes and exit\n"
+      << "  --update_query_repair_kind insert|delete|replace  Update trajectory for checkpoint probes\n"
+      << "  --update_query_repair_probe_repetitions N  Timed passes over fixed probes (default: 3)\n"
+      << "  --update_query_repair_rebuilt_first 0|1  Reverse probe order (default: 0)\n"
       << "  --query_count N                  Max queries to run (default: 100)\n"
       << "  --workload_mode staged|mixed     Staged checkpoints or interleaved mixed workload (default: staged)\n"
       << "  --mixed_profile NAME             Mixed workload label in output CSV (default: custom)\n"
@@ -373,6 +402,7 @@ void print_usage(const char* program) {
       << "  --validate_every N               Validate every N updates; 0 disables (default: 0)\n"
       << "  --check_correctness 0|1          Compare each checkpoint with rebuilt Boost R-tree (default: 1)\n"
       << "  --correctness_every_n N          Check every N-th checkpoint; 0 disables oracle checks (default: 1)\n"
+      << "  --correctness_query_count N      Check N fixed query IDs per mixed checkpoint; 0 checks all (default: 0)\n"
       << "  --stop_on_mismatch 0|1           Stop if Boost answers differ (default: 1)\n"
       << "  --output_csv PATH                Write checkpoint summary CSV\n";
 }
@@ -394,12 +424,34 @@ Options parse_args(int argc, char* argv[]) {
       options.dataset_name = require_value(key);
     } else if (key == "--query_file") {
       options.query_file = require_value(key);
+    } else if (key == "--partition_training_query_file") {
+      options.partition_training_query_file = require_value(key);
+    } else if (key == "--cost_probe_output_csv") {
+      options.cost_probe_output_csv = require_value(key);
+    } else if (key == "--cost_probe_query_set") {
+      options.cost_probe_query_set = require_value(key);
+    } else if (key == "--update_query_repair_output_csv") {
+      options.update_query_repair_output_csv = require_value(key);
+    } else if (key == "--update_query_repair_kind") {
+      options.update_query_repair_kind = require_value(key);
+    } else if (key == "--update_query_repair_probe_repetitions") {
+      options.update_query_repair_probe_repetitions =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--update_query_repair_rebuilt_first") {
+      options.update_query_repair_rebuilt_first =
+          std::stoi(require_value(key)) != 0;
+    } else if (key == "--cost_probe_repetitions") {
+      options.cost_probe_repetitions =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--output_csv") {
       options.output_csv = require_value(key);
     } else if (key == "--limit") {
       options.limit = static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--query_count") {
       options.query_count =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--partition_training_query_count") {
+      options.partition_training_query_count =
           static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--workload_mode") {
       options.workload_mode = require_value(key);
@@ -510,6 +562,9 @@ Options parse_args(int argc, char* argv[]) {
     } else if (key == "--correctness_every_n") {
       options.correctness_every_n =
           static_cast<std::size_t>(std::stoull(require_value(key)));
+    } else if (key == "--correctness_query_count") {
+      options.correctness_query_count =
+          static_cast<std::size_t>(std::stoull(require_value(key)));
     } else if (key == "--stop_on_mismatch") {
       options.stop_on_mismatch = std::stoi(require_value(key)) != 0;
     } else if (key == "--help" || key == "-h") {
@@ -531,6 +586,35 @@ Options parse_args(int argc, char* argv[]) {
   }
   if (options.query_count == 0) {
     throw std::runtime_error("--query_count must be greater than 0");
+  }
+  if (options.cost_probe_repetitions == 0) {
+    throw std::runtime_error("--cost_probe_repetitions must be greater than 0");
+  }
+  if (!options.update_query_repair_output_csv.empty()) {
+    if (options.update_query_repair_kind != "insert" &&
+        options.update_query_repair_kind != "delete" &&
+        options.update_query_repair_kind != "replace") {
+      throw std::runtime_error(
+          "--update_query_repair_kind must be insert, delete, or replace");
+    }
+    if (options.update_query_repair_probe_repetitions == 0 ||
+        options.mixed_operations == 0 || options.mixed_checkpoint_interval == 0) {
+      throw std::runtime_error("Update-query-repair counts must be positive");
+    }
+    if (options.update_query_repair_kind == "replace" &&
+        ((options.mixed_operations % 2) != 0 ||
+         (options.mixed_checkpoint_interval % 2) != 0)) {
+      throw std::runtime_error("Replacement operations and checkpoint interval must be even");
+    }
+    if (options.partition_training_query_file.empty()) {
+      throw std::runtime_error(
+          "Update-query-repair requires a held-out --partition_training_query_file");
+    }
+  }
+  if (options.cost_probe_query_set != "train" &&
+      options.cost_probe_query_set != "eval") {
+    throw std::runtime_error(
+        "--cost_probe_query_set must be train or eval");
   }
   if (options.block_size == 0) {
     throw std::runtime_error("--block_size must be greater than 0");
@@ -876,6 +960,24 @@ std::vector<QueryCase> load_query_file(
     throw std::runtime_error("No query rows loaded from: " + options.query_file);
   }
   return queries;
+}
+
+void validate_partition_training_queries(
+    const std::vector<QueryCase>& evaluation,
+    const std::vector<QueryCase>& training, std::size_t object_count) {
+  for (const QueryCase& query : training) {
+    if (query.source_geometry_id >= object_count) {
+      throw std::runtime_error(
+          "Partition training query source_geometry_id is outside the loaded object pool");
+    }
+    for (const QueryCase& held_out : evaluation) {
+      if (query.xmin == held_out.xmin && query.ymin == held_out.ymin &&
+          query.xmax == held_out.xmax && query.ymax == held_out.ymax) {
+        throw std::runtime_error(
+            "Partition training/evaluation query box overlap: identical rectangle");
+      }
+    }
+  }
 }
 
 std::size_t percentile_index(std::size_t size, double percentile) {
@@ -1499,6 +1601,7 @@ struct CompareSummary {
   int answers_match_boost = 1;
   std::size_t missing_count = 0;
   std::size_t extra_count = 0;
+  std::size_t correctness_queries_checked = 0;
   long long oracle_build_ns = 0;
   long long oracle_query_ns = 0;
   std::size_t block_size = 0;
@@ -1581,6 +1684,8 @@ struct SimpleQueryResult {
   std::size_t visited_blocks = 0;
   std::size_t compact_records_scanned = 0;
   std::size_t delta_records_scanned = 0;
+  std::size_t physical_compact_slots_scanned = 0;
+  std::size_t physical_delta_slots_scanned = 0;
   std::size_t mbr_candidates = 0;
   std::size_t predicate_shortcuts = 0;
   std::size_t envelope_shortcuts = 0;
@@ -3292,6 +3397,15 @@ struct FusionMemoryStats {
   std::size_t shared_geometry_handle_bytes = 0;
 };
 
+struct SingleStoreMemoryStats {
+  std::size_t id_bytes = 0;
+  std::size_t block_bytes = 0;
+  std::size_t object_bytes = 0;
+  std::size_t auxiliary_bytes = 0;
+  std::size_t sfc_key_bytes = 0;
+  std::size_t method_owned_bytes = 0;
+};
+
 struct LocalBoundedOverlayBlock {
   std::uint64_t block_id = 0;
   std::vector<ObjectId> compact_ids;
@@ -3397,6 +3511,112 @@ class LocalBoundedCompactQueryOverlay {
     rebuild_fusion_global_guard(global_guard_ids);
   }
 
+  CostProbeMeasurement measure_cost_probe(
+      const std::vector<QueryCase>& queries, std::size_t repetitions) const {
+    struct PreparedQuery {
+      double zmin = 0.0;
+      double zmax = 0.0;
+      geos::geom::Envelope envelope;
+    };
+    std::vector<PreparedQuery> prepared;
+    prepared.reserve(queries.size());
+    for (const QueryCase& query : queries) {
+      PreparedQuery item;
+      curve_shape_projection(query.geometry, "z", options_.cell_xmin,
+                             options_.cell_ymin, options_.cell_size,
+                             options_.cell_size, item.zmin, item.zmax);
+      item.envelope = *query.geometry->getEnvelopeInternal();
+      prepared.push_back(item);
+    }
+
+    // Prepare scan jobs outside both timed batches.
+    std::vector<std::pair<std::size_t, const LocalBoundedOverlayBlock*>>
+        scan_jobs;
+    for (std::size_t qi = 0; qi < prepared.size(); ++qi) {
+      const PreparedQuery& query = prepared[qi];
+      for (const LocalBoundedOverlayBlock* block : directory_) {
+        if (block->live_count == 0) {
+          continue;
+        }
+        if (block->min_zmin > query.zmax) {
+          break;
+        }
+        if (block->max_zmax >= query.zmin &&
+            envelopes_intersect(block->mbr, query.envelope)) {
+          scan_jobs.emplace_back(qi, block);
+        }
+      }
+    }
+
+    auto check_batch = [&](CostProbeMeasurement& out, std::size_t count) {
+      for (std::size_t repetition = 0; repetition < count; ++repetition) {
+        for (const PreparedQuery& query : prepared) {
+          for (const LocalBoundedOverlayBlock* block : directory_) {
+            ++out.block_checks;
+            if (block->live_count == 0) {
+              continue;
+            }
+            if (block->min_zmin > query.zmax) {
+              break;
+            }
+            if (block->max_zmax < query.zmin) {
+              continue;
+            }
+            if (envelopes_intersect(block->mbr, query.envelope)) {
+              ++out.matched_blocks;
+            }
+          }
+        }
+      }
+    };
+    auto scan_batch = [&](CostProbeMeasurement& out, std::size_t count) {
+      for (std::size_t repetition = 0; repetition < count; ++repetition) {
+        for (const auto& job : scan_jobs) {
+          const PreparedQuery& query = prepared[job.first];
+          for (ObjectId oid : job.second->compact_ids) {
+            if (oid >= metadata_.size()) {
+              continue;
+            }
+            const GeometryMeta& meta = metadata_[oid];
+            if (meta.zmin > query.zmax) {
+              break;
+            }
+            if (!live_[oid]) {
+              continue;
+            }
+            ++out.records_scanned;
+            if (meta.zmax >= query.zmin &&
+                envelopes_intersect(meta.envelope, query.envelope)) {
+              ++out.mbr_candidates;
+            }
+          }
+        }
+      }
+    };
+
+    CostProbeMeasurement warmup;
+    check_batch(warmup, 1);
+    scan_batch(warmup, 1);
+    CostProbeMeasurement result;
+    const std::clock_t check_start = std::clock();
+    check_batch(result, repetitions);
+    const std::clock_t check_end = std::clock();
+    scan_batch(result, repetitions);
+    const std::clock_t scan_end = std::clock();
+    if (check_start == static_cast<std::clock_t>(-1) ||
+        check_end == static_cast<std::clock_t>(-1) ||
+        scan_end == static_cast<std::clock_t>(-1)) {
+      throw std::runtime_error("Process CPU clock unavailable");
+    }
+    const double ns_per_tick = 1e9 / static_cast<double>(CLOCKS_PER_SEC);
+    result.block_check_cpu_ns = static_cast<long long>(
+        static_cast<double>(check_end - check_start) * ns_per_tick);
+    result.record_scan_cpu_ns = static_cast<long long>(
+        static_cast<double>(scan_end - check_end) * ns_per_tick);
+    volatile std::size_t sink = result.matched_blocks + result.mbr_candidates;
+    (void)sink;
+    return result;
+  }
   bool insert(ObjectId oid) {
     if (oid >= geometries_.size() || live_[oid]) {
       return false;
@@ -3504,14 +3724,26 @@ class LocalBoundedCompactQueryOverlay {
   }
 
   SimpleQueryResult query(const QueryCase& query_case) {
+    return query_impl<true>(query_case);
+  }
+
+  SimpleQueryResult query_probe(const QueryCase& query_case) {
+    return query_impl<false>(query_case);
+  }
+
+ private:
+  template <bool TrackWorkload>
+  SimpleQueryResult query_impl(const QueryCase& query_case) {
     if (should_use_fusion_global_guard_fast_path()) {
       return query_fusion_global_guard(query_case, false);
     }
 
     auto start = std::chrono::high_resolution_clock::now();
     SimpleQueryResult result;
-    ++operation_clock_;
-    ++query_ops_;
+    if (TrackWorkload) {
+      ++operation_clock_;
+      ++query_ops_;
+    }
 
     double query_zmin = 0.0;
     double query_zmax = 0.0;
@@ -3537,7 +3769,9 @@ class LocalBoundedCompactQueryOverlay {
         continue;
       }
       ++result.visited_blocks;
-      observe_query_hit(block);
+      if (TrackWorkload) {
+        observe_query_hit(block);
+      }
       const std::size_t before_compact = result.compact_records_scanned;
       const std::size_t before_delta = result.delta_records_scanned;
       const std::size_t before_mbr = result.mbr_candidates;
@@ -3546,13 +3780,15 @@ class LocalBoundedCompactQueryOverlay {
                         query_envelope, result);
       query_delta_ids(*block, query_case, query_zmin, query_zmax,
                       query_envelope, result);
-      observe_fusion_query(
-          block,
-          (result.compact_records_scanned - before_compact) +
-              (result.delta_records_scanned - before_delta),
-          result.mbr_candidates - before_mbr,
-          result.exact_calls - before_exact);
-      if (fusion_policy_ && block->fusion_guard_dirty &&
+      if (TrackWorkload) {
+        observe_fusion_query(
+            block,
+            (result.compact_records_scanned - before_compact) +
+                (result.delta_records_scanned - before_delta),
+            result.mbr_candidates - before_mbr,
+            result.exact_calls - before_exact);
+      }
+      if (TrackWorkload && fusion_policy_ && block->fusion_guard_dirty &&
           should_build_fusion_spatial_guard(*block)) {
         fusion_guard_build_candidates.push_back(block);
       }
@@ -3560,18 +3796,22 @@ class LocalBoundedCompactQueryOverlay {
 
     auto end = std::chrono::high_resolution_clock::now();
     result.query_ns = ns_count(end - start);
-    if (fusion_policy_) {
+    if (TrackWorkload && fusion_policy_) {
       ++fusion_sfc_query_count_;
       fusion_sfc_query_ns_ += result.query_ns;
       fusion_sfc_query_candidates_ += result.candidates;
       fusion_sfc_query_exact_calls_ += result.exact_calls;
     }
-    probe_fusion_global_guard(query_case, result.query_ns);
-    if (!fusion_guard_build_candidates.empty()) {
+    if (TrackWorkload) {
+      probe_fusion_global_guard(query_case, result.query_ns);
+    }
+    if (TrackWorkload && !fusion_guard_build_candidates.empty()) {
       maybe_build_fusion_spatial_guard(fusion_guard_build_candidates.front());
     }
     return result;
   }
+
+ public:
 
   bool validate_index(std::string* message = nullptr) const {
     auto fail = [&](const std::string& reason) {
@@ -3582,9 +3822,14 @@ class LocalBoundedCompactQueryOverlay {
     };
 
     std::size_t seen_live = 0;
+    double previous_max_zmin = -std::numeric_limits<double>::infinity();
     bool have_previous_live_block = false;
     double previous_live_min_zmin = -std::numeric_limits<double>::infinity();
     for (const LocalBoundedOverlayBlock* block : directory_) {
+      if (previous_max_zmin > block->min_zmin) {
+        return fail("local bounded directory routing bounds overlap out of order");
+      }
+      previous_max_zmin = block->max_zmin;
       for (std::size_t i = 1; i < block->compact_ids.size(); ++i) {
         if (ObjectIdLess(metadata_)(block->compact_ids[i],
                                     block->compact_ids[i - 1])) {
@@ -3774,6 +4019,22 @@ class LocalBoundedCompactQueryOverlay {
     const std::size_t denom = live + dead;
     return denom == 0 ? 0.0 : static_cast<double>(dead) /
                                 static_cast<double>(denom);
+  }
+
+  std::size_t live_delta_ids() const {
+    std::size_t total = 0;
+    for (const LocalBoundedOverlayBlock* block : directory_) {
+      total += block->live_delta_count;
+    }
+    return total;
+  }
+
+  std::size_t dead_slots() const {
+    std::size_t total = 0;
+    for (const LocalBoundedOverlayBlock* block : directory_) {
+      total += block->dead_count;
+    }
+    return total;
   }
 
   FusionDebugStats fusion_debug_stats() const {
@@ -5070,6 +5331,8 @@ class LocalBoundedCompactQueryOverlay {
 
   void rebuild_block_summary(LocalBoundedOverlayBlock* block,
                              bool compact_dead) {
+    const double previous_min_zmin = block->min_zmin;
+    const double previous_max_zmin = block->max_zmin;
     bool has_live = false;
     std::size_t live_count = 0;
     std::size_t live_delta_count = 0;
@@ -5155,8 +5418,9 @@ class LocalBoundedCompactQueryOverlay {
       block->max_zmax = max_zmax;
       block->mbr = mbr;
     } else {
-      block->min_zmin = std::numeric_limits<double>::infinity();
-      block->max_zmin = -std::numeric_limits<double>::infinity();
+      // Empty blocks remain in the directory and retain their routing slot.
+      block->min_zmin = previous_min_zmin;
+      block->max_zmin = previous_max_zmin;
       block->max_zmax = -std::numeric_limits<double>::infinity();
       block->mbr = geos::geom::Envelope();
     }
@@ -5266,6 +5530,7 @@ class LocalBoundedCompactQueryOverlay {
     }
 
     for (ObjectId oid : block.compact_ids) {
+      ++result.physical_compact_slots_scanned;
       if (oid >= metadata_.size()) {
         continue;
       }
@@ -5296,6 +5561,7 @@ class LocalBoundedCompactQueryOverlay {
                        const geos::geom::Envelope& query_envelope,
                        SimpleQueryResult& result) const {
     for (ObjectId oid : block.delta_ids) {
+      ++result.physical_delta_slots_scanned;
       if (oid >= metadata_.size() || !live_[oid]) {
         continue;
       }
@@ -5665,6 +5931,15 @@ class DeliAlexHybridLocalBoundedIndex {
     return overlay_.query(query_case);
   }
 
+  SimpleQueryResult query_probe(const QueryCase& query_case) {
+    return overlay_.query_probe(query_case);
+  }
+
+  CostProbeMeasurement measure_cost_probe(
+      const std::vector<QueryCase>& queries, std::size_t repetitions) const {
+    return overlay_.measure_cost_probe(queries, repetitions);
+  }
+
   bool validate_index(std::string* message = nullptr) const {
     return overlay_.validate_index(message);
   }
@@ -5702,11 +5977,33 @@ class DeliAlexHybridLocalBoundedIndex {
   }
   std::size_t blocks_with_delta() const { return overlay_.blocks_with_delta(); }
   double tombstone_ratio() const { return overlay_.tombstone_ratio(); }
+  std::size_t live_delta_ids() const { return overlay_.live_delta_ids(); }
+  std::size_t dead_slots() const { return overlay_.dead_slots(); }
   FusionDebugStats fusion_debug_stats() const {
     return overlay_.fusion_debug_stats();
   }
   FusionMemoryStats fusion_memory_stats() const {
     return overlay_.fusion_memory_stats();
+  }
+  SingleStoreMemoryStats single_store_memory_stats() const {
+    if (!single_store_) {
+      throw std::logic_error("Memory breakdown requires SingleStore mode");
+    }
+    const FusionMemoryStats raw = overlay_.fusion_memory_stats();
+    SingleStoreMemoryStats stats;
+    stats.id_bytes = raw.compact_id_bytes + raw.block_delta_id_bytes;
+    stats.block_bytes = raw.directory_bytes + raw.block_header_bytes;
+    stats.sfc_key_bytes = metadata_.capacity() * 2 * sizeof(double);
+    stats.object_bytes = raw.live_bitmap_bytes + raw.delta_bitmap_bytes +
+                         raw.object_locator_bytes + stats.sfc_key_bytes;
+    stats.auxiliary_bytes = raw.predicate_plan_bytes +
+                            raw.local_guard_bytes_estimate +
+                            raw.base_guard_bytes_estimate +
+                            raw.delta_guard_bytes_estimate +
+                            raw.global_delta_log_bytes + raw.rebuild_queue_bytes;
+    stats.method_owned_bytes = stats.id_bytes + stats.block_bytes +
+                               stats.object_bytes + stats.auxiliary_bytes;
+    return stats;
   }
   std::size_t leaf_count() const {
     if (single_store_) {
@@ -6628,6 +6925,7 @@ CompareSummary run_generic_checkpoint(
   if (!do_correctness) {
     summary.answers_match_boost = -1;
   }
+  summary.correctness_queries_checked = do_correctness ? queries.size() : 0;
   return summary;
 }
 
@@ -6696,6 +6994,8 @@ CompareSummary convert_deli_summary(const CheckpointSummary& source,
   summary.answers_match_boost = source.answers_match_boost;
   summary.missing_count = source.missing_count;
   summary.extra_count = source.extra_count;
+  summary.correctness_queries_checked =
+      source.answers_match_boost == -1 ? 0 : source.query_count;
   summary.oracle_build_ns = source.boost_rebuild_ns;
   summary.oracle_query_ns = source.boost_query_ns;
   summary.block_size = options.block_size;
@@ -7177,7 +7477,7 @@ void write_compare_csv(const std::string& path,
          "candidates,exact_calls,geos_exact_ns,avg_geos_exact_ns,"
          "geos_exact_query_fraction,answers,"
          "candidate_answer_ratio,zero_answer_queries,answers_match_boost,"
-         "missing_count,extra_count,oracle_build_ns,oracle_query_ns,"
+         "missing_count,extra_count,correctness_queries_checked,oracle_build_ns,oracle_query_ns,"
          "block_size,stale_threshold_fraction,delete_compact_fraction,"
          "block_count,stale_block_count,"
          "summary_rebuild_count,summary_rebuild_ns,"
@@ -7245,6 +7545,7 @@ void write_compare_csv(const std::string& path,
            << row.answers << "," << row.candidate_answer_ratio << ","
            << row.zero_answer_queries << "," << row.answers_match_boost
            << "," << row.missing_count << "," << row.extra_count << ","
+           << row.correctness_queries_checked << ","
            << row.oracle_build_ns << "," << row.oracle_query_ns << ","
            << row.block_size << "," << row.stale_threshold_fraction << ","
            << row.delete_compact_fraction << "," << row.block_count << ","
@@ -7465,20 +7766,35 @@ void mixed_correctness_check(const Options& options,
                              long long* oracle_build_ns,
                              long long* oracle_query_ns,
                              std::size_t* missing_total,
-                             std::size_t* extra_total) {
+                             std::size_t* extra_total,
+                             std::size_t* checked_queries) {
   *oracle_build_ns = 0;
   *oracle_query_ns = 0;
   *missing_total = 0;
   *extra_total = 0;
+  *checked_queries = 0;
   if (!should_check_correctness(options, checkpoint_id)) {
     return;
   }
 
+  std::vector<QueryCase> sample;
+  const std::vector<QueryCase>* check_queries = &queries;
+  if (options.correctness_query_count > 0 &&
+      options.correctness_query_count < queries.size()) {
+    sample.reserve(options.correctness_query_count);
+    // Use the same evenly spaced query IDs at every checked checkpoint.
+    for (std::size_t i = 0; i < options.correctness_query_count; ++i) {
+      sample.push_back(
+          queries[i * queries.size() / options.correctness_query_count]);
+    }
+    check_queries = &sample;
+  }
+  *checked_queries = check_queries->size();
   std::vector<std::unordered_set<ObjectId>> oracle_answers =
-      compute_oracle_answers(geometries, state.live_ids, state.live, queries,
-                             oracle_build_ns, oracle_query_ns);
-  for (std::size_t i = 0; i < queries.size(); ++i) {
-    SimpleQueryResult result = query_fn(queries[i], state.live);
+      compute_oracle_answers(geometries, state.live_ids, state.live,
+                             *check_queries, oracle_build_ns, oracle_query_ns);
+  for (std::size_t i = 0; i < check_queries->size(); ++i) {
+    SimpleQueryResult result = query_fn((*check_queries)[i], state.live);
     *missing_total += count_missing(oracle_answers[i], result.answers, nullptr);
     *extra_total += count_missing(result.answers, oracle_answers[i], nullptr);
   }
@@ -7519,11 +7835,12 @@ void run_mixed_workload_for_index(
     long long oracle_query_ns = 0;
     std::size_t missing_total = 0;
     std::size_t extra_total = 0;
+    std::size_t checked_queries = 0;
     const bool do_correctness = should_check_correctness(options, checkpoint_id);
     mixed_correctness_check(options, geometries, queries, state, checkpoint_id,
                             query_fn,
                             &oracle_build_ns, &oracle_query_ns,
-                            &missing_total, &extra_total);
+                            &missing_total, &extra_total, &checked_queries);
 
     CompareSummary row = finalize_compare_summary(
         options, index_name,
@@ -7534,6 +7851,7 @@ void run_mixed_workload_for_index(
         oracle_query_ns, missing_total, extra_total);
     row.workload_mode = "mixed";
     row.mixed_profile = options.mixed_profile;
+    row.correctness_queries_checked = checked_queries;
 	    row.operation_count = completed_ops;
 	    row.checkpoint_ops = completed_ops - interval_begin;
 	    row.success_count = interval_success;
@@ -7613,6 +7931,8 @@ void run_mixed_workload_for_index(
                     operations.size());
 }
 
+#include "deli_update_query_repair.inc"
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -7636,6 +7956,22 @@ int main(int argc, char* argv[]) {
     std::vector<GeometryPtr> owned_queries;
     std::vector<QueryCase> queries =
         load_query_file(options, *factory, owned_queries);
+
+    std::vector<GeometryPtr> owned_partition_training_queries;
+    std::vector<QueryCase> partition_training_queries;
+    const std::vector<QueryCase>* partition_queries = &queries;
+    if (!options.partition_training_query_file.empty()) {
+      Options training_options = options;
+      training_options.query_file = options.partition_training_query_file;
+      if (options.partition_training_query_count != 0) {
+        training_options.query_count = options.partition_training_query_count;
+      }
+      partition_training_queries = load_query_file(
+          training_options, *factory, owned_partition_training_queries);
+      validate_partition_training_queries(
+          queries, partition_training_queries, geometries.size());
+      partition_queries = &partition_training_queries;
+    }
 
     std::vector<ObjectId> all_ids(geometries.size());
     std::iota(all_ids.begin(), all_ids.end(), ObjectId{0});
@@ -7696,6 +8032,62 @@ int main(int argc, char* argv[]) {
         build_geometry_to_oid(geometries);
     std::vector<GeometryMeta> geometry_metadata =
         build_geometry_metadata(geometries, options);
+    if (!options.update_query_repair_output_csv.empty()) {
+      run_update_query_repair(options, geometries, geometry_metadata, queries,
+                              *partition_queries, initial_ids);
+      return 0;
+    }
+    if (!options.cost_probe_output_csv.empty()) {
+      DeliAlexHybridLocalBoundedIndex probe_index(
+          options, geometries, geometry_metadata, true, partition_queries,
+          true);
+      const auto build_start = std::chrono::high_resolution_clock::now();
+      probe_index.bulk_load(initial_ids);
+      const auto build_end = std::chrono::high_resolution_clock::now();
+      const std::vector<QueryCase>& probe_queries =
+          options.cost_probe_query_set == "eval" ? queries : *partition_queries;
+      const CostProbeMeasurement probe = probe_index.measure_cost_probe(
+          probe_queries, options.cost_probe_repetitions);
+      std::ofstream output(options.cost_probe_output_csv);
+      if (!output) {
+        throw std::runtime_error("Cannot open cost probe CSV: " +
+                                 options.cost_probe_output_csv);
+      }
+      output << "dataset,training_query_file,component,repetitions,build_ms,"
+                "cpu_ns,operations,ns_per_operation,matched_blocks,"
+                "mbr_candidates,geos_exact_calls,probe_query_set,probe_query_file\n";
+      const double build_ms = ns_count(build_end - build_start) / 1e6;
+      auto write_probe_row = [&](const char* component, long long cpu_ns,
+                                 std::size_t operations) {
+        output << options.dataset_name << ","
+               << (options.partition_training_query_file.empty()
+                       ? options.query_file
+                       : options.partition_training_query_file)
+               << "," << component << ","
+               << options.cost_probe_repetitions << "," << build_ms << ","
+               << cpu_ns << "," << operations << ","
+               << (operations == 0 ? 0.0
+                                   : static_cast<double>(cpu_ns) / operations)
+               << "," << probe.matched_blocks << ","
+               << probe.mbr_candidates << ",0,"
+               << options.cost_probe_query_set << ","
+               << (options.cost_probe_query_set == "eval"
+                       ? options.query_file
+                       : (options.partition_training_query_file.empty()
+                              ? options.query_file
+                              : options.partition_training_query_file))
+               << "\n";
+      };
+      output << std::setprecision(12);
+      write_probe_row("block_check", probe.block_check_cpu_ns,
+                      probe.block_checks);
+      write_probe_row("record_scan", probe.record_scan_cpu_ns,
+                      probe.records_scanned);
+      std::cout << "Cost probe: " << options.cost_probe_output_csv
+                << " block_checks=" << probe.block_checks
+                << " records_scanned=" << probe.records_scanned << "\n";
+      return 0;
+    }
     std::vector<rlr_lite::Box2D> rlr_train_queries =
         rlr_train_queries_for_cases(queries);
 
@@ -7985,7 +8377,7 @@ int main(int argc, char* argv[]) {
       if (index_enabled(options, "DELI_ALEX_HYBRID_COST")) {
         DeliAlexHybridLocalBoundedIndex mixed_index(options, geometries,
                                                     geometry_metadata, true,
-                                                    &queries);
+                                                    partition_queries);
         auto start = std::chrono::high_resolution_clock::now();
         mixed_index.bulk_load(initial_ids);
         auto end = std::chrono::high_resolution_clock::now();
@@ -8010,7 +8402,7 @@ int main(int argc, char* argv[]) {
                                         bool cost_driven) {
         DeliAlexHybridLocalBoundedIndex mixed_index(
             options, geometries, geometry_metadata, cost_driven,
-            cost_driven ? &queries : nullptr, true);
+            cost_driven ? partition_queries : nullptr, true);
         auto start = std::chrono::high_resolution_clock::now();
         mixed_index.bulk_load(initial_ids);
         auto end = std::chrono::high_resolution_clock::now();
@@ -8041,7 +8433,7 @@ int main(int argc, char* argv[]) {
       if (index_enabled(options, "DELI_ADAPTIVE_PRL_FUSION")) {
         print_index_phase("DELI_ADAPTIVE_PRL_FUSION", "build_start");
         DeliAlexHybridLocalBoundedIndex mixed_index(
-            options, geometries, geometry_metadata, true, &queries, true,
+            options, geometries, geometry_metadata, true, partition_queries, true,
             true);
         auto start = std::chrono::high_resolution_clock::now();
         mixed_index.bulk_load(initial_ids);
@@ -9212,7 +9604,7 @@ int main(int argc, char* argv[]) {
       // predicted scan benefit covers the local compaction cost.
       if (index_enabled(options, "DELI_ALEX_HYBRID_COST")) {
         DeliAlexHybridLocalBoundedIndex deli_alex_hybrid_cost(
-            options, geometries, geometry_metadata, true, &queries);
+            options, geometries, geometry_metadata, true, partition_queries);
         auto cost_build_start = std::chrono::high_resolution_clock::now();
         deli_alex_hybrid_cost.bulk_load(initial_ids);
         auto cost_build_end = std::chrono::high_resolution_clock::now();
@@ -9279,7 +9671,7 @@ int main(int argc, char* argv[]) {
 
       if (index_enabled(options, "DELI_ADAPTIVE_PRL_FUSION")) {
         DeliAlexHybridLocalBoundedIndex fusion_index(
-            options, geometries, geometry_metadata, true, &queries, true,
+            options, geometries, geometry_metadata, true, partition_queries, true,
             true);
         auto fusion_build_start = std::chrono::high_resolution_clock::now();
         fusion_index.bulk_load(initial_ids);

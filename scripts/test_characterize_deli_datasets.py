@@ -45,9 +45,15 @@ class CharacterizationTest(unittest.TestCase):
             self.assertEqual(row["bbox_maxx"], "3")
 
     def test_normalization_and_geometry_labels(self):
+        source_rows = {"AW": 2292766, "LW": 5838339,
+                       "PARKS": 9961896, "ROADS": 72339945}
         for row in self.rows:
             validate(row, 500000)
+            self.assertEqual(int(row["source_rows"]), source_rows[row["dataset"]])
         table = table_text(self.rows)
+        self.assertIn("Source rows & Avg. vertices", table)
+        self.assertNotIn("Pool objects", table)
+        self.assertIn("72,339,945 & 11.1", table)
         self.assertIn(r"Polygon (>99.9\%)", table)
         self.assertIn(r"Polygon (79.3\%)", table)
         self.assertIn(r"LineString (97.6\%)", table)
@@ -56,7 +62,8 @@ class CharacterizationTest(unittest.TestCase):
     def test_reject_wrong_count_domain_and_encoding(self):
         for field, value in (("loaded_count", "5"), ("mean_normalized_mbr_area", "2"),
                              ("mean_normalized_sfc_span", "nan"), ("cell_size", "1"),
-                             ("coordinate_count", "0"), ("pair_overlap_fraction", "0.5")):
+                             ("coordinate_count", "0"), ("pair_overlap_fraction", "0.5"),
+                             ("source_rows", "499999")):
             row = copy.deepcopy(self.rows[0])
             row[field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):

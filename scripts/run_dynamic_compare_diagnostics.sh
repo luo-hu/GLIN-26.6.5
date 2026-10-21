@@ -483,6 +483,8 @@ DATA_ROOT="${DATA_ROOT:-/mnt/hgfs}"
 ZGAP_WORK_DIR="${ZGAP_WORK_DIR:-data/synthetic/zrange_gap}"
 ZGAP_MIXED_WORK_DIR="${ZGAP_MIXED_WORK_DIR:-data/synthetic/zrange_gap_mixed_${LIMIT}}"
 QUERY_ROOT="${QUERY_ROOT:-queries/dynamic_compare_${QUERY_LIMIT}}"
+PARTITION_TRAINING_QUERY_ROOT="${PARTITION_TRAINING_QUERY_ROOT:-}"
+PARTITION_TRAINING_QUERY_COUNT="${PARTITION_TRAINING_QUERY_COUNT:-$QUERY_COUNT}"
 RESULT_DIR="${RESULT_DIR:-results/dynamic_compare_${LIMIT}}"
 FIGURE_DIR="${FIGURE_DIR:-figures/dynamic_compare_${LIMIT}}"
 SELECTIVITY_TAGS="${SELECTIVITY_TAGS:-1pct}"
@@ -536,6 +538,7 @@ SEED="${SEED:-42}"
 INDEXES="${INDEXES:-all}"
 CHECK_CORRECTNESS="${CHECK_CORRECTNESS:-1}"
 CORRECTNESS_EVERY_N="${CORRECTNESS_EVERY_N:-1}"
+CORRECTNESS_QUERY_COUNT="${CORRECTNESS_QUERY_COUNT:-0}"
 WORKLOAD_MODE="${WORKLOAD_MODE:-staged}"
 MIXED_PROFILES="${MIXED_PROFILES:-read_heavy balanced write_heavy}"
 BATCH_MIXED_PROFILES="${BATCH_MIXED_PROFILES:-1}"
@@ -566,6 +569,7 @@ if [[ "$SHOW_CONFIG" == "1" ]]; then
     DATASETS=$DATASETS
     LIMIT=$LIMIT, QUERY_LIMIT=$QUERY_LIMIT, QUERY_COUNT=$QUERY_COUNT
     QUERY_ROOT=$QUERY_ROOT
+    PARTITION_TRAINING_QUERY_ROOT=$PARTITION_TRAINING_QUERY_ROOT
     RESULT_DIR=$RESULT_DIR
     FIGURE_DIR=$FIGURE_DIR
     SELECTIVITY_TAGS=$SELECTIVITY_TAGS
@@ -584,6 +588,7 @@ if [[ "$SHOW_CONFIG" == "1" ]]; then
     INDEXES=$INDEXES
     CHECK_CORRECTNESS=$CHECK_CORRECTNESS
     CORRECTNESS_EVERY_N=$CORRECTNESS_EVERY_N
+    CORRECTNESS_QUERY_COUNT=$CORRECTNESS_QUERY_COUNT
     PREDICATE_SHORTCUTS=$PREDICATE_SHORTCUTS
     PREDICATE_SHORTCUTS_LIST=$PREDICATE_SHORTCUTS_LIST
     REPRESENTATIVE_POINT_SHORTCUTS=$REPRESENTATIVE_POINT_SHORTCUTS
@@ -875,6 +880,16 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
         echo "请先用 run_interval_overlap_diagnostics.sh 生成 query，或设置正确 QUERY_ROOT。" >&2
         exit 1
       fi
+      partition_training_args=()
+      if [[ -n "$PARTITION_TRAINING_QUERY_ROOT" ]]; then
+        training_query_file="$PARTITION_TRAINING_QUERY_ROOT/${dataset}_jts_strtree_knn_${tag}.csv"
+        scripts/validate_jts_query_file.py \
+          --query_file "$training_query_file" \
+          --expected_tag "$tag" \
+          --expected_count "$PARTITION_TRAINING_QUERY_COUNT"
+        partition_training_args=(--partition_training_query_file "$training_query_file" --partition_training_query_count "$PARTITION_TRAINING_QUERY_COUNT")
+      fi
+
 
       profiles="staged"
       if [[ "$WORKLOAD_MODE" == "mixed" ]]; then
@@ -924,6 +939,7 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           "${benchmark_prefix[@]}" "$BUILD_DIR/bench_dynamic_compare_wkt" \
           --data_file "$data_file" \
           --query_file "$query_file" \
+          "${partition_training_args[@]}" \
           --dataset_name "$dataset" \
           --limit "$LIMIT" \
           --query_count "$QUERY_COUNT" \
@@ -941,6 +957,7 @@ if [[ "$RUN_BENCHMARKS" == "1" ]]; then
           --indexes "$INDEXES" \
           --check_correctness "$CHECK_CORRECTNESS" \
           --correctness_every_n "$CORRECTNESS_EVERY_N" \
+          --correctness_query_count "$CORRECTNESS_QUERY_COUNT" \
           --block_size "$BLOCK_SIZE" \
           --stale_threshold_fraction "$STALE_THRESHOLD" \
           --local_delta_bound "$LOCAL_DELTA_BOUND" \

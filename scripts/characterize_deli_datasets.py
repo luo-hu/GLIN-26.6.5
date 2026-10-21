@@ -24,6 +24,9 @@ def scientific(value):
 def validate(row, limit):
     if int(row["loaded_count"]) != limit or limit < 2:
         raise ValueError("Wrong prefix size")
+    if int(row["lines_seen"]) < limit or (
+            row.get("source_rows") and int(row["source_rows"]) < int(row["lines_seen"])):
+        raise ValueError("Invalid source-row accounting")
     types = dict(item.split(":") for item in row["geometry_types"].split(";"))
     if not set(types) <= GEOMETRY_TYPES or sum(map(int, types.values())) != limit:
         raise ValueError("Invalid geometry-type accounting")
@@ -48,7 +51,7 @@ def validate(row, limit):
 
 def table_text(rows):
     lines = [r"\begin{tabular}{@{}llrrrrr@{}}", r"\toprule",
-             r"Dataset & Dominant geometry & Objects & Avg. vertices & Norm. MBR area & Norm. SFC span & Avg. overlaps \\",
+             r"Dataset & Dominant geometry & Source rows & Avg. vertices & Norm. MBR area & Norm. SFC span & Avg. overlaps \\",
              r"\midrule"]
     for row in rows:
         types = validate(row, int(row["loaded_count"]))
@@ -56,7 +59,7 @@ def table_text(rows):
         fraction = int(types[dominant]) / int(row["loaded_count"])
         share = "100" if fraction == 1 else (">99.9" if fraction > 0.999 else f"{fraction * 100:.1f}")
         geometry = dominant + " (" + share + r"\%)"
-        cells = [row["dataset"], geometry, f"{int(row['loaded_count']) / 1000:g}K",
+        cells = [row["dataset"], geometry, f"{int(row['source_rows']):,}",
                  f"{float(row['avg_vertices']):.1f}", scientific(float(row["mean_normalized_mbr_area"])),
                  scientific(float(row["mean_normalized_sfc_span"])),
                  f"{float(row['mean_interval_overlaps']):.1f}"]
@@ -78,6 +81,11 @@ def prefix_fingerprint(path, lines):
     return {"data_file": str(path), "file_bytes": path.stat().st_size,
             "mtime_ns": path.stat().st_mtime_ns, "consumed_lines": lines,
             "consumed_bytes": bytes_read, "consumed_prefix_sha256": digest.hexdigest()}
+
+
+def count_source_rows(path):
+    result = subprocess.run(["wc", "-l", str(path)], check=True, capture_output=True, text=True)
+    return int(result.stdout.split()[0])
 
 
 def main():
@@ -116,8 +124,11 @@ def main():
             raise ValueError("Invalid dataset export")
         row = loaded[0]
         validate(row, args.limit)
+        row["source_rows"] = count_source_rows(source)
+        validate(row, args.limit)
         rows.append(row)
-        inputs.append(prefix_fingerprint(source, int(row["lines_seen"])))
+        inputs.append({**prefix_fingerprint(source, int(row["lines_seen"])),
+                       "source_rows": row["source_rows"]})
         commands.append(command)
         print(dataset, row["geometry_types"], "vertices=" + row["avg_vertices"],
               "overlaps=" + row["mean_interval_overlaps"], flush=True)
@@ -133,7 +144,7 @@ def main():
                 "mean_sfc_span": "Mean (zmax-zmin) / (max(zmax)-min(zmin)); benchmark double endpoints",
                 "mean_interval_overlaps": "Mean count of other closed intervals intersecting each object interval",
                 "vertices": "Stored coordinate count, including closing polygon-ring coordinates",
-                "scope": "Full valid object pool prefix, not final live workload state or query-conditioned overlap"}
+                "scope": "Source rows are physical file lines, not full-file validated objects; prefix statistics use the first valid nonempty geometries, not final live workload state"}
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print("Dataset table:", args.table)
 

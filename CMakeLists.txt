@@ -130,6 +130,13 @@ target_compile_definitions(bench_dynamic_compare_wkt PRIVATE PIECE)
 target_link_libraries(bench_dynamic_compare_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
 target_include_directories(bench_dynamic_compare_wkt PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
 
+add_executable(test_deli_single_store_directory
+    test/deli_single_store_directory_test.cpp glin/hilbert/hilbert.cpp)
+target_compile_definitions(test_deli_single_store_directory PRIVATE PIECE)
+target_link_libraries(test_deli_single_store_directory PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
+target_include_directories(test_deli_single_store_directory PUBLIC ${GLIN_WKT_INCLUDE_DIRS})
+add_test(NAME test_deli_single_store_directory COMMAND test_deli_single_store_directory)
+
 add_executable(bench_index_size_wkt src/benchmark/bench_index_size_wkt.cpp glin/hilbert/hilbert.h glin/hilbert/hilbert.cpp)
 target_link_libraries(bench_index_size_wkt PRIVATE ${GEOS_LIBRARY} ${Boost_SYSTEM_LIBRARY})
 target_include_directories(bench_index_size_wkt PUBLIC ${GLIN_WKT_INCLUDE_DIRS})

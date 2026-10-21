@@ -311,6 +311,8 @@ def build_mechanism_views(source, final, out, datasets, tags, tag_labels):
     update_figure(final, out, datasets, tags, "deli_update_all_methods")
     update_figure(final, out, datasets, tags, "deli_update_service_rates",
                   metrics=SERVICE_METRICS)
+    update_figure(final, out, datasets, tags, "deli_operation_service_rates",
+                  metrics=(("query_tps", "Query rate (Kops/s)", 0.001),) + SERVICE_METRICS)
     for tag in tags:
         update_figure(final, out, datasets, tags, "deli_update_absolute_" + tag, selectivity=tag)
         update_figure(final, out, datasets, tags, "deli_update_service_absolute_" + tag,
